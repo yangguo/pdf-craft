@@ -16,7 +16,7 @@ from .error import (
 from .llm import LLM
 from .markdown.render import render_markdown_file
 from .metering import AbortedCheck, OCRTokensMetering
-from .pdf import OCR, DeepSeekOCRSize, OCREvent, PDFHandler
+from .pdf import OCR, DeepSeekOCRSize, DeepSeekOCRVersion, OCREvent, PDFHandler
 from .sequence import generate_chapter_files
 from .to_path import to_path
 from .toc import TocExtractionMode, analyse_toc
@@ -26,11 +26,15 @@ class Transform:
     def __init__(
         self,
         models_cache_path: PathLike | str | None = None,
+        ocr_model: str | None = None,
+        ocr_version: DeepSeekOCRVersion = "v1",
         pdf_handler: PDFHandler | None = None,
         local_only: bool = False,
     ) -> None:
         self._ocr: OCR = OCR(
             model_path=models_cache_path,
+            model_name=ocr_model,
+            ocr_version=ocr_version,
             pdf_handler=pdf_handler,
             local_only=local_only,
         )

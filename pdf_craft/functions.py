@@ -6,18 +6,22 @@ from epub_generator import BookMeta, LaTeXRender, TableRender
 from .error import IgnoreOCRErrorsChecker, IgnorePDFErrorsChecker
 from .llm import LLM
 from .metering import AbortedCheck, OCRTokensMetering
-from .pdf import OCR, DeepSeekOCRSize, OCREvent, PDFHandler
+from .pdf import OCR, DeepSeekOCRSize, DeepSeekOCRVersion, OCREvent, PDFHandler
 from .toc import TocExtractionMode
 from .transform import Transform
 
 
 def predownload_models(
     models_cache_path: PathLike | None = None,
+    ocr_model: str | None = None,
+    ocr_version: DeepSeekOCRVersion = "v1",
     pdf_handler: PDFHandler | None = None,
     revision: str | None = None,
 ) -> None:
     ocr = OCR(
         model_path=models_cache_path,
+        model_name=ocr_model,
+        ocr_version=ocr_version,
         pdf_handler=pdf_handler,
         local_only=False,
     )
@@ -32,6 +36,8 @@ def transform_markdown(
     analysing_path: PathLike | str | None = None,
     ocr_size: DeepSeekOCRSize = "gundam",
     models_cache_path: PathLike | str | None = None,
+    ocr_model: str | None = None,
+    ocr_version: DeepSeekOCRVersion = "v1",
     local_only: bool = False,
     dpi: int | None = None,
     max_page_image_file_size: int | None = None,
@@ -49,6 +55,8 @@ def transform_markdown(
 ) -> OCRTokensMetering:
     return Transform(
         models_cache_path=models_cache_path,
+        ocr_model=ocr_model,
+        ocr_version=ocr_version,
         pdf_handler=pdf_handler,
         local_only=local_only,
     ).transform_markdown(
@@ -80,6 +88,8 @@ def transform_epub(
     analysing_path: PathLike | str | None = None,
     ocr_size: DeepSeekOCRSize = "gundam",
     models_cache_path: PathLike | str | None = None,
+    ocr_model: str | None = None,
+    ocr_version: DeepSeekOCRVersion = "v1",
     local_only: bool = False,
     dpi: int | None = None,
     max_page_image_file_size: int | None = None,
@@ -102,6 +112,8 @@ def transform_epub(
 ) -> OCRTokensMetering:
     return Transform(
         models_cache_path=models_cache_path,
+        ocr_model=ocr_model,
+        ocr_version=ocr_version,
         pdf_handler=pdf_handler,
         local_only=local_only,
     ).transform_epub(

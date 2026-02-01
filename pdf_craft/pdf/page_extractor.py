@@ -9,37 +9,138 @@ from ..common import ASSET_TAGS, AssetHub, remove_surrogates
 from ..error import OCRError
 from ..metering import AbortedCheck, check_aborted
 from .ngrams import has_repetitive_ngrams
-from .types import DeepSeekOCRSize, Page, PageLayout
+from .types import DeepSeekOCRSize, DeepSeekOCRVersion, Page, PageLayout
 
 
 class PageExtractorNode:
     def __init__(
         self,
         model_path: Path | None = None,
+        model_name: str | None = None,
+        ocr_version: DeepSeekOCRVersion = "v1",
         local_only: bool = False,
         enable_devices_numbers: Iterable[int] | None = None,
     ) -> None:
         self._model_path: Path | None = model_path
+        self._model_name: str | None = model_name
+        self._ocr_version: DeepSeekOCRVersion = ocr_version
         self._local_only: bool = local_only
         self._enable_devices_numbers: Iterable[int] | None = enable_devices_numbers
         self._page_extractor = None
+        self._v2_model = None
 
     def _get_page_extractor(self):
         if not self._page_extractor:
             # 尽可能推迟 doc-page-extractor 的加载时间
             from doc_page_extractor import create_page_extractor
 
-            self._page_extractor = create_page_extractor(
-                model_path=self._model_path,
-                local_only=self._local_only,
-                enable_devices_numbers=self._enable_devices_numbers,
-            )
+            kwargs = {
+                "model_path": self._model_path,
+                "local_only": self._local_only,
+                "enable_devices_numbers": self._enable_devices_numbers,
+            }
+            if self._model_name:
+                try:
+                    self._page_extractor = create_page_extractor(
+                        model_name=self._model_name,
+                        **kwargs,
+                    )
+                except TypeError:
+                    # Backward compatibility with older doc-page-extractor
+                    self._page_extractor = create_page_extractor(**kwargs)
+            else:
+                self._page_extractor = create_page_extractor(**kwargs)
         return self._page_extractor
 
+    def _predownload_v2(self, revision: str | None) -> None:
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as error:  # pragma: no cover - import guard
+            raise OCRError(
+                "DeepSeek-OCR-2 requires huggingface_hub to predownload models."
+            ) from error
+
+        model_name = self._model_name or "deepseek-ai/DeepSeek-OCR-2"
+        snapshot_download(
+            repo_id=model_name,
+            revision=revision,
+            cache_dir=str(self._model_path) if self._model_path else None,
+            local_files_only=self._local_only,
+        )
+
+    def _get_v2_model(self):
+        if self._v2_model is None:
+            try:
+                import torch
+                from transformers import AutoModel, AutoTokenizer
+            except ImportError as error:  # pragma: no cover - import guard
+                raise OCRError(
+                    "DeepSeek-OCR-2 requires transformers and torch to be installed. "
+                    "Install with: pip install 'transformers>=4.46' torch"
+                ) from error
+
+            if not torch.cuda.is_available():
+                raise OCRError(
+                    "CUDA is not available for DeepSeek-OCR-2. "
+                    "Please ensure you have a CUDA-capable GPU and PyTorch with CUDA support."
+                )
+
+            model_name = self._model_name or "deepseek-ai/DeepSeek-OCR-2"
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                cache_dir=str(self._model_path) if self._model_path else None,
+                local_files_only=self._local_only,
+            )
+
+            # Try flash_attention_2 first, fall back to sdpa or eager if unavailable
+            attn_impl = self._get_best_attention_implementation()
+            model = AutoModel.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                use_safetensors=True,
+                attn_implementation=attn_impl,
+                cache_dir=str(self._model_path) if self._model_path else None,
+                local_files_only=self._local_only,
+            )
+            model = model.eval().cuda()
+            try:
+                model = model.to(torch.bfloat16)
+            except Exception:
+                model = model.to(torch.float16)
+
+            self._v2_model = (tokenizer, model)
+        return self._v2_model
+
+    def _get_best_attention_implementation(self) -> str:
+        """Determine the best available attention implementation."""
+        try:
+            import flash_attn  # noqa: F401
+
+            return "flash_attention_2"
+        except ImportError:
+            pass
+
+        try:
+            import torch
+
+            if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+                return "sdpa"
+        except ImportError:
+            pass
+
+        return "eager"
+
     def download_models(self, revision: str | None) -> None:
+        if self._ocr_version == "v2":
+            self._predownload_v2(revision)
+            return
         self._get_page_extractor().download_models(revision)
 
     def load_models(self) -> None:
+        if self._ocr_version == "v2":
+            self._get_v2_model()
+            return
         self._get_page_extractor().load_models()
 
     def image2page(
@@ -56,6 +157,16 @@ class PageExtractorNode:
         device_number: int | None,
         aborted: AbortedCheck,
     ) -> Page:
+        if self._ocr_version == "v2":
+            return self._image2page_v2(
+                image=image,
+                page_index=page_index,
+                asset_hub=asset_hub,
+                includes_raw_image=includes_raw_image,
+                aborted=aborted,
+                device_number=device_number,
+            )
+
         from doc_page_extractor import ExtractionContext, plot
 
         body_layouts: list[PageLayout] = []
@@ -155,6 +266,209 @@ class PageExtractorNode:
                 input_tokens=context.input_tokens,
                 output_tokens=context.output_tokens,
             )
+
+    def _image2page_v2(
+        self,
+        image: Image,
+        page_index: int,
+        asset_hub: AssetHub,
+        includes_raw_image: bool,
+        aborted: AbortedCheck,
+        device_number: int | None,
+    ) -> Page:
+        import os
+        import tempfile
+
+        import torch
+
+        if device_number is not None:
+            torch.cuda.set_device(device_number)
+
+        tokenizer, model = self._get_v2_model()
+        raw_image: Image | None = None
+        if includes_raw_image:
+            raw_image = image
+
+        with tempfile.TemporaryDirectory() as temp_dir_path:
+            image_file = os.path.join(temp_dir_path, f"page_{page_index}.png")
+            output_path = os.path.join(temp_dir_path, "output")
+            os.makedirs(output_path, exist_ok=True)
+            image.save(image_file, format="PNG")
+
+            prompt = "<image>\n<|grounding|>Convert the document to markdown. "
+            try:
+                result = model.infer(
+                    tokenizer,
+                    prompt=prompt,
+                    image_file=image_file,
+                    output_path=output_path,
+                    base_size=1024,
+                    image_size=768,
+                    crop_mode=True,
+                    save_results=True,
+                )
+            except Exception as error:
+                raise OCRError(
+                    f"DeepSeek-OCR-2 inference failed for page {page_index}: {error}",
+                    page_index=page_index,
+                    step_index=1,
+                ) from error
+
+            check_aborted(aborted)
+
+            text = None
+            if isinstance(result, str):
+                text = result
+            elif isinstance(result, dict):
+                text = (
+                    result.get("markdown")
+                    or result.get("text")
+                    or result.get("result")
+                    or result.get("output")
+                )
+
+            if text is None:
+                output_dir = Path(output_path)
+                if output_dir.exists():
+                    candidates = list(output_dir.glob("*.md")) + list(
+                        output_dir.glob("*.txt")
+                    )
+                    if candidates:
+                        text = candidates[0].read_text(encoding="utf-8")
+
+            if text is None:
+                raise OCRError(
+                    f"DeepSeek-OCR-2 did not return text for page {page_index}.",
+                    page_index=page_index,
+                    step_index=1,
+                )
+
+            # Estimate token counts using the tokenizer
+            input_tokens, output_tokens = self._estimate_v2_tokens(
+                tokenizer, prompt, text
+            )
+
+            # Process the markdown text to extract layouts
+            body_layouts = self._parse_v2_markdown(
+                text=text,
+                image=image,
+                asset_hub=asset_hub,
+            )
+
+            return Page(
+                index=page_index,
+                image=raw_image,
+                body_layouts=body_layouts,
+                footnotes_layouts=[],
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+
+    def _estimate_v2_tokens(
+        self,
+        tokenizer,
+        prompt: str,
+        output_text: str,
+    ) -> tuple[int, int]:
+        """Estimate input and output token counts for v2 model."""
+        try:
+            # Input tokens: prompt + image tokens (estimated)
+            prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+            # DeepSeek-OCR-2 uses variable image tokens based on image size
+            # Estimate ~1000 tokens for a typical document page image
+            estimated_image_tokens = 1000
+            input_tokens = prompt_tokens + estimated_image_tokens
+
+            # Output tokens: the generated markdown
+            output_tokens = len(tokenizer.encode(output_text, add_special_tokens=False))
+
+            return input_tokens, output_tokens
+        except Exception:
+            # If tokenization fails, return 0
+            return 0, 0
+
+    def _parse_v2_markdown(
+        self,
+        text: str,
+        image: Image,
+        asset_hub: AssetHub,
+    ) -> list[PageLayout]:
+        """Parse v2 markdown output into PageLayout objects.
+
+        DeepSeek-OCR-2 outputs markdown that may contain image references.
+        This method extracts and processes them.
+        """
+        import re
+
+        width, height = image.size
+        layouts: list[PageLayout] = []
+
+        # Pattern to match image placeholders in markdown: ![...](...)
+        # DeepSeek-OCR-2 may output images as base64 or file references
+        image_pattern = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
+
+        last_end = 0
+        order = 0
+
+        for match in image_pattern.finditer(text):
+            # Add text before this image
+            text_before = text[last_end : match.start()].strip()
+            if text_before:
+                layouts.append(
+                    PageLayout(
+                        ref="text",
+                        det=(0, 0, width, height),
+                        text=self._normalize_text(text_before),
+                        order=order,
+                        hash=None,
+                    )
+                )
+                order += 1
+
+            # Process the image reference
+            alt_text = match.group(1)
+            img_src = match.group(2)
+
+            # Check if this is a region reference (e.g., coordinates in the image)
+            # For now, we keep the markdown image syntax as-is in the text
+            # The image from the page is already available via asset_hub if needed
+            layouts.append(
+                PageLayout(
+                    ref="image",
+                    det=(0, 0, width, height),
+                    text=f"![{alt_text}]({img_src})",
+                    order=order,
+                    hash=None,
+                )
+            )
+            order += 1
+            last_end = match.end()
+
+        # Add remaining text after last image
+        text_after = text[last_end:].strip()
+        if text_after:
+            layouts.append(
+                PageLayout(
+                    ref="text",
+                    det=(0, 0, width, height),
+                    text=self._normalize_text(text_after),
+                    order=order,
+                    hash=None,
+                )
+            )
+        elif not layouts:
+            # No images found, treat entire text as single layout
+            layouts.append(
+                PageLayout(
+                    ref="text",
+                    det=(0, 0, width, height),
+                    text=self._normalize_text(text),
+                    order=0,
+                    hash=None,
+                )
+            )
+
+        return layouts
 
     def _normalize_text(self, text: str | None) -> str:
         if text is None:

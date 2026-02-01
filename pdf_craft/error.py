@@ -10,10 +10,15 @@ class PDFError(Exception):
 
 
 class OCRError(Exception):
-    def __init__(self, message: str, page_index: int, step_index: int) -> None:
+    def __init__(
+        self,
+        message: str,
+        page_index: int | None = None,
+        step_index: int | None = None,
+    ) -> None:
         super().__init__(message)
-        self.page_index: int = page_index
-        self.step_index: int = step_index
+        self.page_index: int | None = page_index
+        self.step_index: int | None = step_index
 
 
 def is_inline_error(error: Exception) -> bool:

@@ -41,6 +41,15 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 pip install pdf-craft
 ```
 
+#### 3.1 (Optional) DeepSeek-OCR-2 Dependencies
+
+If you plan to use `ocr_version="v2"`, install the additional dependencies required by DeepSeek-OCR-2:
+
+```bash
+pip install "transformers>=4.46" "tokenizers>=0.20" einops addict easydict huggingface_hub
+pip install flash-attn==2.7.3 --no-build-isolation
+```
+
 #### 4. Install Poppler
 
 pdf-craft uses Poppler (via `pdf2image`) for PDF parsing and rendering. You need to install Poppler separately:

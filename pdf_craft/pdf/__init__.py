@@ -4,6 +4,7 @@ from .page_ref import pdf_pages_count
 from .ref import *
 from .types import (
     DeepSeekOCRSize,
+    DeepSeekOCRVersion,
     Page,
     PageLayout,
     PDFDocumentMetadata,

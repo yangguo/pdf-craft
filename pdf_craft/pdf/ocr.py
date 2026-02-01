@@ -16,7 +16,7 @@ from ..to_path import to_path
 from .handler import DefaultPDFHandler, PDFHandler
 from .page_extractor import Page, PageExtractorNode, PageLayout
 from .page_ref import PageRefContext
-from .types import DeepSeekOCRSize, PDFDocumentMetadata, encode
+from .types import DeepSeekOCRSize, DeepSeekOCRVersion, PDFDocumentMetadata, encode
 
 
 class OCREventKind(Enum):
@@ -43,6 +43,8 @@ class OCR:
     def __init__(
         self,
         model_path: PathLike | str | None,
+        model_name: str | None,
+        ocr_version: DeepSeekOCRVersion,
         pdf_handler: PDFHandler | None,
         local_only: bool,
     ) -> None:
@@ -50,6 +52,8 @@ class OCR:
         self._pdf_handler_lock = Lock()
         self._extractor = PageExtractorNode(
             model_path=to_path(model_path) if model_path is not None else None,
+            model_name=model_name,
+            ocr_version=ocr_version,
             local_only=local_only,
         )
 

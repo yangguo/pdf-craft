@@ -12,6 +12,7 @@ from .llm import LLM
 from .metering import AbortedCheck, InterruptedKind
 from .pdf import (
     DeepSeekOCRSize,
+    DeepSeekOCRVersion,
     DefaultPDFDocument,
     DefaultPDFHandler,
     OCREvent,
