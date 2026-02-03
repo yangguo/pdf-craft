@@ -12,6 +12,22 @@ from .ngrams import has_repetitive_ngrams
 from .types import DeepSeekOCRSize, DeepSeekOCRVersion, Page, PageLayout
 
 
+class _GLMOCRFallbackProcessor:
+    def __init__(self, tokenizer, image_processor) -> None:
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+
+    def __call__(self, images, text, return_tensors="pt"):
+        image_inputs = self.image_processor(images=images, return_tensors=return_tensors)
+        text_inputs = self.tokenizer(text, return_tensors=return_tensors)
+        merged = dict(image_inputs)
+        merged.update(text_inputs)
+        return merged
+
+    def decode(self, ids, skip_special_tokens=True):
+        return self.tokenizer.decode(ids, skip_special_tokens=skip_special_tokens)
+
+
 class PageExtractorNode:
     def __init__(
         self,
@@ -148,11 +164,78 @@ class PageExtractorNode:
             local_files_only=self._local_only,
         )
 
+    def _load_glm_ocr_processor(self, model_name: str):
+        cache_dir = str(self._model_path) if self._model_path else None
+        local_only = self._local_only
+        try:
+            from transformers import AutoProcessor
+
+            return AutoProcessor.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                cache_dir=cache_dir,
+                local_files_only=local_only,
+            )
+        except Exception:
+            pass
+
+        try:
+            from transformers import AutoImageProcessor, AutoTokenizer
+        except ImportError:
+            from transformers import AutoTokenizer
+
+            AutoImageProcessor = None
+
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                cache_dir=cache_dir,
+                local_files_only=local_only,
+            )
+
+            if AutoImageProcessor is not None:
+                try:
+                    image_processor = AutoImageProcessor.from_pretrained(
+                        model_name,
+                        trust_remote_code=True,
+                        cache_dir=cache_dir,
+                        local_files_only=local_only,
+                    )
+                except Exception:
+                    image_processor = None
+            else:
+                image_processor = None
+
+            if image_processor is None:
+                try:
+                    from transformers import AutoFeatureExtractor
+                except ImportError as feature_error:
+                    raise OCRError(
+                        "GLM-OCR requires a processor or image processor. "
+                        "Failed to load any compatible processor."
+                    ) from feature_error
+
+                image_processor = AutoFeatureExtractor.from_pretrained(
+                    model_name,
+                    trust_remote_code=True,
+                    cache_dir=cache_dir,
+                    local_files_only=local_only,
+                )
+
+            return _GLMOCRFallbackProcessor(tokenizer, image_processor)
+        except Exception as fallback_error:  # pragma: no cover - safety net
+            raise OCRError(
+                "Failed to load GLM-OCR processor. "
+                "If you see 'Unrecognized processing class', "
+                "upgrade transformers or use a model repo with processor files."
+            ) from fallback_error
+
     def _get_glm_ocr_model(self):
         if self._glm_ocr_model is None:
             try:
                 import torch
-                from transformers import AutoModelForImageTextToText, AutoProcessor
+                from transformers import AutoModelForImageTextToText
             except ImportError as error:  # pragma: no cover - import guard
                 raise OCRError(
                     "GLM-OCR requires transformers and torch to be installed. "
@@ -166,12 +249,7 @@ class PageExtractorNode:
                 )
 
             model_name = self._model_name or "zai-org/GLM-OCR"
-            processor = AutoProcessor.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                cache_dir=str(self._model_path) if self._model_path else None,
-                local_files_only=self._local_only,
-            )
+            processor = self._load_glm_ocr_processor(model_name)
 
             # Try flash_attention_2 first, fall back to sdpa or eager if unavailable
             attn_impl = self._get_best_attention_implementation()
@@ -480,7 +558,12 @@ class PageExtractorNode:
                 generated_ids = model.generate(**inputs, max_new_tokens=4096)
 
             # Decode the result
-            result = processor.decode(generated_ids[0], skip_special_tokens=True)
+            if hasattr(processor, "decode"):
+                result = processor.decode(generated_ids[0], skip_special_tokens=True)
+            else:
+                result = processor.tokenizer.decode(
+                    generated_ids[0], skip_special_tokens=True
+                )
         except Exception as error:
             raise OCRError(
                 f"GLM-OCR inference failed for page {page_index}: {error}",
