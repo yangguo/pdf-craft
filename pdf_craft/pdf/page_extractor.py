@@ -28,6 +28,7 @@ class PageExtractorNode:
         self._enable_devices_numbers: Iterable[int] | None = enable_devices_numbers
         self._page_extractor = None
         self._v2_model = None
+        self._glm_ocr_model = None
 
     def _get_page_extractor(self):
         if not self._page_extractor:
@@ -131,15 +132,81 @@ class PageExtractorNode:
 
         return "eager"
 
+    def _predownload_glm_ocr(self, revision: str | None) -> None:
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as error:  # pragma: no cover - import guard
+            raise OCRError(
+                "GLM-OCR requires huggingface_hub to predownload models."
+            ) from error
+
+        model_name = self._model_name or "zai-org/GLM-OCR"
+        snapshot_download(
+            repo_id=model_name,
+            revision=revision,
+            cache_dir=str(self._model_path) if self._model_path else None,
+            local_files_only=self._local_only,
+        )
+
+    def _get_glm_ocr_model(self):
+        if self._glm_ocr_model is None:
+            try:
+                import torch
+                from transformers import AutoModelForImageTextToText, AutoProcessor
+            except ImportError as error:  # pragma: no cover - import guard
+                raise OCRError(
+                    "GLM-OCR requires transformers and torch to be installed. "
+                    "Install with: pip install 'transformers>=4.46' torch"
+                ) from error
+
+            if not torch.cuda.is_available():
+                raise OCRError(
+                    "CUDA is not available for GLM-OCR. "
+                    "Please ensure you have a CUDA-capable GPU and PyTorch with CUDA support."
+                )
+
+            model_name = self._model_name or "zai-org/GLM-OCR"
+            processor = AutoProcessor.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                cache_dir=str(self._model_path) if self._model_path else None,
+                local_files_only=self._local_only,
+            )
+
+            # Try flash_attention_2 first, fall back to sdpa or eager if unavailable
+            attn_impl = self._get_best_attention_implementation()
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_name,
+                trust_remote_code=True,
+                use_safetensors=True,
+                attn_implementation=attn_impl,
+                cache_dir=str(self._model_path) if self._model_path else None,
+                local_files_only=self._local_only,
+            )
+            model = model.eval().cuda()
+            try:
+                model = model.to(torch.bfloat16)
+            except Exception:
+                model = model.to(torch.float16)
+
+            self._glm_ocr_model = (processor, model)
+        return self._glm_ocr_model
+
     def download_models(self, revision: str | None) -> None:
         if self._ocr_version == "v2":
             self._predownload_v2(revision)
+            return
+        if self._ocr_version == "glm-ocr":
+            self._predownload_glm_ocr(revision)
             return
         self._get_page_extractor().download_models(revision)
 
     def load_models(self) -> None:
         if self._ocr_version == "v2":
             self._get_v2_model()
+            return
+        if self._ocr_version == "glm-ocr":
+            self._get_glm_ocr_model()
             return
         self._get_page_extractor().load_models()
 
@@ -159,6 +226,16 @@ class PageExtractorNode:
     ) -> Page:
         if self._ocr_version == "v2":
             return self._image2page_v2(
+                image=image,
+                page_index=page_index,
+                asset_hub=asset_hub,
+                includes_raw_image=includes_raw_image,
+                aborted=aborted,
+                device_number=device_number,
+            )
+
+        if self._ocr_version == "glm-ocr":
+            return self._image2page_glm_ocr(
                 image=image,
                 page_index=page_index,
                 asset_hub=asset_hub,
@@ -363,6 +440,110 @@ class PageExtractorNode:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
             )
+
+    def _image2page_glm_ocr(
+        self,
+        image: Image,
+        page_index: int,
+        asset_hub: AssetHub,
+        includes_raw_image: bool,
+        aborted: AbortedCheck,
+        device_number: int | None,
+    ) -> Page:
+        import torch
+
+        if device_number is not None:
+            torch.cuda.set_device(device_number)
+
+        processor, model = self._get_glm_ocr_model()
+        raw_image: Image | None = None
+        if includes_raw_image:
+            raw_image = image
+
+        # Convert PIL Image to RGB if needed
+        if image.mode != "RGB":
+            image = image.convert("RGB")
+
+        # Prepare prompt for GLM-OCR
+        prompt = "Text Recognition:"
+
+        try:
+            # Prepare inputs using the processor
+            inputs = processor(images=image, text=prompt, return_tensors="pt")
+
+            # Move inputs to GPU
+            for key in inputs:
+                inputs[key] = inputs[key].cuda()
+
+            # Generate output
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs, max_new_tokens=4096)
+
+            # Decode the result
+            result = processor.decode(generated_ids[0], skip_special_tokens=True)
+        except Exception as error:
+            raise OCRError(
+                f"GLM-OCR inference failed for page {page_index}: {error}",
+                page_index=page_index,
+                step_index=1,
+            ) from error
+
+        check_aborted(aborted)
+
+        text = result if isinstance(result, str) else str(result)
+
+        if not text:
+            raise OCRError(
+                f"GLM-OCR did not return text for page {page_index}.",
+                page_index=page_index,
+                step_index=1,
+            )
+
+        # Estimate token counts using the processor's tokenizer
+        input_tokens, output_tokens = self._estimate_glm_ocr_tokens(
+            processor, prompt, text
+        )
+
+        # Process the markdown text to extract layouts
+        # GLM-OCR output format is similar to v2, so reuse the parsing logic
+        body_layouts = self._parse_v2_markdown(
+            text=text,
+            image=image,
+            asset_hub=asset_hub,
+        )
+
+        return Page(
+            index=page_index,
+            image=raw_image,
+            body_layouts=body_layouts,
+            footnotes_layouts=[],
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+
+    def _estimate_glm_ocr_tokens(
+        self,
+        processor,
+        prompt: str,
+        output_text: str,
+    ) -> tuple[int, int]:
+        """Estimate input and output token counts for GLM-OCR model."""
+        try:
+            # Input tokens: prompt + image tokens (estimated)
+            tokenizer = processor.tokenizer
+            prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
+            # GLM-OCR uses variable image tokens based on image size
+            # Estimate ~1000 tokens for a typical document page image
+            estimated_image_tokens = 1000
+            input_tokens = prompt_tokens + estimated_image_tokens
+
+            # Output tokens: the generated text
+            output_tokens = len(tokenizer.encode(output_text, add_special_tokens=False))
+
+            return input_tokens, output_tokens
+        except Exception:
+            # If tokenization fails, return 0
+            return 0, 0
 
     def _estimate_v2_tokens(
         self,

@@ -88,8 +88,8 @@ transform_markdown(
     analysing_path="temp",  # Optional: specify temporary folder
     ocr_size="gundam",  # Optional: tiny, small, base, large, gundam
     models_cache_path="models",  # Optional: model cache path
-    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2")
-    ocr_version="v1",  # Optional: "v1" (default) or "v2"
+    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR")
+    ocr_version="v1",  # Optional: "v1" (default), "v2", or "glm-ocr"
     dpi=300,  # Optional: DPI for rendering PDF pages (default: 300)
     max_page_image_file_size=None,  # Optional: max image file size in bytes, auto-adjust DPI if exceeded
     includes_cover=False,  # Optional: include cover
@@ -112,8 +112,8 @@ transform_epub(
     analysing_path="temp",  # Optional: specify temporary folder
     ocr_size="gundam",  # Optional: tiny, small, base, large, gundam
     models_cache_path="models",  # Optional: model cache path
-    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2")
-    ocr_version="v1",  # Optional: "v1" (default) or "v2"
+    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR")
+    ocr_version="v1",  # Optional: "v1" (default), "v2", or "glm-ocr"
     dpi=300,  # Optional: DPI for rendering PDF pages (default: 300)
     max_page_image_file_size=None,  # Optional: max image file size in bytes, auto-adjust DPI if exceeded
     includes_cover=True,  # Optional: include cover
@@ -140,6 +140,8 @@ transform_epub(
 pdf-craft depends on DeepSeek OCR models, which are automatically downloaded from Hugging Face on first run. You can control model storage and loading behavior through the `models_cache_path` and `local_only` parameters.
 
 For DeepSeek-OCR-2, set `ocr_version="v2"` (and optionally `ocr_model="deepseek-ai/DeepSeek-OCR-2"`). OCR-2 currently ships as a single large model; `ocr_size` is ignored in v2 mode.
+
+For GLM-OCR, set `ocr_version="glm-ocr"` (and optionally `ocr_model="zai-org/GLM-OCR"`). GLM-OCR is a lightweight (0.9B parameters) multimodal OCR model with high accuracy and multi-language support. Like v2, `ocr_size` is ignored in glm-ocr mode.
 
 #### Pre-download Models
 

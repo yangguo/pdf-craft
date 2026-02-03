@@ -88,6 +88,8 @@ transform_markdown(
     analysing_path="temp",  # 可选：指定临时文件夹
     ocr_size="gundam",  # 可选：tiny, small, base, large, gundam
     models_cache_path="models",  # 可选：模型缓存路径
+    ocr_model=None,  # 可选：模型仓库 ID（如 "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR"）
+    ocr_version="v1",  # 可选："v1"（默认）、"v2" 或 "glm-ocr"
     dpi=300,  # 可选：渲染 PDF 页面的 DPI（默认：300）
     max_page_image_file_size=None,  # 可选：最大图像文件大小（字节），超出时自动调整 DPI
     includes_cover=False,  # 可选：包含封面
@@ -110,6 +112,8 @@ transform_epub(
     analysing_path="temp",  # 可选：指定临时文件夹
     ocr_size="gundam",  # 可选：tiny, small, base, large, gundam
     models_cache_path="models",  # 可选：模型缓存路径
+    ocr_model=None,  # 可选：模型仓库 ID（如 "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR"）
+    ocr_version="v1",  # 可选："v1"（默认）、"v2" 或 "glm-ocr"
     dpi=300,  # 可选：渲染 PDF 页面的 DPI（默认：300）
     max_page_image_file_size=None,  # 可选：最大图像文件大小（字节），超出时自动调整 DPI
     includes_cover=True,  # 可选：包含封面
@@ -134,6 +138,10 @@ transform_epub(
 ### 模型管理
 
 pdf-craft 依赖 DeepSeek OCR 模型，首次运行时会自动从 Hugging Face 下载。你可以通过 `models_cache_path` 和 `local_only` 参数控制模型的存储和加载行为。
+
+对于 DeepSeek-OCR-2，设置 `ocr_version="v2"`（可选配合 `ocr_model="deepseek-ai/DeepSeek-OCR-2"`）。OCR-2 目前作为单一大模型发布，v2 模式下 `ocr_size` 参数将被忽略。
+
+对于 GLM-OCR，设置 `ocr_version="glm-ocr"`（可选配合 `ocr_model="zai-org/GLM-OCR"`）。GLM-OCR 是一个轻量级（0.9B 参数）的多模态 OCR 模型，具有高精度和多语言支持。与 v2 类似，glm-ocr 模式下 `ocr_size` 参数将被忽略。
 
 #### 预下载模型
 
