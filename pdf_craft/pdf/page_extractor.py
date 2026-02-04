@@ -270,6 +270,16 @@ class PageExtractorNode:
             self._glm_ocr_model = (processor, model)
         return self._glm_ocr_model
 
+    @staticmethod
+    def _build_glm_ocr_prompt(processor) -> str:
+        image_token = getattr(processor, "image_token", None)
+        if not isinstance(image_token, str) or not image_token:
+            tokenizer = getattr(processor, "tokenizer", None)
+            image_token = getattr(tokenizer, "image_token", None)
+        if not isinstance(image_token, str) or not image_token:
+            image_token = "<|image|>"
+        return f"{image_token}\nText Recognition:"
+
     def download_models(self, revision: str | None) -> None:
         if self._ocr_version == "v2":
             self._predownload_v2(revision)
@@ -543,7 +553,7 @@ class PageExtractorNode:
             image = image.convert("RGB")
 
         # Prepare prompt for GLM-OCR
-        prompt = "Text Recognition:"
+        prompt = self._build_glm_ocr_prompt(processor)
 
         try:
             # Prepare inputs using the processor
