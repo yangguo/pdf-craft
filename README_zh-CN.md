@@ -74,6 +74,114 @@ transform_epub(
 
 ![](docs/images/pdf2epub-cn.png)
 
+### 命令行脚本
+
+如果你已经克隆了本仓库，`scripts/` 目录下提供了可以直接运行的脚本。
+
+**PDF → EPUB**（`scripts/gen_epub.py`）
+
+```bash
+# 最简用法 —— 输出到 analysing_<文件名>/<文件名>.epub
+python scripts/gen_epub.py book.pdf
+
+# 自定义输出路径
+python scripts/gen_epub.py book.pdf -o output/book.epub
+
+# 所有选项
+python scripts/gen_epub.py book.pdf \
+  -o output/book.epub \
+  --analysing-dir /tmp/ocr-work \
+  --models-cache ~/.cache/models
+```
+
+**PDF → Markdown**（`scripts/gen_md.py`）
+
+编辑文件顶部的 `_IMAGE_STEM` 变量，使其指向你的 PDF 文件，然后运行：
+
+```bash
+python scripts/gen_md.py
+```
+
+**百度 PaddleOCR API → EPUB**（`pdf2epub_paddle.py`）—— *实验性*
+
+一个独立脚本，使用[百度 AIStudio PaddleOCR 版面解析 API](https://aistudio.baidu.com/) 替代本地 DeepSeek OCR，无需本地 GPU。完整说明见下方 [PaddleOCR API 工具](#paddleocr-api-工具实验性) 章节。
+
+```bash
+python pdf2epub_paddle.py input.pdf --output book.epub --auto-toc
+```
+
+## PaddleOCR API 工具（实验性）
+
+这是一个独立脚本（`pdf2epub_paddle.py`），使用百度 AIStudio PaddleOCR 版面分析 API 将扫描版 PDF 书籍转换为 EPUB，无需本地 GPU。
+
+### 功能特性
+
+- **高质量版面分析**：使用 PaddleOCR 智能识别段落、标题、图片和表格。
+- **智能章节分割**：自动检测章节标题，交互式 TOC 审查允许你在生成 EPUB 前确认、删除或调整章节。
+- **封面图片**：自动提取 PDF 第一页作为 EPUB 封面。
+- **元数据支持**：根据 OCR 识别的首页文本交互式提示输入书名和作者，或通过 CLI 参数直接指定。
+- **图片嵌入**：完整保留原 PDF 中的图片。
+- **纯净输出**：自动移除页眉、页脚和页码。
+- **高鲁棒性**：断点续传、速率限制与自动重试。
+
+### 前置要求
+
+- Python 3.8+
+- 百度 AIStudio API Token —— 登录 [百度 AIStudio](https://aistudio.baidu.com/)，找到 PaddleOCR / 版面解析 API 并复制你的 Token。
+- 额外依赖：`pymupdf`、`ebooklib`、`requests`、`python-dotenv`、`markdown`
+
+### 配置
+
+1. 将 `.env.example` 复制为 `.env` 并填入你的 Token：
+
+    ```bash
+    cp .env.example .env
+    # 编辑 .env：
+    # PADDLE_API_TOKEN=your_api_token_here
+    ```
+
+2. 安装依赖（推荐使用 `uv`，或标准 pip）：
+
+    ```bash
+    # 使用 uv（自动处理虚拟环境）
+    uv run pdf2epub_paddle.py /path/to/book.pdf
+
+    # 或使用标准 pip
+    pip install pymupdf ebooklib requests python-dotenv markdown
+    python pdf2epub_paddle.py /path/to/book.pdf
+    ```
+
+    也可以直接设置环境变量代替 `.env` 文件：
+
+    ```bash
+    export PADDLE_API_TOKEN='your_token'
+    ```
+
+### 使用方法
+
+```bash
+# 基本用法（交互式填写书名和作者）
+python pdf2epub_paddle.py book.pdf
+
+# 指定输出路径
+python pdf2epub_paddle.py book.pdf --output book.epub
+
+# 通过 CLI 参数指定元数据（跳过交互提示）
+python pdf2epub_paddle.py book.pdf --title "书名" --author "作者"
+
+# 跳过交互式 TOC 审查，使用自动检测的章节
+python pdf2epub_paddle.py book.pdf --auto-toc
+
+# 不分章节，生成单章 EPUB
+python pdf2epub_paddle.py book.pdf --no-toc
+```
+
+### 配置项
+
+- **分块大小**：默认每次 API 请求处理 5 页（脚本中的 `CHUNK_SIZE`）。网络稳定且额度充足时可适当增大。
+- **超时时间**：默认每次请求超时 180 秒。
+- **断点续传**：每处理完一个分块后，进度保存在 `paddle_epub_work_<hash>/` 目录。中断后重新运行相同命令即可续传。
+
 ## 详细使用
 
 ### 转换为 Markdown
@@ -88,6 +196,8 @@ transform_markdown(
     analysing_path="temp",  # 可选：指定临时文件夹
     ocr_size="gundam",  # 可选：tiny, small, base, large, gundam
     models_cache_path="models",  # 可选：模型缓存路径
+    ocr_model=None,  # 可选：模型仓库 ID（如 "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR"）
+    ocr_version="v1",  # 可选："v1"（默认）、"v2" 或 "glm-ocr"
     dpi=300,  # 可选：渲染 PDF 页面的 DPI（默认：300）
     max_page_image_file_size=None,  # 可选：最大图像文件大小（字节），超出时自动调整 DPI
     includes_cover=False,  # 可选：包含封面
@@ -110,6 +220,8 @@ transform_epub(
     analysing_path="temp",  # 可选：指定临时文件夹
     ocr_size="gundam",  # 可选：tiny, small, base, large, gundam
     models_cache_path="models",  # 可选：模型缓存路径
+    ocr_model=None,  # 可选：模型仓库 ID（如 "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR"）
+    ocr_version="v1",  # 可选："v1"（默认）、"v2" 或 "glm-ocr"
     dpi=300,  # 可选：渲染 PDF 页面的 DPI（默认：300）
     max_page_image_file_size=None,  # 可选：最大图像文件大小（字节），超出时自动调整 DPI
     includes_cover=True,  # 可选：包含封面
@@ -134,6 +246,10 @@ transform_epub(
 ### 模型管理
 
 pdf-craft 依赖 DeepSeek OCR 模型，首次运行时会自动从 Hugging Face 下载。你可以通过 `models_cache_path` 和 `local_only` 参数控制模型的存储和加载行为。
+
+对于 DeepSeek-OCR-2，设置 `ocr_version="v2"`（可选配合 `ocr_model="deepseek-ai/DeepSeek-OCR-2"`）。OCR-2 目前作为单一大模型发布，v2 模式下 `ocr_size` 参数将被忽略。
+
+对于 GLM-OCR，设置 `ocr_version="glm-ocr"`（可选配合 `ocr_model="zai-org/GLM-OCR"`）。GLM-OCR 是一个轻量级（0.9B 参数）的多模态 OCR 模型，具有高精度和多语言支持。与 v2 类似，glm-ocr 模式下 `ocr_size` 参数将被忽略。
 
 #### 预下载模型
 

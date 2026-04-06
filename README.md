@@ -74,6 +74,114 @@ transform_epub(
 
 ![20251218-162533](https://github.com/user-attachments/assets/7f6df04a-1fa7-48b3-aa5e-d2d056304ad6)
 
+### Command Line Scripts
+
+If you have cloned this repository, ready-to-run scripts are provided in `scripts/`.
+
+**PDF → EPUB** (`scripts/gen_epub.py`)
+
+```bash
+# Minimal — output goes to analysing_<name>/<name>.epub
+python scripts/gen_epub.py book.pdf
+
+# Custom output path
+python scripts/gen_epub.py book.pdf -o output/book.epub
+
+# All options
+python scripts/gen_epub.py book.pdf \
+  -o output/book.epub \
+  --analysing-dir /tmp/ocr-work \
+  --models-cache ~/.cache/models
+```
+
+**PDF → Markdown** (`scripts/gen_md.py`)
+
+Edit the `_IMAGE_STEM` variable at the top of the file to point at your PDF, then run:
+
+```bash
+python scripts/gen_md.py
+```
+
+**Baidu PaddleOCR API → EPUB** (`pdf2epub_paddle.py`) — *experimental*
+
+A self-contained script that uses the [Baidu AIStudio PaddleOCR Layout API](https://aistudio.baidu.com/) instead of local DeepSeek OCR. See the [PaddleOCR API Tool](#paddleocr-api-tool-experimental) section below for full setup and usage.
+
+```bash
+python pdf2epub_paddle.py input.pdf --output book.epub --auto-toc
+```
+
+## PaddleOCR API Tool (Experimental)
+
+This is a standalone script (`pdf2epub_paddle.py`) that converts scanned PDF books to EPUB using the Baidu AIStudio PaddleOCR Layout Analysis API — no local GPU required.
+
+### Features
+
+- **High-Quality Layout Analysis**: Uses PaddleOCR to intelligently detect paragraphs, headers, images, and tables.
+- **Smart Chapter Splitting**: Automatically detects chapter headings from OCR output. An interactive TOC review lets you confirm, remove, or adjust detected chapters before generating the EPUB.
+- **Cover Image**: Automatically extracts the first page of the PDF as the EPUB cover.
+- **Metadata Support**: Interactively prompts for book title and author based on OCR'd first-page text, or accepts them via CLI arguments.
+- **Image Embedding**: Preserves images from the original PDF.
+- **Clean Output**: Removes headers, footers, and page numbers for a seamless reading experience.
+- **Robustness**: Checkpointing (resume on interrupt), rate limiting, and automatic retry logic.
+
+### Prerequisites
+
+- Python 3.8+
+- A Baidu AIStudio API Token — log in to [Baidu AIStudio](https://aistudio.baidu.com/), find the PaddleOCR / Layout Parsing API, and copy your token.
+- Extra dependencies: `pymupdf`, `ebooklib`, `requests`, `python-dotenv`, `markdown`
+
+### Setup
+
+1. Copy `.env.example` to `.env` and add your token:
+
+    ```bash
+    cp .env.example .env
+    # Edit .env:
+    # PADDLE_API_TOKEN=your_api_token_here
+    ```
+
+2. Install dependencies (recommended via `uv`, or standard pip):
+
+    ```bash
+    # With uv (handles virtualenv automatically)
+    uv run pdf2epub_paddle.py /path/to/book.pdf
+
+    # Or with standard pip
+    pip install pymupdf ebooklib requests python-dotenv markdown
+    python pdf2epub_paddle.py /path/to/book.pdf
+    ```
+
+    You can also set the token directly as an environment variable instead of using `.env`:
+
+    ```bash
+    export PADDLE_API_TOKEN='your_token'
+    ```
+
+### Usage
+
+```bash
+# Basic (prompts for title and author)
+python pdf2epub_paddle.py book.pdf
+
+# Specify output path
+python pdf2epub_paddle.py book.pdf --output book.epub
+
+# Provide metadata via CLI (skips interactive prompts)
+python pdf2epub_paddle.py book.pdf --title "Book Title" --author "Author Name"
+
+# Skip interactive TOC review, use auto-detected chapters
+python pdf2epub_paddle.py book.pdf --auto-toc
+
+# No chapter splitting — single-chapter EPUB
+python pdf2epub_paddle.py book.pdf --no-toc
+```
+
+### Configuration
+
+- **Chunk Size**: Default is 5 pages per API request (`CHUNK_SIZE` in the script). Increase if your connection is stable and your quota is high.
+- **Timeout**: Default is 180 seconds per request.
+- **Checkpointing**: Progress is saved after each chunk in a `paddle_epub_work_<hash>/` directory. Re-run the same command to resume after an interruption.
+
 ## Detailed Usage
 
 ### Convert to Markdown
@@ -88,8 +196,8 @@ transform_markdown(
     analysing_path="temp",  # Optional: specify temporary folder
     ocr_size="gundam",  # Optional: tiny, small, base, large, gundam
     models_cache_path="models",  # Optional: model cache path
-    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2")
-    ocr_version="v1",  # Optional: "v1" (default) or "v2"
+    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR")
+    ocr_version="v1",  # Optional: "v1" (default), "v2", or "glm-ocr"
     dpi=300,  # Optional: DPI for rendering PDF pages (default: 300)
     max_page_image_file_size=None,  # Optional: max image file size in bytes, auto-adjust DPI if exceeded
     includes_cover=False,  # Optional: include cover
@@ -112,8 +220,8 @@ transform_epub(
     analysing_path="temp",  # Optional: specify temporary folder
     ocr_size="gundam",  # Optional: tiny, small, base, large, gundam
     models_cache_path="models",  # Optional: model cache path
-    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2")
-    ocr_version="v1",  # Optional: "v1" (default) or "v2"
+    ocr_model=None,  # Optional: model repo id (e.g. "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR")
+    ocr_version="v1",  # Optional: "v1" (default), "v2", or "glm-ocr"
     dpi=300,  # Optional: DPI for rendering PDF pages (default: 300)
     max_page_image_file_size=None,  # Optional: max image file size in bytes, auto-adjust DPI if exceeded
     includes_cover=True,  # Optional: include cover
@@ -140,6 +248,8 @@ transform_epub(
 pdf-craft depends on DeepSeek OCR models, which are automatically downloaded from Hugging Face on first run. You can control model storage and loading behavior through the `models_cache_path` and `local_only` parameters.
 
 For DeepSeek-OCR-2, set `ocr_version="v2"` (and optionally `ocr_model="deepseek-ai/DeepSeek-OCR-2"`). OCR-2 currently ships as a single large model; `ocr_size` is ignored in v2 mode.
+
+For GLM-OCR, set `ocr_version="glm-ocr"` (and optionally `ocr_model="zai-org/GLM-OCR"`). GLM-OCR is a lightweight (0.9B parameters) multimodal OCR model with high accuracy and multi-language support. Like v2, `ocr_size` is ignored in glm-ocr mode.
 
 #### Pre-download Models
 

@@ -8,7 +8,7 @@ from PIL.Image import Image
 from ..common import indent
 
 DeepSeekOCRSize = Literal["tiny", "small", "base", "large", "gundam"]
-DeepSeekOCRVersion = Literal["v1", "v2"]
+DeepSeekOCRVersion = Literal["v1", "v2", "glm-ocr"]
 
 
 @dataclass
