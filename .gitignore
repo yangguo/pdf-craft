@@ -1,8 +1,14 @@
 .DS_Store
+/*.png
+/*.json
+/*.epub
+/*.pdf
 
 /.venv
 /analysing
 /models-cache
+/tmp
+/paddle_epub_work_*/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
