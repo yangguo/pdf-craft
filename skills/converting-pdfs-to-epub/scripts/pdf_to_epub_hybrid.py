@@ -176,14 +176,16 @@ def join_pdf_lines(lines: list[str]) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 
-def is_header_or_footer(block: tuple, drop_headers: bool) -> bool:
+def is_header_or_footer(block: tuple, drop_headers: bool, page_height: float = 792.0) -> bool:
     if not drop_headers:
         return False
     _, y0, _, _, text = block[:5]
     compact = " ".join(clean_lines(text))
     if not compact:
         return True
-    return y0 < 52 or y0 > 580
+    header_threshold = page_height * 0.065
+    footer_threshold = page_height * 0.732
+    return y0 < header_threshold or y0 > footer_threshold
 
 
 def page_text_blocks(page: fitz.Page, page_no: int, drop_headers: bool) -> list[str]:
@@ -194,8 +196,9 @@ def page_text_blocks(page: fitz.Page, page_no: int, drop_headers: bool) -> list[
         blocks = sorted(blocks, key=lambda b: (round(b[1], 1), round(b[0], 1)))
 
     text_blocks = []
+    page_height = page.rect.height
     for block in blocks:
-        if is_header_or_footer(block, drop_headers):
+        if is_header_or_footer(block, drop_headers, page_height):
             continue
         text = join_pdf_lines(clean_lines(block[4]))
         if text:
@@ -215,7 +218,11 @@ def paragraph_html(text: str, *, first: bool, index_page: bool) -> str:
 
 def render_page_jpeg(page: fitz.Page, *, zoom: float, quality: int) -> bytes:
     rect = page.rect
-    clip = fitz.Rect(max(rect.x0, 30), max(rect.y0, 24), min(rect.x1, rect.x1 - 30), min(rect.y1, rect.y1 - 24))
+    clip_x0 = max(rect.x0, 30)
+    clip_y0 = max(rect.y0, 24)
+    clip_x1 = max(rect.x0 + 1, rect.x1 - 30)
+    clip_y1 = max(rect.y0 + 1, rect.y1 - 24)
+    clip = fitz.Rect(clip_x0, clip_y0, clip_x1, clip_y1)
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
     image = Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
     buf = BytesIO()
@@ -292,6 +299,10 @@ def build_epub(args: argparse.Namespace) -> int:
     pdf_path = Path(args.pdf)
     out_path = Path(args.output)
     doc = fitz.open(pdf_path)
+
+    if not (1 <= args.cover_page <= doc.page_count):
+        print(f"[!] Error: cover_page must be between 1 and {doc.page_count}, got {args.cover_page}")
+        return 1
 
     title = args.title or normalize_text(doc.metadata.get("title") or "") or pdf_path.stem
     author = args.author or normalize_text(doc.metadata.get("author") or "") or "Unknown"
