@@ -1,0 +1,4 @@
+interface:
+  display_name: "Convert PDFs to EPUB"
+  short_description: "Validated PDF to EPUB conversion"
+  default_prompt: "Convert the provided PDF into a validated EPUB, preserving selectable text and embedding only necessary local visuals."

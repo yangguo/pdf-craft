@@ -83,7 +83,7 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     return chunk_paths
 
 
-def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any]:
+def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
     """
     Sends a PDF chunk to the PaddleOCR API and returns the parsed result.
     """
@@ -155,7 +155,7 @@ def process_layout_results(result, chunk_path):
     return result
 
 
-def extract_cover_image(pdf_path: str, output_path: str) -> str:
+def extract_cover_image(pdf_path: str, output_path: str) -> str | None:
     """Renders the first page of a PDF as a PNG image for use as an EPUB cover."""
     doc = fitz.open(pdf_path)
     try:
@@ -175,7 +175,7 @@ def extract_cover_image(pdf_path: str, output_path: str) -> str:
         doc.close()
 
 
-def extract_metadata_interactive(results: List[Dict], default_title: str) -> Dict[str, str]:
+def extract_metadata_interactive(results: List[Dict], default_title: str) -> Dict[str, str | None]:
     """Shows the first page OCR text and prompts the user for title and author."""
     first_page_text = ""
     try:
@@ -358,8 +358,8 @@ def download_image(url: str, save_path: str):
 
 
 def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
-                cover_image_path: str = None, author: str = None,
-                confirmed_headings: List[Dict] = None):
+                cover_image_path: str | None = None, author: str | None = None,
+                confirmed_headings: List[Dict] | None = None):
     """
     Creates an EPUB file from the aggregated API results.
     """
