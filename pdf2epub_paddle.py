@@ -5,6 +5,7 @@ import base64
 import json
 import re
 import tempfile
+import zipfile
 
 from typing import List, Dict, Any
 
@@ -23,8 +24,140 @@ API_URL = "https://feq472ncm4mfofva.aistudio-app.com/layout-parsing"
 # Environment variable for API token
 API_TOKEN = os.getenv("PADDLE_API_TOKEN", "")
 
-CHUNK_SIZE = 5  # Reduced to 5 for maximum reliability
+DEFAULT_EPUB_LANGUAGE = os.getenv("EPUB_LANGUAGE", "zh-Hant")
 MAX_DAILY_PAGES = 3000
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    """Parse integer env vars without making import fail on bad local config."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if minimum is not None and parsed < minimum:
+        return default
+    return parsed
+
+
+CHUNK_SIZE = _env_int("PADDLE_CHUNK_SIZE", 5, minimum=1)  # Reduced to 5 for reliability
+API_TIMEOUT_SECONDS = _env_int("PADDLE_API_TIMEOUT_SECONDS", 600, minimum=1)
+DEFAULT_COVER_MAX_EDGE = _env_int("EPUB_COVER_MAX_EDGE", 2000, minimum=1)
+DEFAULT_COVER_JPEG_QUALITY = _env_int("EPUB_COVER_JPEG_QUALITY", 82, minimum=1)
+
+DOWNARROW_PROSE_SEPARATOR_PATTERN = re.compile(
+    r"([\u3400-\u9fff])\s*\$\s*\\downarrow\s*\$\s*([\u3400-\u9fff])"
+)
+OCR_NOISE_PATTERNS = (
+    ("\\underset{\\cdot}", re.compile(r"\\underset\{\\cdot\}")),
+    ("CJK $ \\downarrow $ separator", DOWNARROW_PROSE_SEPARATOR_PATTERN),
+    (
+        "20 $ \\frac{1}{2} $7年",
+        re.compile(r"20\s*\$\s*\\frac\{1\}\{2\}\s*\$\s*7年"),
+    ),
+)
+EPUB_STRUCTURAL_FILES = {
+    "content.opf",
+    "toc.ncx",
+    "nav.xhtml",
+    "nav.html",
+}
+
+
+def clean_ocr_noise(markdown_text: str) -> str:
+    """Remove common PaddleOCR layout artifacts while preserving prose."""
+    if not markdown_text:
+        return ""
+
+    cleaned = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # False inline math around emphasized Chinese characters.
+    cleaned = re.sub(
+        r"\$\s*\\underset\{\\cdot\}\{([^{}]+)\}\s*\$",
+        r"\1",
+        cleaned,
+    )
+    # Known OCR split: 2017 rendered as 20 $ \frac{1}{2} $7.
+    cleaned = re.sub(
+        r"20\s*\$\s*\\frac\{1\}\{2\}\s*\$\s*7年",
+        "2017年",
+        cleaned,
+    )
+    # False arrow used as a list separator in CJK prose.
+    cleaned = DOWNARROW_PROSE_SEPARATOR_PATTERN.sub(r"\1、\2", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def scan_epub_for_ocr_noise(epub_path: str) -> List[Dict[str, Any]]:
+    """Return suspicious OCR LaTeX artifacts found in EPUB text files."""
+    findings: List[Dict[str, Any]] = []
+    with zipfile.ZipFile(epub_path) as archive:
+        for name in archive.namelist():
+            lower_name = name.lower()
+            if os.path.basename(lower_name) in EPUB_STRUCTURAL_FILES:
+                continue
+            if not lower_name.endswith((".xhtml", ".html")):
+                continue
+            text = archive.read(name).decode("utf-8", "ignore")
+            for token, pattern in OCR_NOISE_PATTERNS:
+                count = len(pattern.findall(text))
+                if count:
+                    findings.append({"file": name, "token": token, "count": count})
+    return findings
+
+
+def validate_epub_no_ocr_noise(epub_path: str, strict: bool = False) -> List[Dict[str, Any]]:
+    """Report suspicious OCR artifacts found in the EPUB, optionally failing."""
+    findings = scan_epub_for_ocr_noise(epub_path)
+    if not findings:
+        return []
+
+    examples = ", ".join(
+        f"{item['file']}:{item['token']} x{item['count']}"
+        for item in findings[:8]
+    )
+    truncated = ""
+    if len(findings) > 8:
+        truncated = f" (showing 8 of {len(findings)})"
+    message = (
+        "OCR noise tokens remain in generated EPUB. "
+        f"Inspect and clean these artifacts before using the file: {examples}{truncated}"
+    )
+    if strict:
+        raise RuntimeError(message)
+    print(f"[!] {message}")
+    return findings
+
+
+def write_validated_epub(
+    book: Any,
+    output_file: str,
+    strict_ocr_validation: bool = False,
+) -> None:
+    """Write EPUB to a same-directory temp file and publish only after validation."""
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    output_name = os.path.basename(output_file)
+    fd, temp_output = tempfile.mkstemp(
+        prefix=f".{output_name}.",
+        suffix=".epub",
+        dir=output_dir,
+    )
+    os.close(fd)
+
+    try:
+        epub.write_epub(temp_output, book, {})
+        validate_epub_no_ocr_noise(temp_output, strict=strict_ocr_validation)
+        os.replace(temp_output, output_file)
+    except Exception:
+        try:
+            os.remove(temp_output)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def check_dependencies():
@@ -107,7 +240,7 @@ def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
     for attempt in range(max_retries):
         try:
             response = requests.post(
-                API_URL, json=payload, headers=headers, timeout=180
+                API_URL, json=payload, headers=headers, timeout=API_TIMEOUT_SECONDS
             )
             response.raise_for_status()
             result = response.json()
@@ -155,17 +288,25 @@ def process_layout_results(result, chunk_path):
     return result
 
 
-def extract_cover_image(pdf_path: str, output_path: str) -> str | None:
-    """Renders the first page of a PDF as a PNG image for use as an EPUB cover."""
+def extract_cover_image(
+    pdf_path: str,
+    output_path: str,
+    max_edge: int = DEFAULT_COVER_MAX_EDGE,
+    jpg_quality: int = DEFAULT_COVER_JPEG_QUALITY,
+) -> str | None:
+    """Renders the first PDF page as a bounded JPEG image for use as an EPUB cover."""
     doc = fitz.open(pdf_path)
     try:
         if len(doc) == 0:
             print("[!] PDF has no pages; skipping cover extraction.")
             return None
         page = doc.load_page(0)
-        mat = fitz.Matrix(2, 2)  # 2x zoom (~144 DPI)
-        pix = page.get_pixmap(matrix=mat)
-        pix.save(output_path)
+        if max_edge <= 0:
+            zoom = 2.0
+        else:
+            zoom = min(2.0, max_edge / max(page.rect.width, page.rect.height))
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        pix.save(output_path, jpg_quality=max(1, min(jpg_quality, 100)))
         print(f"[*] Cover image extracted to {output_path}")
         return output_path
     except Exception as e:
@@ -211,7 +352,7 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
             continue
         for page_res in result["result"].get("layoutParsingResults", []):
             global_page += 1
-            page_md = page_res["markdown"]["text"]
+            page_md = clean_ocr_noise(page_res["markdown"]["text"])
             for line in page_md.split("\n"):
                 if line.strip().isdigit():
                     continue
@@ -359,14 +500,16 @@ def download_image(url: str, save_path: str):
 
 def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
                 cover_image_path: str | None = None, author: str | None = None,
-                confirmed_headings: List[Dict] | None = None):
+                confirmed_headings: List[Dict] | None = None,
+                language: str = DEFAULT_EPUB_LANGUAGE,
+                strict_ocr_validation: bool = False):
     """
     Creates an EPUB file from the aggregated API results.
     """
     book = epub.EpubBook()
     book.set_identifier(f"id_{title}")
     book.set_title(title)
-    book.set_language("en")  # Or auto-detect?
+    book.set_language(language)
 
     if author:
         book.add_author(author)
@@ -375,7 +518,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     if cover_image_path and os.path.exists(cover_image_path):
         with open(cover_image_path, "rb") as f:
             cover_data = f.read()
-        book.set_cover("cover.png", cover_data)
+        book.set_cover(os.path.basename(cover_image_path), cover_data)
 
     chapters = []
 
@@ -420,7 +563,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         for i, page_res in enumerate(layout_results):
             global_page += 1
             # 1. Get Markdown Text
-            page_md = page_res["markdown"]["text"]
+            page_md = clean_ocr_noise(page_res["markdown"]["text"])
 
             # 2. Handle Images
             # page_res["markdown"]["images"] is { relative_path: url }
@@ -655,7 +798,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                     c = epub.EpubHtml(
                         title=display_title,
                         file_name=f"{safe_title}_{chapter_count}.xhtml",
-                        lang="en",
+                        lang=language,
                     )
 
                     try:
@@ -696,7 +839,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         c = epub.EpubHtml(
             title=display_title,
             file_name=f"{safe_title}_{chapter_count}.xhtml",
-            lang="en",
+            lang=language,
         )
         try:
             import markdown
@@ -712,7 +855,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
 
     # If no chapters were created (no headers found), create one big chapter
     if not chapters and full_markdown:
-        c = epub.EpubHtml(title="Content", file_name="content.xhtml", lang="en")
+        c = epub.EpubHtml(title="Content", file_name="content.xhtml", lang=language)
         try:
             import markdown
 
@@ -728,7 +871,11 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + chapters
 
-    epub.write_epub(output_file, book, {})
+    write_validated_epub(
+        book,
+        output_file,
+        strict_ocr_validation=strict_ocr_validation,
+    )
     print(f"[*] EPUB saved to {output_file}")
 
 
@@ -743,6 +890,14 @@ def main():
     )
     parser.add_argument("--title", help="Book title (skips interactive prompt)")
     parser.add_argument("--author", help="Author name (skips interactive prompt)")
+    parser.add_argument("--language", default=DEFAULT_EPUB_LANGUAGE,
+                        help=f"EPUB language tag (default: {DEFAULT_EPUB_LANGUAGE})")
+    parser.add_argument("--cover-max-edge", type=int, default=DEFAULT_COVER_MAX_EDGE,
+                        help=f"Max cover image edge in pixels (default: {DEFAULT_COVER_MAX_EDGE})")
+    parser.add_argument("--cover-quality", type=int, default=DEFAULT_COVER_JPEG_QUALITY,
+                        help=f"JPEG cover quality 1-100 (default: {DEFAULT_COVER_JPEG_QUALITY})")
+    parser.add_argument("--strict-ocr-noise", action="store_true",
+                        help="Fail EPUB generation when suspicious OCR artifacts remain")
     parser.add_argument("--auto-toc", action="store_true",
                         help="Skip interactive TOC review; use auto-detected headings")
     parser.add_argument("--no-toc", action="store_true",
@@ -794,7 +949,12 @@ def main():
         chunk_temp_dir = os.path.dirname(chunk_paths[0]) if chunk_paths else None
 
         # Step 1.5: Extract cover image
-        cover_path = extract_cover_image(input_path, os.path.join(work_dir, "cover.png"))
+        cover_path = extract_cover_image(
+            input_path,
+            os.path.join(work_dir, "cover.jpg"),
+            max_edge=args.cover_max_edge,
+            jpg_quality=args.cover_quality,
+        )
 
         # Step 2: API Processing
         results = []
@@ -881,7 +1041,8 @@ def main():
         print("[-] Step 3: Generating EPUB...")
         create_epub(metadata["title"], results, args.output, image_dir,
                     cover_image_path=cover_path, author=metadata["author"],
-                    confirmed_headings=confirmed_headings)
+                    confirmed_headings=confirmed_headings, language=args.language,
+                    strict_ocr_validation=args.strict_ocr_noise)
 
     finally:
         # Clean up the temporary split-PDF directory created by split_pdf().
