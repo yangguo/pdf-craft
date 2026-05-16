@@ -2,9 +2,12 @@ import os
 import sys
 import argparse
 import base64
+import html
 import json
+import posixpath
 import re
 import tempfile
+import urllib.parse
 import zipfile
 
 from typing import List, Dict, Any
@@ -50,6 +53,8 @@ DEFAULT_COVER_JPEG_QUALITY = _env_int("EPUB_COVER_JPEG_QUALITY", 82, minimum=1)
 DOWNARROW_PROSE_SEPARATOR_PATTERN = re.compile(
     r"([\u3400-\u9fff])\s*\$\s*\\downarrow\s*\$\s*([\u3400-\u9fff])"
 )
+HTML_TABLE_PATTERN = re.compile(r"(?is)<table\b.*?</table>")
+DOTTED_NUMERIC_TOKEN_PATTERN = re.compile(r"(?<![\d.])\d+(?:\.\d+){2,}(?![\d.])")
 OCR_NOISE_PATTERNS = (
     ("\\underset{\\cdot}", re.compile(r"\\underset\{\\cdot\}")),
     ("CJK $ \\downarrow $ separator", DOWNARROW_PROSE_SEPARATOR_PATTERN),
@@ -64,6 +69,560 @@ EPUB_STRUCTURAL_FILES = {
     "nav.xhtml",
     "nav.html",
 }
+TOC_PAGE_START_CLASS = "toc-page-start"
+TOC_PAGE_START_CSS = f"""
+.{TOC_PAGE_START_CLASS} {{
+    break-before: page;
+    page-break-before: always;
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}}
+body > .{TOC_PAGE_START_CLASS}:first-child {{
+    break-before: auto;
+    page-break-before: auto;
+}}
+"""
+NUMBERED_TOC_LABEL_PATTERN = re.compile(
+    r"^(第[零〇一二三四五六七八九十百千0-9]+([章編编篇部卷]))"
+)
+PART_TOC_KINDS = {"編", "编", "篇", "部", "卷"}
+XHTML_TEXT_ELEMENT_PATTERN = re.compile(
+    r"(?is)(<(?P<tag>h[1-6]|p|div|span)\b(?P<attrs>[^>]*)>)"
+    r"(?P<body>.*?)</(?P=tag)>"
+)
+
+
+def _resolve_epub_fragment_href(base_name: str, href: str) -> tuple[str, str] | None:
+    """Resolve a TOC href to an EPUB member and fragment id."""
+    href = html.unescape(href.strip())
+    if not href or re.match(r"(?i)^[a-z][a-z0-9+.-]*:", href):
+        return None
+
+    file_part, separator, fragment = href.partition("#")
+    if not separator or not fragment:
+        return None
+
+    fragment = urllib.parse.unquote(fragment)
+    if not file_part:
+        return base_name.lstrip("/"), fragment
+
+    target = urllib.parse.unquote(file_part)
+    target = posixpath.normpath(posixpath.join(posixpath.dirname(base_name), target))
+    return target.lstrip("/"), fragment
+
+
+def _collect_toc_fragment_targets(entries: Dict[str, bytes]) -> Dict[str, set[str]]:
+    """Collect file/id targets referenced by EPUB TOC documents."""
+    targets: Dict[str, set[str]] = {}
+    for name, data in entries.items():
+        lower_name = name.lower()
+        if os.path.basename(lower_name) not in {"nav.xhtml", "nav.html", "toc.ncx"}:
+            continue
+
+        text = data.decode("utf-8", "ignore")
+        for match in re.finditer(r"(?is)\b(?:href|src)\s*=\s*(['\"])(.*?)\1", text):
+            resolved = _resolve_epub_fragment_href(name, match.group(2))
+            if not resolved:
+                continue
+            target_file, fragment = resolved
+            targets.setdefault(target_file, set()).add(fragment)
+    return targets
+
+
+def _plain_text_from_html(value: str) -> str:
+    text = html.unescape(re.sub(r"(?is)<[^>]+>", "", value))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_numbered_marker(value: str) -> str:
+    return value.replace("编", "編").strip()
+
+
+def _extract_numbered_toc_marker(label: str) -> tuple[str, str] | None:
+    label_text = _plain_text_from_html(label)
+    match = NUMBERED_TOC_LABEL_PATTERN.match(label_text)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _get_start_tag_attr(start_tag: str, attr_name: str) -> str | None:
+    match = re.search(
+        rf"(?is)\b{re.escape(attr_name)}\s*=\s*(['\"])(.*?)\1",
+        start_tag,
+    )
+    if not match:
+        return None
+    return html.unescape(match.group(2))
+
+
+def _existing_fragment_ids(xhtml_text: str) -> set[str]:
+    return {
+        html.unescape(match.group(2))
+        for match in re.finditer(
+            r"(?is)\b(?:id|name)\s*=\s*(['\"])(.*?)\1",
+            xhtml_text,
+        )
+    }
+
+
+def _unique_fragment_id(xhtml_text: str, base: str, suffix: str) -> str:
+    safe_base = re.sub(r"[^A-Za-z0-9_.:-]+", "-", base).strip("-") or "toc-auto"
+    candidate = f"{safe_base}-{suffix}"
+    existing = _existing_fragment_ids(xhtml_text)
+    if candidate not in existing:
+        return candidate
+
+    index = 2
+    while f"{candidate}-{index}" in existing:
+        index += 1
+    return f"{candidate}-{index}"
+
+
+def _add_id_to_text_element(xhtml_text: str, element: Dict[str, Any], new_id: str) -> str:
+    start_tag = element["start_tag"]
+    if _get_start_tag_attr(start_tag, "id") or _get_start_tag_attr(start_tag, "name"):
+        return xhtml_text
+
+    insert_at = element["start"] + len(start_tag) - 1
+    return (
+        xhtml_text[:insert_at]
+        + f' id="{html.escape(new_id, quote=True)}"'
+        + xhtml_text[insert_at:]
+    )
+
+
+def _iter_xhtml_text_elements(xhtml_text: str) -> list[Dict[str, Any]]:
+    elements = []
+    for match in XHTML_TEXT_ELEMENT_PATTERN.finditer(xhtml_text):
+        start_tag = match.group(1)
+        elements.append({
+            "start": match.start(),
+            "end": match.end(),
+            "start_tag": start_tag,
+            "tag": match.group("tag").lower(),
+            "text": _plain_text_from_html(match.group("body")),
+            "id": _get_start_tag_attr(start_tag, "id"),
+            "name": _get_start_tag_attr(start_tag, "name"),
+        })
+    return elements
+
+
+def _is_chapter_number_text(value: str) -> bool:
+    match = NUMBERED_TOC_LABEL_PATTERN.match(value.strip())
+    return bool(match and match.group(2) == "章" and value.strip() == match.group(1))
+
+
+def _move_part_block_before_previous_chapter_marker(
+    xhtml_text: str,
+    elements: list[Dict[str, Any]],
+    target_index: int,
+) -> str:
+    if target_index <= 0:
+        return xhtml_text
+
+    previous = elements[target_index - 1]
+    if not _is_chapter_number_text(previous["text"]):
+        return xhtml_text
+
+    block_start = elements[target_index]["start"]
+    block_end = elements[target_index]["end"]
+    for element in elements[target_index + 1:target_index + 4]:
+        if element["tag"] != "p" or element.get("id") or element.get("name"):
+            break
+        if NUMBERED_TOC_LABEL_PATTERN.match(element["text"]):
+            break
+        block_end = element["end"]
+
+    return (
+        xhtml_text[:previous["start"]]
+        + xhtml_text[block_start:block_end]
+        + xhtml_text[previous["start"]:block_start]
+        + xhtml_text[block_end:]
+    )
+
+
+def _retarget_numbered_toc_fragment(
+    xhtml_text: str,
+    target_fragment: str,
+    marker: str,
+    kind: str,
+    label_text: str,
+) -> tuple[str, str]:
+    elements = _iter_xhtml_text_elements(xhtml_text)
+    target_index = next(
+        (
+            index
+            for index, element in enumerate(elements)
+            if target_fragment in {element.get("id"), element.get("name")}
+        ),
+        None,
+    )
+    if target_index is None:
+        return xhtml_text, target_fragment
+
+    target = elements[target_index]
+    if _normalize_numbered_marker(target["text"]).startswith(
+        _normalize_numbered_marker(marker)
+    ):
+        if kind in PART_TOC_KINDS:
+            return (
+                _move_part_block_before_previous_chapter_marker(
+                    xhtml_text,
+                    elements,
+                    target_index,
+                ),
+                target_fragment,
+            )
+        return xhtml_text, target_fragment
+
+    normalized_marker = _normalize_numbered_marker(marker)
+    for element in reversed(elements[max(0, target_index - 8):target_index]):
+        if _normalize_numbered_marker(element["text"]) != normalized_marker:
+            continue
+
+        existing_id = element.get("id") or element.get("name")
+        if existing_id:
+            return xhtml_text, existing_id
+
+        new_id = _unique_fragment_id(xhtml_text, target_fragment, "start")
+        return _add_id_to_text_element(xhtml_text, element, new_id), new_id
+
+    if kind in PART_TOC_KINDS:
+        new_id = _unique_fragment_id(xhtml_text, target_fragment, "part")
+        remainder = label_text[len(marker):].strip()
+        remainder = re.sub(r"^[\s:：,，、]+", "", remainder)
+        inserted = f'<p id="{new_id}">{html.escape(marker)}</p>'
+        if remainder:
+            inserted += f"<p>{html.escape(remainder)}</p>"
+        return xhtml_text[:target["start"]] + inserted + xhtml_text[target["start"]:], new_id
+
+    if kind != "章":
+        return xhtml_text, target_fragment
+
+    tag = target["tag"] if re.match(r"h[1-6]$", target["tag"]) else "h2"
+    new_id = _unique_fragment_id(xhtml_text, target_fragment, "chapter")
+    inserted = f'<{tag} id="{new_id}">{html.escape(marker)}</{tag}>'
+    return xhtml_text[:target["start"]] + inserted + xhtml_text[target["start"]:], new_id
+
+
+def _replace_fragment_in_href(href: str, fragment: str) -> str:
+    file_part = href.partition("#")[0]
+    escaped_fragment = urllib.parse.quote(fragment, safe="A-Za-z0-9_.:-")
+    return f"{file_part}#{escaped_fragment}"
+
+
+def _retarget_numbered_toc_hrefs(entries: Dict[str, bytes]) -> int:
+    changed_count = 0
+
+    def retarget_href(source_name: str, href: str, label: str) -> str:
+        nonlocal changed_count
+        label_text = _plain_text_from_html(label)
+        marker_info = _extract_numbered_toc_marker(label_text)
+        if not marker_info:
+            return href
+
+        resolved = _resolve_epub_fragment_href(source_name, href)
+        if not resolved:
+            return href
+
+        target_file, target_fragment = resolved
+        if target_file not in entries:
+            return href
+
+        marker, kind = marker_info
+        xhtml_text = entries[target_file].decode("utf-8", "ignore")
+        updated_text, updated_fragment = _retarget_numbered_toc_fragment(
+            xhtml_text,
+            target_fragment,
+            marker,
+            kind,
+            label_text,
+        )
+        content_changed = updated_text != xhtml_text
+        if updated_text != xhtml_text:
+            entries[target_file] = updated_text.encode("utf-8")
+        if updated_fragment == target_fragment:
+            if content_changed:
+                changed_count += 1
+            return href
+
+        changed_count += 1
+        return _replace_fragment_in_href(href, updated_fragment)
+
+    for name, data in list(entries.items()):
+        lower_name = name.lower()
+        basename = os.path.basename(lower_name)
+        if basename in {"nav.xhtml", "nav.html"}:
+            text = data.decode("utf-8", "ignore")
+
+            def replace_nav_link(match: re.Match) -> str:
+                href = match.group(3)
+                label = _plain_text_from_html(match.group(5))
+                new_href = retarget_href(name, href, label)
+                return (
+                    match.group(1)
+                    + match.group(2)
+                    + html.escape(new_href, quote=True)
+                    + match.group(2)
+                    + match.group(4)
+                    + match.group(5)
+                    + match.group(6)
+                )
+
+            patched = re.sub(
+                r"(?is)(<a\b[^>]*\bhref\s*=\s*)(['\"])(.*?)\2([^>]*>)(.*?)(</a>)",
+                replace_nav_link,
+                text,
+            )
+            if patched != text:
+                entries[name] = patched.encode("utf-8")
+        elif basename == "toc.ncx":
+            text = data.decode("utf-8", "ignore")
+
+            def replace_ncx_content(match: re.Match) -> str:
+                label = _plain_text_from_html(match.group(2))
+                href = match.group(5)
+                new_href = retarget_href(name, href, label)
+                return (
+                    match.group(1)
+                    + match.group(2)
+                    + match.group(3)
+                    + match.group(4)
+                    + html.escape(new_href, quote=True)
+                    + match.group(4)
+                )
+
+            patched = re.sub(
+                r"(?is)(<navLabel>\s*<text[^>]*>)(.*?)(</text>\s*</navLabel>\s*"
+                r"<content\b[^>]*\bsrc\s*=\s*)(['\"])(.*?)\4",
+                replace_ncx_content,
+                text,
+            )
+            if patched != text:
+                entries[name] = patched.encode("utf-8")
+
+    return changed_count
+
+
+def _add_class_to_start_tag(start_tag: str, class_name: str) -> str:
+    class_match = re.search(r"(?is)\bclass\s*=\s*(['\"])(.*?)\1", start_tag)
+    if not class_match:
+        return f'{start_tag} class="{class_name}"'
+
+    classes = class_match.group(2).split()
+    if class_name in classes:
+        return start_tag
+
+    classes.append(class_name)
+    return (
+        start_tag[:class_match.start(2)]
+        + " ".join(classes)
+        + start_tag[class_match.end(2):]
+    )
+
+
+def _mark_toc_targets_as_page_starts(xhtml_text: str, target_ids: set[str]) -> str:
+    """Add a page-start class to elements used as TOC fragment targets."""
+    updated = xhtml_text
+    for target_id in sorted(target_ids, key=len, reverse=True):
+        pattern = re.compile(
+            r"(<[A-Za-z][\w:.-]*\b"
+            r"(?=[^>]*\b(?:id|name)\s*=\s*['\"]"
+            + re.escape(target_id)
+            + r"['\"])"
+            r"[^>]*?)(\s*/?>)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        updated = pattern.sub(
+            lambda match: _add_class_to_start_tag(match.group(1), TOC_PAGE_START_CLASS)
+            + match.group(2),
+            updated,
+            count=1,
+        )
+    return updated
+
+
+def _remove_toc_page_start_classes(xhtml_text: str) -> str:
+    def replace_class_attr(match: re.Match) -> str:
+        classes = [
+            class_name
+            for class_name in match.group(2).split()
+            if class_name != TOC_PAGE_START_CLASS
+        ]
+        if not classes:
+            return ""
+        return f' class={match.group(1)}{" ".join(classes)}{match.group(1)}'
+
+    return re.sub(
+        r"(?is)\s+class\s*=\s*(['\"])(.*?)\1",
+        replace_class_attr,
+        xhtml_text,
+    )
+
+
+def _append_toc_page_start_css(css_text: str) -> str:
+    if f".{TOC_PAGE_START_CLASS}" in css_text:
+        return css_text
+    return css_text.rstrip() + "\n\n" + TOC_PAGE_START_CSS.strip() + "\n"
+
+
+def ensure_toc_targets_start_pages(epub_path: str) -> Dict[str, Any]:
+    """Patch an EPUB so TOC fragment targets begin on a fresh reader page."""
+    epub_path = os.fspath(epub_path)
+    with zipfile.ZipFile(epub_path, "r") as archive:
+        original_entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
+
+    entry_map = {info.filename: data for info, data in original_entries}
+    retargeted_links = _retarget_numbered_toc_hrefs(entry_map)
+    toc_targets = _collect_toc_fragment_targets(entry_map)
+    if not toc_targets:
+        return {"targets": 0, "xhtml_files": [], "css_files": []}
+
+    changed = bool(retargeted_links)
+    xhtml_files = []
+    css_files = []
+    patched_entries = []
+    for info, _data in original_entries:
+        data = entry_map.get(info.filename, _data)
+        lower_name = info.filename.lower()
+        new_data = data
+
+        if lower_name.endswith((".xhtml", ".html", ".htm")):
+            text = data.decode("utf-8", "ignore")
+            text = _remove_toc_page_start_classes(text)
+            patched = text
+            if info.filename in toc_targets:
+                patched = _mark_toc_targets_as_page_starts(
+                    text,
+                    toc_targets[info.filename],
+                )
+            if patched.encode("utf-8") != data:
+                changed = True
+                xhtml_files.append(info.filename)
+                new_data = patched.encode("utf-8")
+
+        if lower_name.endswith(".css"):
+            text = new_data.decode("utf-8", "ignore")
+            patched = _append_toc_page_start_css(text)
+            if patched != text:
+                changed = True
+                css_files.append(info.filename)
+                new_data = patched.encode("utf-8")
+
+        patched_entries.append((info, new_data))
+
+    if not changed:
+        return {
+            "targets": sum(len(ids) for ids in toc_targets.values()),
+            "retargeted_links": retargeted_links,
+            "xhtml_files": xhtml_files,
+            "css_files": css_files,
+        }
+
+    output_dir = os.path.dirname(os.path.abspath(epub_path))
+    output_name = os.path.basename(epub_path)
+    fd, temp_output = tempfile.mkstemp(
+        prefix=f".{output_name}.",
+        suffix=".epub",
+        dir=output_dir,
+    )
+    os.close(fd)
+
+    try:
+        with zipfile.ZipFile(temp_output, "w") as archive:
+            mimetype_entries = [
+                (info, data) for info, data in patched_entries if info.filename == "mimetype"
+            ]
+            other_entries = [
+                (info, data) for info, data in patched_entries if info.filename != "mimetype"
+            ]
+            for info, data in mimetype_entries + other_entries:
+                if info.filename == "mimetype":
+                    info.compress_type = zipfile.ZIP_STORED
+                archive.writestr(info, data)
+        os.replace(temp_output, epub_path)
+    except Exception:
+        try:
+            os.remove(temp_output)
+        except FileNotFoundError:
+            pass
+        raise
+
+    return {
+        "targets": sum(len(ids) for ids in toc_targets.values()),
+        "retargeted_links": retargeted_links,
+        "xhtml_files": xhtml_files,
+        "css_files": css_files,
+    }
+
+
+def is_numeric_only_ocr_table(table_html: str) -> bool:
+    """Detect blank-page OCR tables made only from repeated year-like numbers."""
+    row_count = len(re.findall(r"(?i)<tr\b", table_html))
+    if row_count < 12:
+        return False
+
+    text = html.unescape(re.sub(r"(?is)<[^>]+>", " ", table_html))
+    numbers = [int(value) for value in re.findall(r"\d+", text)]
+    if len(numbers) < 30:
+        return False
+
+    non_numeric = re.sub(r"[\d\s.,;:|+\-–—/\\年月]+", "", text)
+    if non_numeric.strip():
+        return False
+
+    year_like = [value for value in numbers if 1900 <= value <= 2200]
+    if len(year_like) / len(numbers) < 0.8:
+        return False
+
+    return len(set(year_like)) >= 12 and (max(year_like) - min(year_like)) >= 12
+
+
+def is_dotted_numeric_ocr_table(table_html: str) -> bool:
+    """Detect blank-page OCR tables made from repeated outline-like numbers."""
+    cell_count = len(re.findall(r"(?i)<t[dh]\b", table_html))
+    if cell_count < 16:
+        return False
+
+    text = html.unescape(re.sub(r"(?is)<[^>]+>", " ", table_html))
+    dotted_tokens = DOTTED_NUMERIC_TOKEN_PATTERN.findall(text)
+    if len(dotted_tokens) < 16:
+        return False
+    if len(dotted_tokens) / cell_count < 0.75:
+        return False
+
+    prefixes: Dict[str, int] = {}
+    tails = []
+    for token in dotted_tokens:
+        prefix, tail = token.rsplit(".", 1)
+        prefixes[prefix] = prefixes.get(prefix, 0) + 1
+        tails.append(int(tail))
+
+    if max(prefixes.values()) / len(dotted_tokens) < 0.8:
+        return False
+    if len(set(tails)) < 12 or (max(tails) - min(tails)) < 12:
+        return False
+
+    residue = DOTTED_NUMERIC_TOKEN_PATTERN.sub(" ", text)
+    residue = re.sub(r"[\d\s.,;:|+\-–—/\\年月·•、。．]+", "", residue)
+    return len(residue.strip()) <= 12
+
+
+def is_ocr_noise_table(table_html: str) -> bool:
+    """Detect OCR table artifacts that should not be carried into EPUB output."""
+    return (
+        is_numeric_only_ocr_table(table_html)
+        or is_dotted_numeric_ocr_table(table_html)
+    )
+
+
+def remove_numeric_only_ocr_tables(markdown_text: str) -> str:
+    """Strip numeric-like HTML tables commonly hallucinated from blank pages."""
+    return HTML_TABLE_PATTERN.sub(
+        lambda match: "" if is_ocr_noise_table(match.group(0)) else match.group(0),
+        markdown_text,
+    )
 
 
 def clean_ocr_noise(markdown_text: str) -> str:
@@ -72,6 +631,7 @@ def clean_ocr_noise(markdown_text: str) -> str:
         return ""
 
     cleaned = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = remove_numeric_only_ocr_tables(cleaned)
 
     # False inline math around emphasized Chinese characters.
     cleaned = re.sub(
@@ -107,6 +667,31 @@ def scan_epub_for_ocr_noise(epub_path: str) -> List[Dict[str, Any]]:
                 count = len(pattern.findall(text))
                 if count:
                     findings.append({"file": name, "token": token, "count": count})
+            numeric_table_count = sum(
+                1
+                for match in HTML_TABLE_PATTERN.finditer(text)
+                if is_numeric_only_ocr_table(match.group(0))
+            )
+            if numeric_table_count:
+                findings.append({
+                    "file": name,
+                    "token": "numeric-only OCR table",
+                    "count": numeric_table_count,
+                })
+            dotted_table_count = sum(
+                1
+                for match in HTML_TABLE_PATTERN.finditer(text)
+                if (
+                    not is_numeric_only_ocr_table(match.group(0))
+                    and is_dotted_numeric_ocr_table(match.group(0))
+                )
+            )
+            if dotted_table_count:
+                findings.append({
+                    "file": name,
+                    "token": "dotted numeric OCR table",
+                    "count": dotted_table_count,
+                })
     return findings
 
 
@@ -150,6 +735,8 @@ def write_validated_epub(
 
     try:
         epub.write_epub(temp_output, book, {})
+        if zipfile.is_zipfile(temp_output):
+            ensure_toc_targets_start_pages(temp_output)
         validate_epub_no_ocr_noise(temp_output, strict=strict_ocr_validation)
         os.replace(temp_output, output_file)
     except Exception:

@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -100,6 +101,49 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertIn(r"$ \downarrow $", cleaned)
         self.assertNotIn("、", cleaned)
 
+    def test_clean_ocr_noise_removes_numeric_only_year_table_from_blank_page(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "clean_ocr_noise"))
+
+        rows = []
+        for year in range(2021, 2045):
+            rows.append(
+                "<tr>"
+                f"<td>{year}</td><td>{year + 1}</td><td>{year + 2}</td>"
+                "</tr>"
+            )
+        raw = "Before.\n\n<table>" + "".join(rows) + "</table>\n\nAfter."
+
+        cleaned = mod.clean_ocr_noise(raw)
+
+        self.assertIn("Before.", cleaned)
+        self.assertIn("After.", cleaned)
+        self.assertNotIn("<table", cleaned)
+        self.assertNotIn("2044", cleaned)
+
+    def test_clean_ocr_noise_removes_dotted_numeric_table_from_blank_page(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "clean_ocr_noise"))
+
+        cells = "".join(
+            f"<td>1.1.1.{index}</td>"
+            for index in range(377, 397)
+        )
+        raw = (
+            "<p>Before.</p>"
+            "<table><tr><td>序：章之三</td>"
+            + cells
+            + "</tr></table>"
+            "<p>After.</p>"
+        )
+
+        cleaned = mod.clean_ocr_noise(raw)
+
+        self.assertIn("Before.", cleaned)
+        self.assertIn("After.", cleaned)
+        self.assertNotIn("<table", cleaned)
+        self.assertNotIn("1.1.1.382", cleaned)
+
     def test_scan_epub_for_ocr_noise_reports_specific_false_latex_artifacts(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
@@ -117,6 +161,61 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         self.assertTrue(any(item["file"] == "EPUB/chapter.xhtml" for item in findings))
         self.assertTrue(any(item["token"] == "\\underset{\\cdot}" for item in findings))
+
+    def test_scan_epub_for_ocr_noise_reports_numeric_only_year_table(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        rows = []
+        for year in range(2021, 2045):
+            rows.append(
+                "<tr>"
+                f"<td>{year}</td><td>{year + 1}</td><td>{year + 2}</td>"
+                "</tr>"
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    "<html><body><table>"
+                    + "".join(rows)
+                    + "</table></body></html>",
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        self.assertTrue(
+            any(item["token"] == "numeric-only OCR table" for item in findings)
+        )
+
+    def test_scan_epub_for_ocr_noise_reports_dotted_numeric_table(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        cells = "".join(
+            f"<td>1.1.1.{index}</td>"
+            for index in range(377, 397)
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    "<html><body><table><tr><td>序：章之三</td>"
+                    + cells
+                    + "</tr></table></body></html>",
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        self.assertTrue(
+            any(item["token"] == "dotted numeric OCR table" for item in findings)
+        )
 
     def test_scan_epub_for_ocr_noise_allows_valid_math_latex(self):
         mod = _load_script_module()
@@ -235,6 +334,319 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         self.assertTrue(findings)
         self.assertTrue(any("[!]" in str(call.args[0]) for call in mock_print.call_args_list))
+
+    def test_resolve_epub_fragment_href_keeps_same_file_fragment_in_source_file(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "_resolve_epub_fragment_href"))
+
+        resolved = mod._resolve_epub_fragment_href("EPUB/nav.xhtml", "#toc-header")
+
+        self.assertEqual(("EPUB/nav.xhtml", "toc-header"), resolved)
+
+    def test_ensure_toc_targets_start_pages_marks_only_toc_heading_targets(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    (
+                        "<html><body><nav><ol><li>"
+                        "<a href=\"chapter.xhtml#section-1\">Section</a>"
+                        "</li></ol></nav></body></html>"
+                    ),
+                )
+                zf.writestr("EPUB/style/nav.css", "body { margin: 1em; }\n")
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><head><link href=\"style/nav.css\" rel=\"stylesheet\" "
+                        "type=\"text/css\"/></head><body>"
+                        "<h2 id=\"intro\">Intro</h2>"
+                        "<p>Before.</p>"
+                        "<h2 id=\"section-1\">Section</h2>"
+                        "<p>After.</p>"
+                        "</body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                infos = zf.infolist()
+                css = zf.read("EPUB/style/nav.css").decode("utf-8")
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        self.assertEqual("mimetype", infos[0].filename)
+        self.assertEqual(ZIP_STORED, infos[0].compress_type)
+        self.assertIn(".toc-page-start", css)
+        self.assertIn("break-before: page", css)
+        self.assertIn('<h2 id="section-1" class="toc-page-start">Section</h2>', chapter)
+        self.assertIn('<h2 id="intro">Intro</h2>', chapter)
+
+    def test_ensure_toc_targets_start_pages_preserves_existing_heading_class(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/toc.ncx",
+                    '<ncx><navMap><navPoint><content src="chapter.xhtml#section-1"/>'
+                    '</navPoint></navMap></ncx>',
+                )
+                zf.writestr("EPUB/style/nav.css", "body { margin: 1em; }\n")
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body><h2 class=\"chapter-title\" id=\"section-1\">"
+                        "Section</h2></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        self.assertIn(
+            '<h2 class="chapter-title toc-page-start" id="section-1">Section</h2>',
+            chapter,
+        )
+
+    def test_ensure_toc_targets_start_pages_moves_chapter_link_to_number_heading(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    (
+                        "<html><body><nav><ol><li>"
+                        "<a href=\"chapter.xhtml#title\">第五章 對外關係</a>"
+                        "</li></ol></nav></body></html>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/toc.ncx",
+                    (
+                        "<ncx><navMap><navPoint><navLabel><text>第五章 對外關係"
+                        "</text></navLabel><content src=\"chapter.xhtml#title\"/>"
+                        "</navPoint></navMap></ncx>"
+                    ),
+                )
+                zf.writestr("EPUB/style/nav.css", "body { margin: 1em; }\n")
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body><p>Before.</p>"
+                        "<h2 id=\"chapter-number\">第五章</h2>"
+                        "<h2 id=\"title\" class=\"toc-page-start\">對外關係</h2>"
+                        "<p>After.</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                nav = zf.read("EPUB/nav.xhtml").decode("utf-8")
+                ncx = zf.read("EPUB/toc.ncx").decode("utf-8")
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        self.assertIn('href="chapter.xhtml#chapter-number"', nav)
+        self.assertIn('src="chapter.xhtml#chapter-number"', ncx)
+        self.assertIn('<h2 id="chapter-number" class="toc-page-start">第五章</h2>', chapter)
+        self.assertIn('<h2 id="title">對外關係</h2>', chapter)
+
+    def test_ensure_toc_targets_start_pages_moves_part_link_to_part_line(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    (
+                        "<html><body><nav><ol>"
+                        "<li><a href=\"chapter.xhtml#title\">第一編 傳統制度的延續，1600-1800年</a></li>"
+                        "<li><a href=\"chapter.xhtml#title\">第二章 清帝國的興盛</a></li>"
+                        "</ol></nav></body></html>"
+                    ),
+                )
+                zf.writestr("EPUB/style/nav.css", "body { margin: 1em; }\n")
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body><p>第一編</p><p>傳統制度的延續</p>"
+                        "<p>1600-1800年</p><h2 id=\"title\">清帝國的興盛</h2>"
+                        "<p>After.</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                nav = zf.read("EPUB/nav.xhtml").decode("utf-8")
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        part_href = re.search(r'href="chapter.xhtml#([^"]+)">第一編', nav)
+        chapter_href = re.search(r'href="chapter.xhtml#([^"]+)">第二章', nav)
+        self.assertIsNotNone(part_href)
+        self.assertIsNotNone(chapter_href)
+        self.assertNotEqual("title", part_href.group(1))
+        self.assertNotEqual("title", chapter_href.group(1))
+        self.assertIn(
+            f'<p id="{part_href.group(1)}" class="toc-page-start">第一編</p>',
+            chapter,
+        )
+        self.assertIn(
+            f'<h2 id="{chapter_href.group(1)}" class="toc-page-start">第二章</h2>',
+            chapter,
+        )
+        self.assertIn('<h2 id="title">清帝國的興盛</h2>', chapter)
+
+    def test_ensure_toc_targets_start_pages_inserts_missing_part_heading(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    (
+                        "<html><body><nav><ol>"
+                        "<li><a href=\"chapter.xhtml#title\">第三編 外國帝國主義加劇時期的自強運動 1861-1895年</a></li>"
+                        "<li><a href=\"chapter.xhtml#title\">第十一章 清朝中興與自強運動</a></li>"
+                        "</ol></nav></body></html>"
+                    ),
+                )
+                zf.writestr("EPUB/style/nav.css", "body { margin: 1em; }\n")
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body><h1 id=\"title\">清朝中興與自強運動</h1>"
+                        "<p>After.</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                nav = zf.read("EPUB/nav.xhtml").decode("utf-8")
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        part_href = re.search(r'href="chapter.xhtml#([^"]+)">第三編', nav)
+        chapter_href = re.search(r'href="chapter.xhtml#([^"]+)">第十一章', nav)
+        self.assertIsNotNone(part_href)
+        self.assertIsNotNone(chapter_href)
+        self.assertNotEqual("title", part_href.group(1))
+        self.assertNotEqual("title", chapter_href.group(1))
+        self.assertLess(chapter.index("第三編"), chapter.index("第十一章"))
+        self.assertIn(
+            f'<p id="{part_href.group(1)}" class="toc-page-start">第三編</p>',
+            chapter,
+        )
+        self.assertIn("<p>外國帝國主義加劇時期的自強運動 1861-1895年</p>", chapter)
+        self.assertIn(
+            f'<h1 id="{chapter_href.group(1)}" class="toc-page-start">第十一章</h1>',
+            chapter,
+        )
+
+    def test_ensure_toc_targets_start_pages_moves_part_heading_before_chapter_number(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    (
+                        "<html><body><nav><ol>"
+                        "<li><a href=\"chapter.xhtml#part\">第三編 外國帝國主義加劇時期的自強運動 1861-1895年</a></li>"
+                        "<li><a href=\"chapter.xhtml#chapter\">第十一章 清朝中興與自強運動</a></li>"
+                        "</ol></nav></body></html>"
+                    ),
+                )
+                zf.writestr("EPUB/style/nav.css", "body { margin: 1em; }\n")
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body><h1 id=\"chapter\" class=\"toc-page-start\">第十一章</h1>"
+                        "<p id=\"part\" class=\"toc-page-start\">第三編</p>"
+                        "<p>外國帝國主義加劇時期的自強運動 1861-1895年</p>"
+                        "<h1 id=\"title\">清朝中興與自強運動</h1></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        self.assertLess(chapter.index("第三編"), chapter.index("第十一章"))
+        self.assertLess(chapter.index("第十一章"), chapter.index("清朝中興與自強運動"))
+
+    def test_write_validated_epub_validates_once_after_toc_patching(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "write_validated_epub"))
+
+        events = []
+
+        def fake_write_epub(output_file, _book, _options):
+            events.append("write")
+            with ZipFile(output_file, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    "<html><body><p>Clean OCR chapter content.</p></body></html>",
+                )
+
+        def fake_ensure_toc_targets_start_pages(_output_file):
+            events.append("toc")
+            return {"targets": 0, "xhtml_files": [], "css_files": []}
+
+        def fake_validate_epub_no_ocr_noise(_output_file, strict=False):
+            events.append(f"validate:{strict}")
+            return []
+
+        fake_epub = SimpleNamespace(write_epub=fake_write_epub)
+
+        with tempfile.TemporaryDirectory() as td:
+            output_path = Path(td) / "book.epub"
+            with mock.patch.object(mod, "epub", fake_epub, create=True), \
+                    mock.patch.object(
+                        mod,
+                        "ensure_toc_targets_start_pages",
+                        fake_ensure_toc_targets_start_pages,
+                    ), \
+                    mock.patch.object(
+                        mod,
+                        "validate_epub_no_ocr_noise",
+                        fake_validate_epub_no_ocr_noise,
+                    ):
+                mod.write_validated_epub(
+                    object(),
+                    str(output_path),
+                    strict_ocr_validation=False,
+                )
+
+            self.assertTrue(output_path.exists())
+
+        self.assertEqual(["write", "toc", "validate:False"], events)
 
     def test_create_epub_does_not_leave_output_file_when_validation_fails(self):
         mod = _load_script_module()
