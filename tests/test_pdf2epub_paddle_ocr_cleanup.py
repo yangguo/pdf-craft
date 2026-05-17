@@ -144,6 +144,101 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertNotIn("<table", cleaned)
         self.assertNotIn("1.1.1.382", cleaned)
 
+    def test_extract_page_footnotes_keeps_ocr_footnote_blocks_only(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "extract_page_footnotes"))
+
+        page_res = {
+            "prunedResult": {
+                "parsing_res_list": [
+                    {"block_label": "text", "block_content": "正文"},
+                    {
+                        "block_label": "footnote",
+                        "block_content": " $ ^{14} $ Ping-ti Ho, 189.",
+                    },
+                    {"block_label": "footnote", "block_content": "  "},
+                    {
+                        "block_label": "vision_footnote",
+                        "block_content": "15 另一条脚注。",
+                    },
+                ]
+            }
+        }
+
+        footnotes = mod.extract_page_footnotes(page_res)
+
+        self.assertEqual(["$ ^{14} $ Ping-ti Ho, 189.", "15 另一条脚注。"], footnotes)
+
+    def test_extract_page_footnotes_infers_unnumbered_note_from_inline_marker(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "extract_page_footnotes"))
+
+        page_res = {
+            "markdown": {
+                "text": "正文 $ ^{9} $ 继续 $ ^{10} $ 结束。",
+            },
+            "prunedResult": {
+                "parsing_res_list": [
+                    {"block_label": "footnote", "block_content": "Leonard S. Hsü, 62-63."},
+                    {"block_label": "footnote", "block_content": "$ ^{10} $ 即杨文炳。"},
+                ]
+            },
+        }
+
+        footnotes = mod.extract_page_footnotes(page_res)
+
+        self.assertEqual(
+            ["$ ^{9} $ Leonard S. Hsü, 62-63.", "$ ^{10} $ 即杨文炳。"],
+            footnotes,
+        )
+
+    def test_format_page_footnotes_html_renders_numbered_notes(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "format_page_footnotes_html"))
+
+        html_text = mod.format_page_footnotes_html(
+            ["$ ^{14} $ Ping-ti Ho, 189.", "15 另一条脚注。"],
+            page_number=42,
+        )
+
+        self.assertIn('class="page-footnotes"', html_text)
+        self.assertIn('data-source-page="42"', html_text)
+        self.assertIn("<sup>14</sup> Ping-ti Ho, 189.", html_text)
+        self.assertIn("<sup>15</sup> 另一条脚注。", html_text)
+
+    def test_link_page_footnote_references_connects_matching_notes(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "link_page_footnote_references"))
+
+        linked_text, footnote_refs = mod.link_page_footnote_references(
+            "正文 $ ^{14} $ 继续 $ ^{99} $。",
+            ["$ ^{14} $ Ping-ti Ho, 189.", "15 另一条脚注。"],
+            page_number=42,
+        )
+        html_text = mod.format_page_footnotes_html(
+            ["$ ^{14} $ Ping-ti Ho, 189.", "15 另一条脚注。"],
+            page_number=42,
+            footnote_refs=footnote_refs,
+        )
+
+        self.assertIn('id="fnref-p42-14"', linked_text)
+        self.assertIn('epub:type="noteref"', linked_text)
+        self.assertIn('href="#fn-p42-14"', linked_text)
+        self.assertIn('class="unlinked-footnote-marker"', linked_text)
+        self.assertIn('<p id="fn-p42-14" class="footnote">', html_text)
+        self.assertIn('epub:type="backlink"', html_text)
+        self.assertIn('href="#fnref-p42-14"', html_text)
+        self.assertNotIn('id="fn-p42-15"', html_text)
+
+    def test_toc_page_start_css_keeps_part_and_chapter_together(self):
+        mod = _load_script_module()
+
+        self.assertIn(
+            "p.toc-page-start + p + h1.toc-page-start",
+            mod.TOC_PAGE_START_CSS,
+        )
+        self.assertIn("break-before: auto", mod.TOC_PAGE_START_CSS)
+
     def test_scan_epub_for_ocr_noise_reports_specific_false_latex_artifacts(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
@@ -599,6 +694,379 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         self.assertLess(chapter.index("第三編"), chapter.index("第十一章"))
         self.assertLess(chapter.index("第十一章"), chapter.index("清朝中興與自強運動"))
+
+    def test_ensure_toc_targets_start_pages_removes_next_heading_preview(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"prev\" href=\"prev.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"next\" href=\"next.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine>"
+                        "<itemref idref=\"prev\"/><itemref idref=\"next\"/>"
+                        "</spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    (
+                        "<html><body><nav><ol>"
+                        "<li><a href=\"next.xhtml#part\">第五編 主義與抗戰，1917-1945年</a></li>"
+                        "<li><a href=\"next.xhtml#chapter\">第二十一章 思想革命</a></li>"
+                        "</ol></nav></body></html>"
+                    ),
+                )
+                zf.writestr("EPUB/style/nav.css", "body { margin: 1em; }\n")
+                zf.writestr(
+                    "EPUB/prev.xhtml",
+                    (
+                        "<html><body><p>上一章正文。</p>"
+                        "<p>第五編</p><p>主義與抗戰</p><p>1917-1945年</p>"
+                        "<h2 id=\"preview\">第二十一章</h2></body></html>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/next.xhtml",
+                    (
+                        "<html><body><p id=\"part\">第五編</p>"
+                        "<p>主義與抗戰，1917-1945年</p>"
+                        "<h1 id=\"chapter\">第二十一章</h1>"
+                        "<p>思想革命正文。</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                prev = zf.read("EPUB/prev.xhtml").decode("utf-8")
+                next_chapter = zf.read("EPUB/next.xhtml").decode("utf-8")
+
+        self.assertIn("上一章正文", prev)
+        self.assertNotIn("第五編", prev)
+        self.assertNotIn("第二十一章", prev)
+        self.assertIn("第五編", next_chapter)
+        self.assertIn("第二十一章", next_chapter)
+
+    def test_ensure_toc_targets_start_pages_removes_truncated_part_preview(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"prev\" href=\"prev.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"next\" href=\"next.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine>"
+                        "<itemref idref=\"prev\"/><itemref idref=\"next\"/>"
+                        "</spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/prev.xhtml",
+                    (
+                        "<html><body><p>上一章正文。</p>"
+                        "<p>第三編</p><p>的自强運動</p><p>1861-1895年</p>"
+                        "</body></html>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/next.xhtml",
+                    (
+                        "<html><body><p id=\"part\">第三編</p>"
+                        "<p>外國帝國主義加劇時期的自強運動 1861-1895年</p>"
+                        "<h1 id=\"chapter\">第十一章</h1>"
+                        "<p>清朝中興與自強運動正文。</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                prev = zf.read("EPUB/prev.xhtml").decode("utf-8")
+                next_chapter = zf.read("EPUB/next.xhtml").decode("utf-8")
+
+        self.assertIn("上一章正文", prev)
+        self.assertNotIn("第三編", prev)
+        self.assertNotIn("的自强運動", prev)
+        self.assertIn("第三編", next_chapter)
+        self.assertIn("外國帝國主義加劇時期的自強運動", next_chapter)
+
+    def test_ensure_toc_targets_start_pages_removes_orphaned_part_year_preview(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"prev\" href=\"prev.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"next\" href=\"next.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine>"
+                        "<itemref idref=\"prev\"/><itemref idref=\"next\"/>"
+                        "</spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/prev.xhtml",
+                    (
+                        "<html><body><p>上一章正文。</p>"
+                        "<p>第三編</p><p>的自强運動</p><p>1861-1895年</p>"
+                        "</body></html>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/next.xhtml",
+                    (
+                        "<html><body><h1>清朝中興與自強運動</h1>"
+                        "<p>正文。</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                prev = zf.read("EPUB/prev.xhtml").decode("utf-8")
+                next_chapter = zf.read("EPUB/next.xhtml").decode("utf-8")
+
+        self.assertIn("上一章正文", prev)
+        self.assertNotIn("第三編", prev)
+        self.assertNotIn("1861-1895年", prev)
+        self.assertIn("清朝中興與自強運動", next_chapter)
+
+    def test_ensure_toc_targets_start_pages_removes_short_orphaned_part_preview(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"prev\" href=\"prev.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"next\" href=\"next.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine>"
+                        "<itemref idref=\"prev\"/><itemref idref=\"next\"/>"
+                        "</spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/prev.xhtml",
+                    (
+                        "<html><body><p>上一章正文。</p>"
+                        "<p>第七編</p><p>毛後中國：追求一個新秩序</p>"
+                        "</body></html>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/next.xhtml",
+                    "<html><body><h1>第三十二章</h1><p>正文。</p></body></html>",
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                prev = zf.read("EPUB/prev.xhtml").decode("utf-8")
+                next_chapter = zf.read("EPUB/next.xhtml").decode("utf-8")
+
+        self.assertIn("上一章正文", prev)
+        self.assertNotIn("第七編", prev)
+        self.assertNotIn("毛後中國", prev)
+        self.assertIn("第三十二章", next_chapter)
+
+    def test_ensure_toc_targets_start_pages_removes_orphaned_chapter_marker_preview(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"prev\" href=\"prev.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"next\" href=\"next.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine>"
+                        "<itemref idref=\"prev\"/><itemref idref=\"next\"/>"
+                        "</spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/prev.xhtml",
+                    "<html><body><p>上一章正文。</p><h2>第十二章</h2></body></html>",
+                )
+                zf.writestr(
+                    "EPUB/next.xhtml",
+                    "<html><body><h1>對外關係與宮廷政治</h1><p>正文。</p></body></html>",
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                prev = zf.read("EPUB/prev.xhtml").decode("utf-8")
+                next_chapter = zf.read("EPUB/next.xhtml").decode("utf-8")
+
+        self.assertIn("上一章正文", prev)
+        self.assertNotIn("第十二章", prev)
+        self.assertIn("對外關係與宮廷政治", next_chapter)
+
+    def test_ensure_toc_targets_start_pages_removes_in_file_previous_chapter_bibliography_title(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"chapter\" href=\"chapter.xhtml\" "
+                        "media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine><itemref idref=\"chapter\"/></spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body><p>第十二章正文。</p>"
+                        "<section class=\"page-footnotes\"><p>脚注。</p></section>"
+                        "<h2 id=\"bib-title\">第十二章 對外關係與宮廷政治，1861–1880年</h2>"
+                        "<p>Warner, Marina, The Dragon Empress.</p>"
+                        "<h2 id=\"chapter13\">第十三章</h2>"
+                        "<h2>外國侵佔臺灣、新疆與安南</h2>"
+                        "<p>第十三章正文。</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        self.assertNotIn("第十二章 對外關係與宮廷政治", chapter)
+        self.assertIn("Warner, Marina", chapter)
+        self.assertIn("第十三章", chapter)
+
+    def test_ensure_toc_targets_start_pages_retargets_numbered_link_without_fragment(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"cover\" href=\"Content_0.xhtml\" "
+                        "media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"chapter\" href=\"chapter.xhtml\" "
+                        "media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine>"
+                        "<itemref idref=\"cover\"/><itemref idref=\"chapter\"/>"
+                        "</spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    (
+                        "<html><body><nav><ol>"
+                        "<li><a href=\"Content_0.xhtml\">第二十章 革命、共和與軍閥割據</a></li>"
+                        "</ol></nav></body></html>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/Content_0.xhtml",
+                    "<html><body><p>目录页 第二十章 革命、共和與軍閥割據</p></body></html>",
+                )
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body><p>上一章结尾。</p>"
+                        "<h2 id=\"chapter20\">第二十章</h2>"
+                        "<h2>革命、共和與軍閥割據</h2>"
+                        "<p>正文。</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                nav = zf.read("EPUB/nav.xhtml").decode("utf-8")
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        self.assertIn('href="chapter.xhtml#chapter20"', nav)
+        self.assertRegex(chapter, r'<h2[^>]*id="chapter20"[^>]*toc-page-start')
+
+    def test_ensure_toc_targets_start_pages_removes_known_garbled_leading_heading(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "ensure_toc_targets_start_pages"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/content.opf",
+                    (
+                        "<package><manifest>"
+                        "<item id=\"nav\" href=\"nav.xhtml\" media-type=\"application/xhtml+xml\"/>"
+                        "<item id=\"chapter\" href=\"chapter.xhtml\" "
+                        "media-type=\"application/xhtml+xml\"/>"
+                        "</manifest><spine><itemref idref=\"chapter\"/></spine></package>"
+                    ),
+                )
+                zf.writestr(
+                    "EPUB/nav.xhtml",
+                    "<html><body><nav><ol><li><a href=\"chapter.xhtml\">扙艶倣麠邉薬棩盩</a></li></ol></nav></body></html>",
+                )
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><head><title>扙艶倣麠邉薬棩盩</title></head>"
+                        "<body><h1 id=\"bad\">扙艶倣麠邉薬棩盩</h1>"
+                        "<h2 id=\"chapter20\">第二十章</h2>"
+                        "<h2>革命、共和與軍閥割據</h2>"
+                        "<p>正文。</p></body></html>"
+                    ),
+                )
+
+            mod.ensure_toc_targets_start_pages(epub_path)
+
+            with ZipFile(epub_path) as zf:
+                nav = zf.read("EPUB/nav.xhtml").decode("utf-8")
+                chapter = zf.read("EPUB/chapter.xhtml").decode("utf-8")
+
+        self.assertNotIn("扙艶倣麠邉薬棩盩", nav)
+        self.assertNotIn("扙艶倣麠邉薬棩盩", chapter)
+        self.assertIn("第二十章 革命、共和與軍閥割據", nav)
+        self.assertIn("<title>第二十章 革命、共和與軍閥割據</title>", chapter)
+        self.assertRegex(chapter, r'<h2[^>]*id="chapter20"[^>]*toc-page-start')
 
     def test_write_validated_epub_validates_once_after_toc_patching(self):
         mod = _load_script_module()

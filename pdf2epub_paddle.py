@@ -69,6 +69,13 @@ EPUB_STRUCTURAL_FILES = {
     "nav.xhtml",
     "nav.html",
 }
+FOOTNOTE_LABELS = {"footnote", "vision_footnote"}
+FOOTNOTE_MARKER_PATTERN = re.compile(
+    r"^\s*(?:\$\s*\^\{)?(\d{1,3})(?:\}\s*\$)?\s*(.*)$",
+    re.DOTALL,
+)
+INLINE_FOOTNOTE_MARKER_PATTERN = re.compile(r"\$\s*\^\{?(\d{1,3})\}?\s*\$")
+KNOWN_GARBLED_HEADINGS = {"扙艶倣麠邉薬棩盩"}
 TOC_PAGE_START_CLASS = "toc-page-start"
 TOC_PAGE_START_CSS = f"""
 .{TOC_PAGE_START_CLASS} {{
@@ -78,6 +85,11 @@ TOC_PAGE_START_CSS = f"""
     padding-top: 0 !important;
 }}
 body > .{TOC_PAGE_START_CLASS}:first-child {{
+    break-before: auto;
+    page-break-before: auto;
+}}
+p.{TOC_PAGE_START_CLASS} + p + h1.{TOC_PAGE_START_CLASS},
+p.{TOC_PAGE_START_CLASS} + p + h2.{TOC_PAGE_START_CLASS} {{
     break-before: auto;
     page-break-before: auto;
 }}
@@ -109,6 +121,27 @@ def _resolve_epub_fragment_href(base_name: str, href: str) -> tuple[str, str] | 
     target = urllib.parse.unquote(file_part)
     target = posixpath.normpath(posixpath.join(posixpath.dirname(base_name), target))
     return target.lstrip("/"), fragment
+
+
+def _resolve_epub_file_href(base_name: str, href: str) -> str | None:
+    """Resolve a TOC href to an EPUB member, allowing hrefs without fragments."""
+    href = html.unescape(href.strip())
+    if not href or href.startswith("#") or re.match(r"(?i)^[a-z][a-z0-9+.-]*:", href):
+        return None
+
+    file_part = href.partition("#")[0]
+    if not file_part:
+        return None
+
+    target = urllib.parse.unquote(file_part)
+    target = posixpath.normpath(posixpath.join(posixpath.dirname(base_name), target))
+    return target.lstrip("/")
+
+
+def _relative_epub_href(source_name: str, target_name: str, fragment: str) -> str:
+    relative = posixpath.relpath(target_name, posixpath.dirname(source_name) or ".")
+    escaped_fragment = urllib.parse.quote(fragment, safe="A-Za-z0-9_.:-")
+    return f"{relative}#{escaped_fragment}"
 
 
 def _collect_toc_fragment_targets(entries: Dict[str, bytes]) -> Dict[str, set[str]]:
@@ -242,6 +275,456 @@ def _move_part_block_before_previous_chapter_marker(
     )
 
 
+def _resolve_opf_href(opf_name: str, href: str) -> str:
+    href = urllib.parse.unquote(html.unescape(href)).partition("#")[0]
+    return posixpath.normpath(
+        posixpath.join(posixpath.dirname(opf_name), href)
+    ).lstrip("/")
+
+
+def _epub_spine_xhtml_order(entries: Dict[str, bytes]) -> list[str]:
+    opf_name = next((name for name in entries if name.lower().endswith(".opf")), None)
+    if not opf_name:
+        return []
+
+    text = entries[opf_name].decode("utf-8", "ignore")
+    manifest: Dict[str, str] = {}
+    for match in re.finditer(r"(?is)<item\b[^>]*>", text):
+        item_tag = match.group(0)
+        item_id = _get_start_tag_attr(item_tag, "id")
+        href = _get_start_tag_attr(item_tag, "href")
+        media_type = (_get_start_tag_attr(item_tag, "media-type") or "").lower()
+        if not item_id or not href:
+            continue
+        resolved = _resolve_opf_href(opf_name, href)
+        if media_type == "application/xhtml+xml" or resolved.lower().endswith(
+            (".xhtml", ".html", ".htm")
+        ):
+            manifest[item_id] = resolved
+
+    spine = []
+    for match in re.finditer(r"(?is)<itemref\b[^>]*>", text):
+        idref = _get_start_tag_attr(match.group(0), "idref")
+        if idref and idref in manifest and manifest[idref] in entries:
+            spine.append(manifest[idref])
+    return spine
+
+
+def _normalize_heading_preview_text(value: str) -> str:
+    value = _normalize_numbered_marker(value)
+    value = value.replace("强", "強")
+    return re.sub(r"[^0-9A-Za-z\u3400-\u9fff]", "", value)
+
+
+def _has_numbered_toc_marker(elements: list[Dict[str, Any]]) -> bool:
+    return any(
+        NUMBERED_TOC_LABEL_PATTERN.match(element["text"].strip()) for element in elements
+    )
+
+
+def _only_closing_markup_after_last_element(xhtml_text: str, last_end: int) -> bool:
+    trailer = xhtml_text[last_end:]
+    trailer = re.sub(r"(?is)</?(?:body|html)\b[^>]*>", "", trailer)
+    return not trailer.strip()
+
+
+def _normalized_preview_marker_and_suffix(
+    elements: list[Dict[str, Any]],
+) -> tuple[str, str] | None:
+    if not elements:
+        return None
+    marker_info = _extract_numbered_toc_marker(elements[0]["text"])
+    if not marker_info:
+        return None
+
+    marker = _normalize_heading_preview_text(marker_info[0])
+    preview = _normalize_heading_preview_text(
+        "".join(element["text"] for element in elements)
+    )
+    if not marker or not preview.startswith(marker):
+        return None
+    return marker, preview[len(marker):]
+
+
+def _heading_preview_matches_next(
+    candidate_elements: list[Dict[str, Any]],
+    next_elements: list[Dict[str, Any]],
+) -> bool:
+    candidate = _normalize_heading_preview_text(
+        "".join(element["text"] for element in candidate_elements)
+    )
+    next_prefix = _normalize_heading_preview_text(
+        "".join(element["text"] for element in next_elements[:8])
+    )
+    if candidate and candidate in next_prefix:
+        return True
+
+    marker_and_suffix = _normalized_preview_marker_and_suffix(candidate_elements)
+    if not marker_and_suffix:
+        return False
+
+    marker, suffix = marker_and_suffix
+    if len(suffix) < 6:
+        return False
+
+    for index in range(min(4, len(next_elements))):
+        next_marker_and_suffix = _normalized_preview_marker_and_suffix(
+            next_elements[index:index + 8]
+        )
+        if not next_marker_and_suffix:
+            continue
+        next_marker, next_suffix = next_marker_and_suffix
+        if next_marker == marker and suffix in next_suffix:
+            return True
+    return False
+
+
+def _is_orphaned_part_preview(candidate_elements: list[Dict[str, Any]]) -> bool:
+    if len(candidate_elements) < 2 or len(candidate_elements) > 5:
+        return False
+
+    marker_info = _extract_numbered_toc_marker(candidate_elements[0]["text"])
+    if not marker_info or marker_info[1] not in PART_TOC_KINDS:
+        return False
+
+    preview_text = " ".join(element["text"] for element in candidate_elements)
+    preview_norm = _normalize_heading_preview_text(preview_text)
+    marker_norm = _normalize_heading_preview_text(marker_info[0])
+    if len(preview_norm) > 80 or len(preview_norm) <= len(marker_norm):
+        return False
+
+    return all(
+        len(_normalize_heading_preview_text(element["text"])) <= 40
+        for element in candidate_elements[1:]
+    )
+
+
+def _is_orphaned_chapter_marker_preview(candidate_elements: list[Dict[str, Any]]) -> bool:
+    if len(candidate_elements) != 1:
+        return False
+
+    text = candidate_elements[0]["text"].strip()
+    marker_info = _extract_numbered_toc_marker(text)
+    return bool(marker_info and marker_info[1] == "章" and text == marker_info[0])
+
+
+def _remove_trailing_next_heading_preview(prev_xhtml: str, next_xhtml: str) -> tuple[str, bool]:
+    prev_elements = _iter_xhtml_text_elements(prev_xhtml)
+    next_elements = _iter_xhtml_text_elements(next_xhtml)
+    if not prev_elements or not next_elements:
+        return prev_xhtml, False
+    if not _only_closing_markup_after_last_element(prev_xhtml, prev_elements[-1]["end"]):
+        return prev_xhtml, False
+
+    best_start_index = None
+    last_index = len(prev_elements) - 1
+    first_candidate_index = max(0, len(prev_elements) - 8)
+    for index in range(last_index, first_candidate_index - 1, -1):
+        candidate_elements = prev_elements[index:last_index + 1]
+        if not _has_numbered_toc_marker(candidate_elements):
+            continue
+
+        if _heading_preview_matches_next(
+            candidate_elements,
+            next_elements,
+        ) or _is_orphaned_part_preview(
+            candidate_elements
+        ) or _is_orphaned_chapter_marker_preview(candidate_elements):
+            best_start_index = index
+            continue
+        if best_start_index is not None:
+            break
+
+    if best_start_index is None:
+        return prev_xhtml, False
+
+    remove_start = prev_elements[best_start_index]["start"]
+    remove_end = prev_elements[last_index]["end"]
+    return prev_xhtml[:remove_start] + prev_xhtml[remove_end:], True
+
+
+def _remove_trailing_next_heading_previews(entries: Dict[str, bytes]) -> list[str]:
+    changed_files = []
+    spine = _epub_spine_xhtml_order(entries)
+    for prev_name, next_name in zip(spine, spine[1:]):
+        if prev_name not in entries or next_name not in entries:
+            continue
+        prev_xhtml = entries[prev_name].decode("utf-8", "ignore")
+        next_xhtml = entries[next_name].decode("utf-8", "ignore")
+        patched, changed = _remove_trailing_next_heading_preview(prev_xhtml, next_xhtml)
+        if changed:
+            entries[prev_name] = patched.encode("utf-8")
+            changed_files.append(prev_name)
+    return changed_files
+
+
+def _chapter_label_from_elements(elements: list[Dict[str, Any]]) -> str | None:
+    if not elements:
+        return None
+    marker_info = _extract_numbered_toc_marker(elements[0]["text"])
+    if not marker_info or marker_info[1] != "章":
+        return None
+
+    label_parts = [marker_info[0]]
+    for element in elements[1:3]:
+        text = element["text"].strip()
+        if not text or NUMBERED_TOC_LABEL_PATTERN.match(text):
+            break
+        label_parts.append(text)
+        break
+    return " ".join(label_parts)
+
+
+def _clean_known_garbled_heading_xhtml(xhtml_text: str) -> tuple[str, str | None]:
+    elements = _iter_xhtml_text_elements(xhtml_text)
+    if len(elements) < 2 or elements[0]["text"].strip() not in KNOWN_GARBLED_HEADINGS:
+        return xhtml_text, None
+
+    label = _chapter_label_from_elements(elements[1:])
+    if not label:
+        return xhtml_text, None
+
+    first = elements[0]
+    updated = xhtml_text[:first["start"]] + xhtml_text[first["end"]:]
+
+    def replace_title(match: re.Match) -> str:
+        if _plain_text_from_html(match.group(2)) not in KNOWN_GARBLED_HEADINGS:
+            return match.group(0)
+        return match.group(1) + html.escape(label) + match.group(3)
+
+    updated = re.sub(
+        r"(?is)(<title\b[^>]*>)(.*?)(</title>)",
+        replace_title,
+        updated,
+        count=1,
+    )
+    return updated, label
+
+
+def _label_for_epub_file(entries: Dict[str, bytes], filename: str) -> str | None:
+    if filename not in entries:
+        return None
+    elements = _iter_xhtml_text_elements(entries[filename].decode("utf-8", "ignore"))
+    return _chapter_label_from_elements(elements)
+
+
+def _clean_known_garbled_toc_labels(
+    entries: Dict[str, bytes],
+    file_labels: Dict[str, str],
+) -> list[str]:
+    changed_files = []
+    for name, data in list(entries.items()):
+        basename = os.path.basename(name.lower())
+        if basename not in {"nav.xhtml", "nav.html", "toc.ncx"}:
+            continue
+
+        text = data.decode("utf-8", "ignore")
+
+        def replacement_label(source_name: str, href: str, current_label: str) -> str | None:
+            if _plain_text_from_html(current_label) not in KNOWN_GARBLED_HEADINGS:
+                return None
+            target = _resolve_epub_file_href(source_name, href)
+            if not target:
+                resolved = _resolve_epub_fragment_href(source_name, href)
+                target = resolved[0] if resolved else None
+            if not target:
+                return None
+            return file_labels.get(target) or _label_for_epub_file(entries, target)
+
+        if basename in {"nav.xhtml", "nav.html"}:
+
+            def replace_nav_link(match: re.Match) -> str:
+                label = replacement_label(name, match.group(3), match.group(5))
+                if not label:
+                    return match.group(0)
+                return (
+                    match.group(1)
+                    + match.group(2)
+                    + match.group(3)
+                    + match.group(2)
+                    + match.group(4)
+                    + html.escape(label)
+                    + match.group(6)
+                )
+
+            patched = re.sub(
+                r"(?is)(<a\b[^>]*\bhref\s*=\s*)(['\"])(.*?)\2([^>]*>)(.*?)(</a>)",
+                replace_nav_link,
+                text,
+            )
+        else:
+
+            def replace_ncx_label(match: re.Match) -> str:
+                label = replacement_label(name, match.group(5), match.group(2))
+                if not label:
+                    return match.group(0)
+                return (
+                    match.group(1)
+                    + html.escape(label)
+                    + match.group(3)
+                    + match.group(4)
+                    + match.group(5)
+                    + match.group(4)
+                )
+
+            patched = re.sub(
+                r"(?is)(<navLabel>\s*<text[^>]*>)(.*?)(</text>\s*</navLabel>\s*"
+                r"<content\b[^>]*\bsrc\s*=\s*)(['\"])(.*?)\4",
+                replace_ncx_label,
+                text,
+            )
+
+        if patched != text:
+            entries[name] = patched.encode("utf-8")
+            changed_files.append(name)
+    return changed_files
+
+
+def _clean_known_garbled_headings(entries: Dict[str, bytes]) -> list[str]:
+    changed_files = []
+    file_labels: Dict[str, str] = {}
+    for name, data in list(entries.items()):
+        if not name.lower().endswith((".xhtml", ".html", ".htm")):
+            continue
+        if os.path.basename(name.lower()) in {"nav.xhtml", "nav.html"}:
+            continue
+
+        text = data.decode("utf-8", "ignore")
+        patched, label = _clean_known_garbled_heading_xhtml(text)
+        if label:
+            file_labels[name] = label
+        if patched != text:
+            entries[name] = patched.encode("utf-8")
+            changed_files.append(name)
+
+    changed_files.extend(_clean_known_garbled_toc_labels(entries, file_labels))
+    return changed_files
+
+
+def _remove_in_file_previous_chapter_bibliography_title(xhtml_text: str) -> tuple[str, bool]:
+    elements = _iter_xhtml_text_elements(xhtml_text)
+    remove_ranges = []
+    for index, element in enumerate(elements):
+        if not re.match(r"h[1-6]$", element["tag"]):
+            continue
+
+        marker_info = _extract_numbered_toc_marker(element["text"])
+        if not marker_info or marker_info[1] != "章":
+            continue
+        if element["text"].strip() == marker_info[0]:
+            continue
+
+        lookahead = elements[index + 1:index + 8]
+        if not any(_is_chapter_number_text(candidate["text"]) for candidate in lookahead):
+            continue
+
+        previous_markup = xhtml_text[max(0, element["start"] - 1200):element["start"]]
+        if "footnote" not in previous_markup and "OCR_FOOTNOTES_END" not in previous_markup:
+            continue
+        remove_ranges.append((element["start"], element["end"]))
+
+    if not remove_ranges:
+        return xhtml_text, False
+
+    updated = xhtml_text
+    for start, end in reversed(remove_ranges):
+        updated = updated[:start] + updated[end:]
+    return updated, True
+
+
+def _remove_in_file_previous_chapter_bibliography_titles(entries: Dict[str, bytes]) -> list[str]:
+    changed_files = []
+    for name, data in list(entries.items()):
+        if not name.lower().endswith((".xhtml", ".html", ".htm")):
+            continue
+        if os.path.basename(name.lower()) in {"nav.xhtml", "nav.html"}:
+            continue
+        text = data.decode("utf-8", "ignore")
+        patched, changed = _remove_in_file_previous_chapter_bibliography_title(text)
+        if changed:
+            entries[name] = patched.encode("utf-8")
+            changed_files.append(name)
+    return changed_files
+
+
+def _is_toc_like_content_file(filename: str) -> bool:
+    basename = os.path.basename(filename.lower())
+    if basename in {"nav.xhtml", "nav.html", "cover.xhtml"}:
+        return True
+    return bool(re.match(r"content_\d+\.xhtml$", basename))
+
+
+def _toc_marker_search_order(entries: Dict[str, bytes], preferred_file: str | None) -> list[str]:
+    ordered = []
+    if preferred_file and preferred_file in entries and not _is_toc_like_content_file(preferred_file):
+        ordered.append(preferred_file)
+    for filename in _epub_spine_xhtml_order(entries):
+        if filename not in entries or filename in ordered or _is_toc_like_content_file(filename):
+            continue
+        ordered.append(filename)
+    for filename in entries:
+        if filename in ordered or _is_toc_like_content_file(filename):
+            continue
+        if filename.lower().endswith((".xhtml", ".html", ".htm")):
+            ordered.append(filename)
+    return ordered
+
+
+def _find_numbered_toc_target(
+    entries: Dict[str, bytes],
+    preferred_file: str | None,
+    marker: str,
+    kind: str,
+    label_text: str,
+) -> tuple[str, str] | None:
+    marker_norm = _normalize_numbered_marker(marker)
+    title_hint = _normalize_heading_preview_text(label_text[len(marker):])
+    best: tuple[int, str, int, Dict[str, Any], str] | None = None
+
+    for filename in _toc_marker_search_order(entries, preferred_file):
+        xhtml_text = entries[filename].decode("utf-8", "ignore")
+        elements = _iter_xhtml_text_elements(xhtml_text)
+        for index, element in enumerate(elements):
+            text = element["text"].strip()
+            if kind == "章":
+                marker_matches = (
+                    _normalize_numbered_marker(text) == marker_norm
+                    or _normalize_numbered_marker(text).startswith(marker_norm)
+                )
+            else:
+                marker_matches = _normalize_numbered_marker(text).startswith(marker_norm)
+            if not marker_matches:
+                continue
+
+            context = _normalize_heading_preview_text(
+                "".join(candidate["text"] for candidate in elements[index:index + 3])
+            )
+            score = 0
+            if filename == preferred_file:
+                score += 2
+            if re.match(r"h[1-6]$", element["tag"]):
+                score += 2
+            if text == marker:
+                score += 2
+            if title_hint and title_hint in context:
+                score += 6
+            candidate = (score, filename, index, element, xhtml_text)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+    if best is None:
+        return None
+
+    _score, filename, _index, element, xhtml_text = best
+    fragment = element.get("id") or element.get("name")
+    if fragment:
+        return filename, fragment
+
+    new_id = _unique_fragment_id(xhtml_text, "toc-auto", "start")
+    entries[filename] = _add_id_to_text_element(xhtml_text, element, new_id).encode("utf-8")
+    return filename, new_id
+
+
 def _retarget_numbered_toc_fragment(
     xhtml_text: str,
     target_fragment: str,
@@ -322,15 +805,27 @@ def _retarget_numbered_toc_hrefs(entries: Dict[str, bytes]) -> int:
         if not marker_info:
             return href
 
+        marker, kind = marker_info
         resolved = _resolve_epub_fragment_href(source_name, href)
         if not resolved:
-            return href
+            preferred_file = _resolve_epub_file_href(source_name, href)
+            found = _find_numbered_toc_target(
+                entries,
+                preferred_file,
+                marker,
+                kind,
+                label_text,
+            )
+            if not found:
+                return href
+            changed_count += 1
+            target_file, target_fragment = found
+            return _relative_epub_href(source_name, target_file, target_fragment)
 
         target_file, target_fragment = resolved
         if target_file not in entries:
             return href
 
-        marker, kind = marker_info
         xhtml_text = entries[target_file].decode("utf-8", "ignore")
         updated_text, updated_fragment = _retarget_numbered_toc_fragment(
             xhtml_text,
@@ -474,13 +969,14 @@ def ensure_toc_targets_start_pages(epub_path: str) -> Dict[str, Any]:
         original_entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
 
     entry_map = {info.filename: data for info, data in original_entries}
+    preclean_files = []
+    preclean_files.extend(_clean_known_garbled_headings(entry_map))
+    preclean_files.extend(_remove_in_file_previous_chapter_bibliography_titles(entry_map))
     retargeted_links = _retarget_numbered_toc_hrefs(entry_map)
     toc_targets = _collect_toc_fragment_targets(entry_map)
-    if not toc_targets:
-        return {"targets": 0, "xhtml_files": [], "css_files": []}
 
-    changed = bool(retargeted_links)
-    xhtml_files = []
+    changed = bool(preclean_files or retargeted_links)
+    xhtml_files = list(dict.fromkeys(preclean_files))
     css_files = []
     patched_entries = []
     for info, _data in original_entries:
@@ -488,7 +984,7 @@ def ensure_toc_targets_start_pages(epub_path: str) -> Dict[str, Any]:
         lower_name = info.filename.lower()
         new_data = data
 
-        if lower_name.endswith((".xhtml", ".html", ".htm")):
+        if toc_targets and lower_name.endswith((".xhtml", ".html", ".htm")):
             text = data.decode("utf-8", "ignore")
             text = _remove_toc_page_start_classes(text)
             patched = text
@@ -502,7 +998,7 @@ def ensure_toc_targets_start_pages(epub_path: str) -> Dict[str, Any]:
                 xhtml_files.append(info.filename)
                 new_data = patched.encode("utf-8")
 
-        if lower_name.endswith(".css"):
+        if toc_targets and lower_name.endswith(".css"):
             text = new_data.decode("utf-8", "ignore")
             patched = _append_toc_page_start_css(text)
             if patched != text:
@@ -511,6 +1007,17 @@ def ensure_toc_targets_start_pages(epub_path: str) -> Dict[str, Any]:
                 new_data = patched.encode("utf-8")
 
         patched_entries.append((info, new_data))
+
+    patched_entry_map = {info.filename: data for info, data in patched_entries}
+    preview_files = _remove_trailing_next_heading_previews(patched_entry_map)
+    if preview_files:
+        changed = True
+        for filename in preview_files:
+            if filename not in xhtml_files:
+                xhtml_files.append(filename)
+        patched_entries = [
+            (info, patched_entry_map.get(info.filename, data)) for info, data in patched_entries
+        ]
 
     if not changed:
         return {
@@ -650,6 +1157,190 @@ def clean_ocr_noise(markdown_text: str) -> str:
 
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
+
+
+def extract_page_footnotes(page_res: Dict[str, Any]) -> List[str]:
+    """Extract OCR footnote blocks omitted from Paddle's markdown text."""
+    footnotes: List[str] = []
+    blocks = page_res.get("prunedResult", {}).get("parsing_res_list", [])
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("block_label") not in FOOTNOTE_LABELS:
+            continue
+        content = str(block.get("block_content") or "").strip()
+        if not content:
+            continue
+        cleaned = clean_ocr_noise(content)
+        if cleaned:
+            footnotes.append(cleaned)
+    return _infer_missing_footnote_markers(page_res, footnotes)
+
+
+def _infer_missing_footnote_markers(
+    page_res: Dict[str, Any],
+    footnotes: List[str],
+) -> List[str]:
+    inline_numbers = [
+        match.group(1)
+        for match in INLINE_FOOTNOTE_MARKER_PATTERN.finditer(
+            page_res.get("markdown", {}).get("text", "")
+        )
+    ]
+    if not inline_numbers:
+        return footnotes
+
+    explicit_counts: Dict[str, int] = {}
+    parsed_numbers: List[str | None] = []
+    for footnote in footnotes:
+        number, _body = _split_footnote_marker(footnote)
+        parsed_numbers.append(number)
+        if number is not None:
+            explicit_counts[number] = explicit_counts.get(number, 0) + 1
+
+    available_numbers: List[str] = []
+    seen_counts: Dict[str, int] = {}
+    for number in inline_numbers:
+        seen_counts[number] = seen_counts.get(number, 0) + 1
+        if seen_counts[number] > explicit_counts.get(number, 0):
+            available_numbers.append(number)
+
+    if not available_numbers:
+        return footnotes
+
+    inferred: List[str] = []
+    available_index = 0
+    for footnote, number in zip(footnotes, parsed_numbers):
+        if number is None and available_index < len(available_numbers):
+            inferred.append(f"$ ^{{{available_numbers[available_index]}}} $ {footnote}")
+            available_index += 1
+        else:
+            inferred.append(footnote)
+    return inferred
+
+
+def _split_footnote_marker(footnote: str) -> tuple[str | None, str]:
+    marker_match = FOOTNOTE_MARKER_PATTERN.match(footnote)
+    if marker_match:
+        return marker_match.group(1), marker_match.group(2).strip()
+    return None, footnote
+
+
+def _footnote_anchor_id(prefix: str, page_number: int, number: str, occurrence: int) -> str:
+    suffix = f"-{occurrence}" if occurrence > 1 else ""
+    return f"{prefix}-p{page_number}-{number}{suffix}"
+
+
+def _build_page_footnote_refs(
+    footnotes: List[str],
+    page_number: int,
+) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    for footnote in footnotes:
+        number, _body = _split_footnote_marker(footnote)
+        if number is None:
+            refs.append({})
+            continue
+        occurrence = counts.get(number, 0) + 1
+        counts[number] = occurrence
+        refs.append(
+            {
+                "number": number,
+                "note_id": _footnote_anchor_id("fn", page_number, number, occurrence),
+                "ref_id": _footnote_anchor_id("fnref", page_number, number, occurrence),
+                "linked": False,
+            }
+        )
+    return refs
+
+
+def link_page_footnote_references(
+    markdown_text: str,
+    footnotes: List[str],
+    page_number: int,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Turn inline OCR footnote markers into EPUB noteref links when possible."""
+    refs = _build_page_footnote_refs(footnotes, page_number)
+    refs_by_number: Dict[str, List[Dict[str, Any]]] = {}
+    for ref in refs:
+        number = ref.get("number")
+        if number:
+            refs_by_number.setdefault(str(number), []).append(ref)
+
+    used_by_number: Dict[str, int] = {}
+
+    def replace_marker(match: re.Match[str]) -> str:
+        number = match.group(1)
+        used = used_by_number.get(number, 0)
+        numbered_refs = refs_by_number.get(number, [])
+        if used < len(numbered_refs):
+            ref = numbered_refs[used]
+            used_by_number[number] = used + 1
+            ref["linked"] = True
+            return (
+                f'<sup id="{html.escape(ref["ref_id"])}" class="footnote-ref">'
+                f'<a epub:type="noteref" href="#{html.escape(ref["note_id"])}">'
+                f"{html.escape(number)}</a></sup>"
+            )
+        return (
+            '<sup class="unlinked-footnote-marker">'
+            + html.escape(number)
+            + "</sup>"
+        )
+
+    return INLINE_FOOTNOTE_MARKER_PATTERN.sub(replace_marker, markdown_text), refs
+
+
+def _format_single_footnote_html(
+    footnote: str,
+    footnote_ref: Dict[str, Any] | None = None,
+) -> str:
+    number, body = _split_footnote_marker(footnote)
+    linked = bool(footnote_ref and footnote_ref.get("linked"))
+    attrs = ""
+    backlink = ""
+    if linked:
+        attrs = f' id="{html.escape(str(footnote_ref["note_id"]))}"'
+        backlink = (
+            f' <a class="footnote-backlink" epub:type="backlink" '
+            f'href="#{html.escape(str(footnote_ref["ref_id"]))}">&#8617;</a>'
+        )
+    if number is not None:
+        return (
+            f'<p{attrs} class="footnote"><sup>'
+            + html.escape(number)
+            + "</sup> "
+            + html.escape(body)
+            + backlink
+            + "</p>"
+        )
+    return f'<p{attrs} class="footnote">' + html.escape(footnote) + backlink + "</p>"
+
+
+def format_page_footnotes_html(
+    footnotes: List[str],
+    page_number: int,
+    footnote_refs: List[Dict[str, Any]] | None = None,
+) -> str:
+    """Render page footnotes as EPUB-friendly HTML appended near their source page."""
+    if not footnotes:
+        return ""
+    if footnote_refs is None:
+        footnote_refs = [{} for _footnote in footnotes]
+    items = "\n".join(
+        _format_single_footnote_html(
+            footnote,
+            footnote_refs[index] if index < len(footnote_refs) else {},
+        )
+        for index, footnote in enumerate(footnotes)
+    )
+    return (
+        f'<section class="page-footnotes" epub:type="footnotes" '
+        f'data-source-page="{page_number}">\n'
+        f"{items}\n"
+        "</section>"
+    )
 
 
 def scan_epub_for_ocr_noise(epub_path: str) -> List[Dict[str, Any]]:
@@ -1118,6 +1809,18 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     p { margin-bottom: 0.8em; }
     blockquote { margin: 1em 2em; font-style: italic; }
     img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
+    .page-footnotes {
+        margin-top: 1.2em;
+        padding-top: 0.6em;
+        border-top: 1px solid #999;
+        font-size: 0.85em;
+        line-height: 1.5;
+    }
+    .page-footnotes p { margin: 0.35em 0; text-align: left; }
+    .page-footnotes sup { font-size: 0.8em; vertical-align: super; }
+    .footnote-ref a { text-decoration: none; }
+    .unlinked-footnote-marker { font-size: 0.8em; vertical-align: super; }
+    .footnote-backlink { margin-left: 0.4em; text-decoration: none; }
     """
     nav_css = epub.EpubItem(
         uid="style_nav", file_name="style/nav.css", media_type="text/css", content=style
@@ -1286,6 +1989,19 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             # But first, check if we need to merge with the previous page's content
             # (sentences can be split across page boundaries)
             page_markdown = "\n\n".join(reflowed_paragraphs)
+            page_footnotes = extract_page_footnotes(page_res)
+            page_markdown, footnote_refs = link_page_footnote_references(
+                page_markdown,
+                page_footnotes,
+                global_page,
+            )
+            footnote_html = format_page_footnotes_html(
+                page_footnotes,
+                global_page,
+                footnote_refs=footnote_refs,
+            )
+            if footnote_html:
+                page_markdown = (page_markdown.rstrip() + "\n\n" + footnote_html).strip()
 
             if full_markdown and page_markdown:
                 # Check if full_markdown ends mid-sentence (no terminal punctuation)
