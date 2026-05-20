@@ -1,6 +1,6 @@
-import importlib.util
 import os
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,13 +10,9 @@ from unittest import mock
 
 
 def _load_script_module():
-    script_path = Path(__file__).resolve().parents[1] / "pdf2epub_paddle.py"
-    spec = importlib.util.spec_from_file_location("pdf2epub_paddle_script", script_path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    import paddle_pipeline
+    return paddle_pipeline
 
 
 class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
@@ -1095,14 +1091,14 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             output_path = Path(td) / "book.epub"
-            with mock.patch.object(mod, "epub", fake_epub, create=True), \
+            with mock.patch.object(mod.epub_validate, "epub", fake_epub, create=True), \
                     mock.patch.object(
-                        mod,
+                        mod.epub_validate,
                         "ensure_toc_targets_start_pages",
                         fake_ensure_toc_targets_start_pages,
                     ), \
                     mock.patch.object(
-                        mod,
+                        mod.epub_validate,
                         "validate_epub_no_ocr_noise",
                         fake_validate_epub_no_ocr_noise,
                     ):
@@ -1164,8 +1160,9 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as td:
             output_path = Path(td) / "book.epub"
-            with mock.patch.object(mod, "epub", fake_epub, create=True), \
-                    mock.patch.object(mod, "validate_epub_no_ocr_noise", fail_validation):
+            with mock.patch.object(mod.epub_builder, "epub", fake_epub, create=True), \
+                    mock.patch.object(mod.epub_validate, "epub", fake_epub, create=True), \
+                    mock.patch.object(mod.epub_validate, "validate_epub_no_ocr_noise", fail_validation):
                 with self.assertRaises(RuntimeError):
                     mod.create_epub(
                         "Title",

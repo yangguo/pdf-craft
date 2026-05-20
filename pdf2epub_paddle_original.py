@@ -1,0 +1,2365 @@
+import os
+import sys
+import argparse
+import base64
+import html
+import json
+import posixpath
+import re
+import tempfile
+import urllib.parse
+import zipfile
+
+from typing import List, Dict, Any
+
+# Optional third-party dependencies – checked at runtime via check_dependencies()
+try:
+    import requests
+    import fitz  # PyMuPDF
+    from ebooklib import epub
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # check_dependencies() called in main() provides actionable install instructions
+
+# --- Configuration ---
+API_URL = "https://feq472ncm4mfofva.aistudio-app.com/layout-parsing"
+# Environment variable for API token
+API_TOKEN = os.getenv("PADDLE_API_TOKEN", "")
+
+DEFAULT_EPUB_LANGUAGE = os.getenv("EPUB_LANGUAGE", "zh-Hant")
+MAX_DAILY_PAGES = 3000
+
+
+def _env_int(name: str, default: int, minimum: int | None = None) -> int:
+    """Parse integer env vars without making import fail on bad local config."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if minimum is not None and parsed < minimum:
+        return default
+    return parsed
+
+
+CHUNK_SIZE = _env_int("PADDLE_CHUNK_SIZE", 5, minimum=1)  # Reduced to 5 for reliability
+API_TIMEOUT_SECONDS = _env_int("PADDLE_API_TIMEOUT_SECONDS", 600, minimum=1)
+DEFAULT_COVER_MAX_EDGE = _env_int("EPUB_COVER_MAX_EDGE", 2000, minimum=1)
+DEFAULT_COVER_JPEG_QUALITY = _env_int("EPUB_COVER_JPEG_QUALITY", 82, minimum=1)
+
+DOWNARROW_PROSE_SEPARATOR_PATTERN = re.compile(
+    r"([\u3400-\u9fff])\s*\$\s*\\downarrow\s*\$\s*([\u3400-\u9fff])"
+)
+HTML_TABLE_PATTERN = re.compile(r"(?is)<table\b.*?</table>")
+DOTTED_NUMERIC_TOKEN_PATTERN = re.compile(r"(?<![\d.])\d+(?:\.\d+){2,}(?![\d.])")
+OCR_NOISE_PATTERNS = (
+    ("\\underset{\\cdot}", re.compile(r"\\underset\{\\cdot\}")),
+    ("CJK $ \\downarrow $ separator", DOWNARROW_PROSE_SEPARATOR_PATTERN),
+    (
+        "20 $ \\frac{1}{2} $7年",
+        re.compile(r"20\s*\$\s*\\frac\{1\}\{2\}\s*\$\s*7年"),
+    ),
+)
+EPUB_STRUCTURAL_FILES = {
+    "content.opf",
+    "toc.ncx",
+    "nav.xhtml",
+    "nav.html",
+}
+FOOTNOTE_LABELS = {"footnote", "vision_footnote"}
+FOOTNOTE_MARKER_PATTERN = re.compile(
+    r"^\s*(?:\$\s*\^\{)?(\d{1,3})(?:\}\s*\$)?\s*(.*)$",
+    re.DOTALL,
+)
+INLINE_FOOTNOTE_MARKER_PATTERN = re.compile(r"\$\s*\^\{?(\d{1,3})\}?\s*\$")
+KNOWN_GARBLED_HEADINGS = {"扙艶倣麠邉薬棩盩"}
+TOC_PAGE_START_CLASS = "toc-page-start"
+TOC_PAGE_START_CSS = f"""
+.{TOC_PAGE_START_CLASS} {{
+    break-before: page;
+    page-break-before: always;
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}}
+body > .{TOC_PAGE_START_CLASS}:first-child {{
+    break-before: auto;
+    page-break-before: auto;
+}}
+p.{TOC_PAGE_START_CLASS} + p + h1.{TOC_PAGE_START_CLASS},
+p.{TOC_PAGE_START_CLASS} + p + h2.{TOC_PAGE_START_CLASS} {{
+    break-before: auto;
+    page-break-before: auto;
+}}
+"""
+NUMBERED_TOC_LABEL_PATTERN = re.compile(
+    r"^(第[零〇一二三四五六七八九十百千0-9]+([章編编篇部卷]))"
+)
+PART_TOC_KINDS = {"編", "编", "篇", "部", "卷"}
+XHTML_TEXT_ELEMENT_PATTERN = re.compile(
+    r"(?is)(<(?P<tag>h[1-6]|p|div|span)\b(?P<attrs>[^>]*)>)"
+    r"(?P<body>.*?)</(?P=tag)>"
+)
+
+
+def _resolve_epub_fragment_href(base_name: str, href: str) -> tuple[str, str] | None:
+    """Resolve a TOC href to an EPUB member and fragment id."""
+    href = html.unescape(href.strip())
+    if not href or re.match(r"(?i)^[a-z][a-z0-9+.-]*:", href):
+        return None
+
+    file_part, separator, fragment = href.partition("#")
+    if not separator or not fragment:
+        return None
+
+    fragment = urllib.parse.unquote(fragment)
+    if not file_part:
+        return base_name.lstrip("/"), fragment
+
+    target = urllib.parse.unquote(file_part)
+    target = posixpath.normpath(posixpath.join(posixpath.dirname(base_name), target))
+    return target.lstrip("/"), fragment
+
+
+def _resolve_epub_file_href(base_name: str, href: str) -> str | None:
+    """Resolve a TOC href to an EPUB member, allowing hrefs without fragments."""
+    href = html.unescape(href.strip())
+    if not href or href.startswith("#") or re.match(r"(?i)^[a-z][a-z0-9+.-]*:", href):
+        return None
+
+    file_part = href.partition("#")[0]
+    if not file_part:
+        return None
+
+    target = urllib.parse.unquote(file_part)
+    target = posixpath.normpath(posixpath.join(posixpath.dirname(base_name), target))
+    return target.lstrip("/")
+
+
+def _relative_epub_href(source_name: str, target_name: str, fragment: str) -> str:
+    relative = posixpath.relpath(target_name, posixpath.dirname(source_name) or ".")
+    escaped_fragment = urllib.parse.quote(fragment, safe="A-Za-z0-9_.:-")
+    return f"{relative}#{escaped_fragment}"
+
+
+def _collect_toc_fragment_targets(entries: Dict[str, bytes]) -> Dict[str, set[str]]:
+    """Collect file/id targets referenced by EPUB TOC documents."""
+    targets: Dict[str, set[str]] = {}
+    for name, data in entries.items():
+        lower_name = name.lower()
+        if os.path.basename(lower_name) not in {"nav.xhtml", "nav.html", "toc.ncx"}:
+            continue
+
+        text = data.decode("utf-8", "ignore")
+        for match in re.finditer(r"(?is)\b(?:href|src)\s*=\s*(['\"])(.*?)\1", text):
+            resolved = _resolve_epub_fragment_href(name, match.group(2))
+            if not resolved:
+                continue
+            target_file, fragment = resolved
+            targets.setdefault(target_file, set()).add(fragment)
+    return targets
+
+
+def _plain_text_from_html(value: str) -> str:
+    text = html.unescape(re.sub(r"(?is)<[^>]+>", "", value))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _normalize_numbered_marker(value: str) -> str:
+    return value.replace("编", "編").strip()
+
+
+def _extract_numbered_toc_marker(label: str) -> tuple[str, str] | None:
+    label_text = _plain_text_from_html(label)
+    match = NUMBERED_TOC_LABEL_PATTERN.match(label_text)
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def _get_start_tag_attr(start_tag: str, attr_name: str) -> str | None:
+    match = re.search(
+        rf"(?is)\b{re.escape(attr_name)}\s*=\s*(['\"])(.*?)\1",
+        start_tag,
+    )
+    if not match:
+        return None
+    return html.unescape(match.group(2))
+
+
+def _existing_fragment_ids(xhtml_text: str) -> set[str]:
+    return {
+        html.unescape(match.group(2))
+        for match in re.finditer(
+            r"(?is)\b(?:id|name)\s*=\s*(['\"])(.*?)\1",
+            xhtml_text,
+        )
+    }
+
+
+def _unique_fragment_id(xhtml_text: str, base: str, suffix: str) -> str:
+    safe_base = re.sub(r"[^A-Za-z0-9_.:-]+", "-", base).strip("-") or "toc-auto"
+    candidate = f"{safe_base}-{suffix}"
+    existing = _existing_fragment_ids(xhtml_text)
+    if candidate not in existing:
+        return candidate
+
+    index = 2
+    while f"{candidate}-{index}" in existing:
+        index += 1
+    return f"{candidate}-{index}"
+
+
+def _add_id_to_text_element(xhtml_text: str, element: Dict[str, Any], new_id: str) -> str:
+    start_tag = element["start_tag"]
+    if _get_start_tag_attr(start_tag, "id") or _get_start_tag_attr(start_tag, "name"):
+        return xhtml_text
+
+    insert_at = element["start"] + len(start_tag) - 1
+    return (
+        xhtml_text[:insert_at]
+        + f' id="{html.escape(new_id, quote=True)}"'
+        + xhtml_text[insert_at:]
+    )
+
+
+def _iter_xhtml_text_elements(xhtml_text: str) -> list[Dict[str, Any]]:
+    elements = []
+    for match in XHTML_TEXT_ELEMENT_PATTERN.finditer(xhtml_text):
+        start_tag = match.group(1)
+        elements.append({
+            "start": match.start(),
+            "end": match.end(),
+            "start_tag": start_tag,
+            "tag": match.group("tag").lower(),
+            "text": _plain_text_from_html(match.group("body")),
+            "id": _get_start_tag_attr(start_tag, "id"),
+            "name": _get_start_tag_attr(start_tag, "name"),
+        })
+    return elements
+
+
+def _is_chapter_number_text(value: str) -> bool:
+    match = NUMBERED_TOC_LABEL_PATTERN.match(value.strip())
+    return bool(match and match.group(2) == "章" and value.strip() == match.group(1))
+
+
+def _move_part_block_before_previous_chapter_marker(
+    xhtml_text: str,
+    elements: list[Dict[str, Any]],
+    target_index: int,
+) -> str:
+    if target_index <= 0:
+        return xhtml_text
+
+    previous = elements[target_index - 1]
+    if not _is_chapter_number_text(previous["text"]):
+        return xhtml_text
+
+    block_start = elements[target_index]["start"]
+    block_end = elements[target_index]["end"]
+    for element in elements[target_index + 1:target_index + 4]:
+        if element["tag"] != "p" or element.get("id") or element.get("name"):
+            break
+        if NUMBERED_TOC_LABEL_PATTERN.match(element["text"]):
+            break
+        block_end = element["end"]
+
+    return (
+        xhtml_text[:previous["start"]]
+        + xhtml_text[block_start:block_end]
+        + xhtml_text[previous["start"]:block_start]
+        + xhtml_text[block_end:]
+    )
+
+
+def _resolve_opf_href(opf_name: str, href: str) -> str:
+    href = urllib.parse.unquote(html.unescape(href)).partition("#")[0]
+    return posixpath.normpath(
+        posixpath.join(posixpath.dirname(opf_name), href)
+    ).lstrip("/")
+
+
+def _epub_spine_xhtml_order(entries: Dict[str, bytes]) -> list[str]:
+    opf_name = next((name for name in entries if name.lower().endswith(".opf")), None)
+    if not opf_name:
+        return []
+
+    text = entries[opf_name].decode("utf-8", "ignore")
+    manifest: Dict[str, str] = {}
+    for match in re.finditer(r"(?is)<item\b[^>]*>", text):
+        item_tag = match.group(0)
+        item_id = _get_start_tag_attr(item_tag, "id")
+        href = _get_start_tag_attr(item_tag, "href")
+        media_type = (_get_start_tag_attr(item_tag, "media-type") or "").lower()
+        if not item_id or not href:
+            continue
+        resolved = _resolve_opf_href(opf_name, href)
+        if media_type == "application/xhtml+xml" or resolved.lower().endswith(
+            (".xhtml", ".html", ".htm")
+        ):
+            manifest[item_id] = resolved
+
+    spine = []
+    for match in re.finditer(r"(?is)<itemref\b[^>]*>", text):
+        idref = _get_start_tag_attr(match.group(0), "idref")
+        if idref and idref in manifest and manifest[idref] in entries:
+            spine.append(manifest[idref])
+    return spine
+
+
+def _normalize_heading_preview_text(value: str) -> str:
+    value = _normalize_numbered_marker(value)
+    value = value.replace("强", "強")
+    return re.sub(r"[^0-9A-Za-z\u3400-\u9fff]", "", value)
+
+
+def _has_numbered_toc_marker(elements: list[Dict[str, Any]]) -> bool:
+    return any(
+        NUMBERED_TOC_LABEL_PATTERN.match(element["text"].strip()) for element in elements
+    )
+
+
+def _only_closing_markup_after_last_element(xhtml_text: str, last_end: int) -> bool:
+    trailer = xhtml_text[last_end:]
+    trailer = re.sub(r"(?is)</?(?:body|html)\b[^>]*>", "", trailer)
+    return not trailer.strip()
+
+
+def _normalized_preview_marker_and_suffix(
+    elements: list[Dict[str, Any]],
+) -> tuple[str, str] | None:
+    if not elements:
+        return None
+    marker_info = _extract_numbered_toc_marker(elements[0]["text"])
+    if not marker_info:
+        return None
+
+    marker = _normalize_heading_preview_text(marker_info[0])
+    preview = _normalize_heading_preview_text(
+        "".join(element["text"] for element in elements)
+    )
+    if not marker or not preview.startswith(marker):
+        return None
+    return marker, preview[len(marker):]
+
+
+def _heading_preview_matches_next(
+    candidate_elements: list[Dict[str, Any]],
+    next_elements: list[Dict[str, Any]],
+) -> bool:
+    candidate = _normalize_heading_preview_text(
+        "".join(element["text"] for element in candidate_elements)
+    )
+    next_prefix = _normalize_heading_preview_text(
+        "".join(element["text"] for element in next_elements[:8])
+    )
+    if candidate and candidate in next_prefix:
+        return True
+
+    marker_and_suffix = _normalized_preview_marker_and_suffix(candidate_elements)
+    if not marker_and_suffix:
+        return False
+
+    marker, suffix = marker_and_suffix
+    if len(suffix) < 6:
+        return False
+
+    for index in range(min(4, len(next_elements))):
+        next_marker_and_suffix = _normalized_preview_marker_and_suffix(
+            next_elements[index:index + 8]
+        )
+        if not next_marker_and_suffix:
+            continue
+        next_marker, next_suffix = next_marker_and_suffix
+        if next_marker == marker and suffix in next_suffix:
+            return True
+    return False
+
+
+def _is_orphaned_part_preview(candidate_elements: list[Dict[str, Any]]) -> bool:
+    if len(candidate_elements) < 2 or len(candidate_elements) > 5:
+        return False
+
+    marker_info = _extract_numbered_toc_marker(candidate_elements[0]["text"])
+    if not marker_info or marker_info[1] not in PART_TOC_KINDS:
+        return False
+
+    preview_text = " ".join(element["text"] for element in candidate_elements)
+    preview_norm = _normalize_heading_preview_text(preview_text)
+    marker_norm = _normalize_heading_preview_text(marker_info[0])
+    if len(preview_norm) > 80 or len(preview_norm) <= len(marker_norm):
+        return False
+
+    return all(
+        len(_normalize_heading_preview_text(element["text"])) <= 40
+        for element in candidate_elements[1:]
+    )
+
+
+def _is_orphaned_chapter_marker_preview(candidate_elements: list[Dict[str, Any]]) -> bool:
+    if len(candidate_elements) != 1:
+        return False
+
+    text = candidate_elements[0]["text"].strip()
+    marker_info = _extract_numbered_toc_marker(text)
+    return bool(marker_info and marker_info[1] == "章" and text == marker_info[0])
+
+
+def _remove_trailing_next_heading_preview(prev_xhtml: str, next_xhtml: str) -> tuple[str, bool]:
+    prev_elements = _iter_xhtml_text_elements(prev_xhtml)
+    next_elements = _iter_xhtml_text_elements(next_xhtml)
+    if not prev_elements or not next_elements:
+        return prev_xhtml, False
+    if not _only_closing_markup_after_last_element(prev_xhtml, prev_elements[-1]["end"]):
+        return prev_xhtml, False
+
+    best_start_index = None
+    last_index = len(prev_elements) - 1
+    first_candidate_index = max(0, len(prev_elements) - 8)
+    for index in range(last_index, first_candidate_index - 1, -1):
+        candidate_elements = prev_elements[index:last_index + 1]
+        if not _has_numbered_toc_marker(candidate_elements):
+            continue
+
+        if _heading_preview_matches_next(
+            candidate_elements,
+            next_elements,
+        ) or _is_orphaned_part_preview(
+            candidate_elements
+        ) or _is_orphaned_chapter_marker_preview(candidate_elements):
+            best_start_index = index
+            continue
+        if best_start_index is not None:
+            break
+
+    if best_start_index is None:
+        return prev_xhtml, False
+
+    remove_start = prev_elements[best_start_index]["start"]
+    remove_end = prev_elements[last_index]["end"]
+    return prev_xhtml[:remove_start] + prev_xhtml[remove_end:], True
+
+
+def _remove_trailing_next_heading_previews(entries: Dict[str, bytes]) -> list[str]:
+    changed_files = []
+    spine = _epub_spine_xhtml_order(entries)
+    for prev_name, next_name in zip(spine, spine[1:]):
+        if prev_name not in entries or next_name not in entries:
+            continue
+        prev_xhtml = entries[prev_name].decode("utf-8", "ignore")
+        next_xhtml = entries[next_name].decode("utf-8", "ignore")
+        patched, changed = _remove_trailing_next_heading_preview(prev_xhtml, next_xhtml)
+        if changed:
+            entries[prev_name] = patched.encode("utf-8")
+            changed_files.append(prev_name)
+    return changed_files
+
+
+def _chapter_label_from_elements(elements: list[Dict[str, Any]]) -> str | None:
+    if not elements:
+        return None
+    marker_info = _extract_numbered_toc_marker(elements[0]["text"])
+    if not marker_info or marker_info[1] != "章":
+        return None
+
+    label_parts = [marker_info[0]]
+    for element in elements[1:3]:
+        text = element["text"].strip()
+        if not text or NUMBERED_TOC_LABEL_PATTERN.match(text):
+            break
+        label_parts.append(text)
+        break
+    return " ".join(label_parts)
+
+
+def _clean_known_garbled_heading_xhtml(xhtml_text: str) -> tuple[str, str | None]:
+    elements = _iter_xhtml_text_elements(xhtml_text)
+    if len(elements) < 2 or elements[0]["text"].strip() not in KNOWN_GARBLED_HEADINGS:
+        return xhtml_text, None
+
+    label = _chapter_label_from_elements(elements[1:])
+    if not label:
+        return xhtml_text, None
+
+    first = elements[0]
+    updated = xhtml_text[:first["start"]] + xhtml_text[first["end"]:]
+
+    def replace_title(match: re.Match) -> str:
+        if _plain_text_from_html(match.group(2)) not in KNOWN_GARBLED_HEADINGS:
+            return match.group(0)
+        return match.group(1) + html.escape(label) + match.group(3)
+
+    updated = re.sub(
+        r"(?is)(<title\b[^>]*>)(.*?)(</title>)",
+        replace_title,
+        updated,
+        count=1,
+    )
+    return updated, label
+
+
+def _label_for_epub_file(entries: Dict[str, bytes], filename: str) -> str | None:
+    if filename not in entries:
+        return None
+    elements = _iter_xhtml_text_elements(entries[filename].decode("utf-8", "ignore"))
+    return _chapter_label_from_elements(elements)
+
+
+def _clean_known_garbled_toc_labels(
+    entries: Dict[str, bytes],
+    file_labels: Dict[str, str],
+) -> list[str]:
+    changed_files = []
+    for name, data in list(entries.items()):
+        basename = os.path.basename(name.lower())
+        if basename not in {"nav.xhtml", "nav.html", "toc.ncx"}:
+            continue
+
+        text = data.decode("utf-8", "ignore")
+
+        def replacement_label(source_name: str, href: str, current_label: str) -> str | None:
+            if _plain_text_from_html(current_label) not in KNOWN_GARBLED_HEADINGS:
+                return None
+            target = _resolve_epub_file_href(source_name, href)
+            if not target:
+                resolved = _resolve_epub_fragment_href(source_name, href)
+                target = resolved[0] if resolved else None
+            if not target:
+                return None
+            return file_labels.get(target) or _label_for_epub_file(entries, target)
+
+        if basename in {"nav.xhtml", "nav.html"}:
+
+            def replace_nav_link(match: re.Match) -> str:
+                label = replacement_label(name, match.group(3), match.group(5))
+                if not label:
+                    return match.group(0)
+                return (
+                    match.group(1)
+                    + match.group(2)
+                    + match.group(3)
+                    + match.group(2)
+                    + match.group(4)
+                    + html.escape(label)
+                    + match.group(6)
+                )
+
+            patched = re.sub(
+                r"(?is)(<a\b[^>]*\bhref\s*=\s*)(['\"])(.*?)\2([^>]*>)(.*?)(</a>)",
+                replace_nav_link,
+                text,
+            )
+        else:
+
+            def replace_ncx_label(match: re.Match) -> str:
+                label = replacement_label(name, match.group(5), match.group(2))
+                if not label:
+                    return match.group(0)
+                return (
+                    match.group(1)
+                    + html.escape(label)
+                    + match.group(3)
+                    + match.group(4)
+                    + match.group(5)
+                    + match.group(4)
+                )
+
+            patched = re.sub(
+                r"(?is)(<navLabel>\s*<text[^>]*>)(.*?)(</text>\s*</navLabel>\s*"
+                r"<content\b[^>]*\bsrc\s*=\s*)(['\"])(.*?)\4",
+                replace_ncx_label,
+                text,
+            )
+
+        if patched != text:
+            entries[name] = patched.encode("utf-8")
+            changed_files.append(name)
+    return changed_files
+
+
+def _clean_known_garbled_headings(entries: Dict[str, bytes]) -> list[str]:
+    changed_files = []
+    file_labels: Dict[str, str] = {}
+    for name, data in list(entries.items()):
+        if not name.lower().endswith((".xhtml", ".html", ".htm")):
+            continue
+        if os.path.basename(name.lower()) in {"nav.xhtml", "nav.html"}:
+            continue
+
+        text = data.decode("utf-8", "ignore")
+        patched, label = _clean_known_garbled_heading_xhtml(text)
+        if label:
+            file_labels[name] = label
+        if patched != text:
+            entries[name] = patched.encode("utf-8")
+            changed_files.append(name)
+
+    changed_files.extend(_clean_known_garbled_toc_labels(entries, file_labels))
+    return changed_files
+
+
+def _remove_in_file_previous_chapter_bibliography_title(xhtml_text: str) -> tuple[str, bool]:
+    elements = _iter_xhtml_text_elements(xhtml_text)
+    remove_ranges = []
+    for index, element in enumerate(elements):
+        if not re.match(r"h[1-6]$", element["tag"]):
+            continue
+
+        marker_info = _extract_numbered_toc_marker(element["text"])
+        if not marker_info or marker_info[1] != "章":
+            continue
+        if element["text"].strip() == marker_info[0]:
+            continue
+
+        lookahead = elements[index + 1:index + 8]
+        if not any(_is_chapter_number_text(candidate["text"]) for candidate in lookahead):
+            continue
+
+        previous_markup = xhtml_text[max(0, element["start"] - 1200):element["start"]]
+        if "footnote" not in previous_markup and "OCR_FOOTNOTES_END" not in previous_markup:
+            continue
+        remove_ranges.append((element["start"], element["end"]))
+
+    if not remove_ranges:
+        return xhtml_text, False
+
+    updated = xhtml_text
+    for start, end in reversed(remove_ranges):
+        updated = updated[:start] + updated[end:]
+    return updated, True
+
+
+def _remove_in_file_previous_chapter_bibliography_titles(entries: Dict[str, bytes]) -> list[str]:
+    changed_files = []
+    for name, data in list(entries.items()):
+        if not name.lower().endswith((".xhtml", ".html", ".htm")):
+            continue
+        if os.path.basename(name.lower()) in {"nav.xhtml", "nav.html"}:
+            continue
+        text = data.decode("utf-8", "ignore")
+        patched, changed = _remove_in_file_previous_chapter_bibliography_title(text)
+        if changed:
+            entries[name] = patched.encode("utf-8")
+            changed_files.append(name)
+    return changed_files
+
+
+def _is_toc_like_content_file(filename: str) -> bool:
+    basename = os.path.basename(filename.lower())
+    if basename in {"nav.xhtml", "nav.html", "cover.xhtml"}:
+        return True
+    return bool(re.match(r"content_\d+\.xhtml$", basename))
+
+
+def _toc_marker_search_order(entries: Dict[str, bytes], preferred_file: str | None) -> list[str]:
+    ordered = []
+    if preferred_file and preferred_file in entries and not _is_toc_like_content_file(preferred_file):
+        ordered.append(preferred_file)
+    for filename in _epub_spine_xhtml_order(entries):
+        if filename not in entries or filename in ordered or _is_toc_like_content_file(filename):
+            continue
+        ordered.append(filename)
+    for filename in entries:
+        if filename in ordered or _is_toc_like_content_file(filename):
+            continue
+        if filename.lower().endswith((".xhtml", ".html", ".htm")):
+            ordered.append(filename)
+    return ordered
+
+
+def _find_numbered_toc_target(
+    entries: Dict[str, bytes],
+    preferred_file: str | None,
+    marker: str,
+    kind: str,
+    label_text: str,
+) -> tuple[str, str] | None:
+    marker_norm = _normalize_numbered_marker(marker)
+    title_hint = _normalize_heading_preview_text(label_text[len(marker):])
+    best: tuple[int, str, int, Dict[str, Any], str] | None = None
+
+    for filename in _toc_marker_search_order(entries, preferred_file):
+        xhtml_text = entries[filename].decode("utf-8", "ignore")
+        elements = _iter_xhtml_text_elements(xhtml_text)
+        for index, element in enumerate(elements):
+            text = element["text"].strip()
+            if kind == "章":
+                marker_matches = (
+                    _normalize_numbered_marker(text) == marker_norm
+                    or _normalize_numbered_marker(text).startswith(marker_norm)
+                )
+            else:
+                marker_matches = _normalize_numbered_marker(text).startswith(marker_norm)
+            if not marker_matches:
+                continue
+
+            context = _normalize_heading_preview_text(
+                "".join(candidate["text"] for candidate in elements[index:index + 3])
+            )
+            score = 0
+            if filename == preferred_file:
+                score += 2
+            if re.match(r"h[1-6]$", element["tag"]):
+                score += 2
+            if text == marker:
+                score += 2
+            if title_hint and title_hint in context:
+                score += 6
+            candidate = (score, filename, index, element, xhtml_text)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+
+    if best is None:
+        return None
+
+    _score, filename, _index, element, xhtml_text = best
+    fragment = element.get("id") or element.get("name")
+    if fragment:
+        return filename, fragment
+
+    new_id = _unique_fragment_id(xhtml_text, "toc-auto", "start")
+    entries[filename] = _add_id_to_text_element(xhtml_text, element, new_id).encode("utf-8")
+    return filename, new_id
+
+
+def _retarget_numbered_toc_fragment(
+    xhtml_text: str,
+    target_fragment: str,
+    marker: str,
+    kind: str,
+    label_text: str,
+) -> tuple[str, str]:
+    elements = _iter_xhtml_text_elements(xhtml_text)
+    target_index = next(
+        (
+            index
+            for index, element in enumerate(elements)
+            if target_fragment in {element.get("id"), element.get("name")}
+        ),
+        None,
+    )
+    if target_index is None:
+        return xhtml_text, target_fragment
+
+    target = elements[target_index]
+    if _normalize_numbered_marker(target["text"]).startswith(
+        _normalize_numbered_marker(marker)
+    ):
+        if kind in PART_TOC_KINDS:
+            return (
+                _move_part_block_before_previous_chapter_marker(
+                    xhtml_text,
+                    elements,
+                    target_index,
+                ),
+                target_fragment,
+            )
+        return xhtml_text, target_fragment
+
+    normalized_marker = _normalize_numbered_marker(marker)
+    for element in reversed(elements[max(0, target_index - 8):target_index]):
+        if _normalize_numbered_marker(element["text"]) != normalized_marker:
+            continue
+
+        existing_id = element.get("id") or element.get("name")
+        if existing_id:
+            return xhtml_text, existing_id
+
+        new_id = _unique_fragment_id(xhtml_text, target_fragment, "start")
+        return _add_id_to_text_element(xhtml_text, element, new_id), new_id
+
+    if kind in PART_TOC_KINDS:
+        new_id = _unique_fragment_id(xhtml_text, target_fragment, "part")
+        remainder = label_text[len(marker):].strip()
+        remainder = re.sub(r"^[\s:：,，、]+", "", remainder)
+        inserted = f'<p id="{new_id}">{html.escape(marker)}</p>'
+        if remainder:
+            inserted += f"<p>{html.escape(remainder)}</p>"
+        return xhtml_text[:target["start"]] + inserted + xhtml_text[target["start"]:], new_id
+
+    if kind != "章":
+        return xhtml_text, target_fragment
+
+    tag = target["tag"] if re.match(r"h[1-6]$", target["tag"]) else "h2"
+    new_id = _unique_fragment_id(xhtml_text, target_fragment, "chapter")
+    inserted = f'<{tag} id="{new_id}">{html.escape(marker)}</{tag}>'
+    return xhtml_text[:target["start"]] + inserted + xhtml_text[target["start"]:], new_id
+
+
+def _replace_fragment_in_href(href: str, fragment: str) -> str:
+    file_part = href.partition("#")[0]
+    escaped_fragment = urllib.parse.quote(fragment, safe="A-Za-z0-9_.:-")
+    return f"{file_part}#{escaped_fragment}"
+
+
+def _retarget_numbered_toc_hrefs(entries: Dict[str, bytes]) -> int:
+    changed_count = 0
+
+    def retarget_href(source_name: str, href: str, label: str) -> str:
+        nonlocal changed_count
+        label_text = _plain_text_from_html(label)
+        marker_info = _extract_numbered_toc_marker(label_text)
+        if not marker_info:
+            return href
+
+        marker, kind = marker_info
+        resolved = _resolve_epub_fragment_href(source_name, href)
+        if not resolved:
+            preferred_file = _resolve_epub_file_href(source_name, href)
+            found = _find_numbered_toc_target(
+                entries,
+                preferred_file,
+                marker,
+                kind,
+                label_text,
+            )
+            if not found:
+                return href
+            changed_count += 1
+            target_file, target_fragment = found
+            return _relative_epub_href(source_name, target_file, target_fragment)
+
+        target_file, target_fragment = resolved
+        if target_file not in entries:
+            return href
+
+        xhtml_text = entries[target_file].decode("utf-8", "ignore")
+        updated_text, updated_fragment = _retarget_numbered_toc_fragment(
+            xhtml_text,
+            target_fragment,
+            marker,
+            kind,
+            label_text,
+        )
+        content_changed = updated_text != xhtml_text
+        if updated_text != xhtml_text:
+            entries[target_file] = updated_text.encode("utf-8")
+        if updated_fragment == target_fragment:
+            if content_changed:
+                changed_count += 1
+            return href
+
+        changed_count += 1
+        return _replace_fragment_in_href(href, updated_fragment)
+
+    for name, data in list(entries.items()):
+        lower_name = name.lower()
+        basename = os.path.basename(lower_name)
+        if basename in {"nav.xhtml", "nav.html"}:
+            text = data.decode("utf-8", "ignore")
+
+            def replace_nav_link(match: re.Match) -> str:
+                href = match.group(3)
+                label = _plain_text_from_html(match.group(5))
+                new_href = retarget_href(name, href, label)
+                return (
+                    match.group(1)
+                    + match.group(2)
+                    + html.escape(new_href, quote=True)
+                    + match.group(2)
+                    + match.group(4)
+                    + match.group(5)
+                    + match.group(6)
+                )
+
+            patched = re.sub(
+                r"(?is)(<a\b[^>]*\bhref\s*=\s*)(['\"])(.*?)\2([^>]*>)(.*?)(</a>)",
+                replace_nav_link,
+                text,
+            )
+            if patched != text:
+                entries[name] = patched.encode("utf-8")
+        elif basename == "toc.ncx":
+            text = data.decode("utf-8", "ignore")
+
+            def replace_ncx_content(match: re.Match) -> str:
+                label = _plain_text_from_html(match.group(2))
+                href = match.group(5)
+                new_href = retarget_href(name, href, label)
+                return (
+                    match.group(1)
+                    + match.group(2)
+                    + match.group(3)
+                    + match.group(4)
+                    + html.escape(new_href, quote=True)
+                    + match.group(4)
+                )
+
+            patched = re.sub(
+                r"(?is)(<navLabel>\s*<text[^>]*>)(.*?)(</text>\s*</navLabel>\s*"
+                r"<content\b[^>]*\bsrc\s*=\s*)(['\"])(.*?)\4",
+                replace_ncx_content,
+                text,
+            )
+            if patched != text:
+                entries[name] = patched.encode("utf-8")
+
+    return changed_count
+
+
+def _add_class_to_start_tag(start_tag: str, class_name: str) -> str:
+    class_match = re.search(r"(?is)\bclass\s*=\s*(['\"])(.*?)\1", start_tag)
+    if not class_match:
+        return f'{start_tag} class="{class_name}"'
+
+    classes = class_match.group(2).split()
+    if class_name in classes:
+        return start_tag
+
+    classes.append(class_name)
+    return (
+        start_tag[:class_match.start(2)]
+        + " ".join(classes)
+        + start_tag[class_match.end(2):]
+    )
+
+
+def _mark_toc_targets_as_page_starts(xhtml_text: str, target_ids: set[str]) -> str:
+    """Add a page-start class to elements used as TOC fragment targets."""
+    updated = xhtml_text
+    for target_id in sorted(target_ids, key=len, reverse=True):
+        pattern = re.compile(
+            r"(<[A-Za-z][\w:.-]*\b"
+            r"(?=[^>]*\b(?:id|name)\s*=\s*['\"]"
+            + re.escape(target_id)
+            + r"['\"])"
+            r"[^>]*?)(\s*/?>)",
+            re.IGNORECASE | re.DOTALL,
+        )
+        updated = pattern.sub(
+            lambda match: _add_class_to_start_tag(match.group(1), TOC_PAGE_START_CLASS)
+            + match.group(2),
+            updated,
+            count=1,
+        )
+    return updated
+
+
+def _remove_toc_page_start_classes(xhtml_text: str) -> str:
+    def replace_class_attr(match: re.Match) -> str:
+        classes = [
+            class_name
+            for class_name in match.group(2).split()
+            if class_name != TOC_PAGE_START_CLASS
+        ]
+        if not classes:
+            return ""
+        return f' class={match.group(1)}{" ".join(classes)}{match.group(1)}'
+
+    return re.sub(
+        r"(?is)\s+class\s*=\s*(['\"])(.*?)\1",
+        replace_class_attr,
+        xhtml_text,
+    )
+
+
+def _append_toc_page_start_css(css_text: str) -> str:
+    if f".{TOC_PAGE_START_CLASS}" in css_text:
+        return css_text
+    return css_text.rstrip() + "\n\n" + TOC_PAGE_START_CSS.strip() + "\n"
+
+
+def ensure_toc_targets_start_pages(epub_path: str) -> Dict[str, Any]:
+    """Patch an EPUB so TOC fragment targets begin on a fresh reader page."""
+    epub_path = os.fspath(epub_path)
+    with zipfile.ZipFile(epub_path, "r") as archive:
+        original_entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
+
+    entry_map = {info.filename: data for info, data in original_entries}
+    preclean_files = []
+    preclean_files.extend(_clean_known_garbled_headings(entry_map))
+    preclean_files.extend(_remove_in_file_previous_chapter_bibliography_titles(entry_map))
+    retargeted_links = _retarget_numbered_toc_hrefs(entry_map)
+    toc_targets = _collect_toc_fragment_targets(entry_map)
+
+    changed = bool(preclean_files or retargeted_links)
+    xhtml_files = list(dict.fromkeys(preclean_files))
+    css_files = []
+    patched_entries = []
+    for info, _data in original_entries:
+        data = entry_map.get(info.filename, _data)
+        lower_name = info.filename.lower()
+        new_data = data
+
+        if toc_targets and lower_name.endswith((".xhtml", ".html", ".htm")):
+            text = data.decode("utf-8", "ignore")
+            text = _remove_toc_page_start_classes(text)
+            patched = text
+            if info.filename in toc_targets:
+                patched = _mark_toc_targets_as_page_starts(
+                    text,
+                    toc_targets[info.filename],
+                )
+            if patched.encode("utf-8") != data:
+                changed = True
+                xhtml_files.append(info.filename)
+                new_data = patched.encode("utf-8")
+
+        if toc_targets and lower_name.endswith(".css"):
+            text = new_data.decode("utf-8", "ignore")
+            patched = _append_toc_page_start_css(text)
+            if patched != text:
+                changed = True
+                css_files.append(info.filename)
+                new_data = patched.encode("utf-8")
+
+        patched_entries.append((info, new_data))
+
+    patched_entry_map = {info.filename: data for info, data in patched_entries}
+    preview_files = _remove_trailing_next_heading_previews(patched_entry_map)
+    if preview_files:
+        changed = True
+        for filename in preview_files:
+            if filename not in xhtml_files:
+                xhtml_files.append(filename)
+        patched_entries = [
+            (info, patched_entry_map.get(info.filename, data)) for info, data in patched_entries
+        ]
+
+    if not changed:
+        return {
+            "targets": sum(len(ids) for ids in toc_targets.values()),
+            "retargeted_links": retargeted_links,
+            "xhtml_files": xhtml_files,
+            "css_files": css_files,
+        }
+
+    output_dir = os.path.dirname(os.path.abspath(epub_path))
+    output_name = os.path.basename(epub_path)
+    fd, temp_output = tempfile.mkstemp(
+        prefix=f".{output_name}.",
+        suffix=".epub",
+        dir=output_dir,
+    )
+    os.close(fd)
+
+    try:
+        with zipfile.ZipFile(temp_output, "w") as archive:
+            mimetype_entries = [
+                (info, data) for info, data in patched_entries if info.filename == "mimetype"
+            ]
+            other_entries = [
+                (info, data) for info, data in patched_entries if info.filename != "mimetype"
+            ]
+            for info, data in mimetype_entries + other_entries:
+                if info.filename == "mimetype":
+                    info.compress_type = zipfile.ZIP_STORED
+                archive.writestr(info, data)
+        os.replace(temp_output, epub_path)
+    except Exception:
+        try:
+            os.remove(temp_output)
+        except FileNotFoundError:
+            pass
+        raise
+
+    return {
+        "targets": sum(len(ids) for ids in toc_targets.values()),
+        "retargeted_links": retargeted_links,
+        "xhtml_files": xhtml_files,
+        "css_files": css_files,
+    }
+
+
+def is_numeric_only_ocr_table(table_html: str) -> bool:
+    """Detect blank-page OCR tables made only from repeated year-like numbers."""
+    row_count = len(re.findall(r"(?i)<tr\b", table_html))
+    if row_count < 12:
+        return False
+
+    text = html.unescape(re.sub(r"(?is)<[^>]+>", " ", table_html))
+    numbers = [int(value) for value in re.findall(r"\d+", text)]
+    if len(numbers) < 30:
+        return False
+
+    non_numeric = re.sub(r"[\d\s.,;:|+\-–—/\\年月]+", "", text)
+    if non_numeric.strip():
+        return False
+
+    year_like = [value for value in numbers if 1900 <= value <= 2200]
+    if len(year_like) / len(numbers) < 0.8:
+        return False
+
+    return len(set(year_like)) >= 12 and (max(year_like) - min(year_like)) >= 12
+
+
+def is_dotted_numeric_ocr_table(table_html: str) -> bool:
+    """Detect blank-page OCR tables made from repeated outline-like numbers."""
+    cell_count = len(re.findall(r"(?i)<t[dh]\b", table_html))
+    if cell_count < 16:
+        return False
+
+    text = html.unescape(re.sub(r"(?is)<[^>]+>", " ", table_html))
+    dotted_tokens = DOTTED_NUMERIC_TOKEN_PATTERN.findall(text)
+    if len(dotted_tokens) < 16:
+        return False
+    if len(dotted_tokens) / cell_count < 0.75:
+        return False
+
+    prefixes: Dict[str, int] = {}
+    tails = []
+    for token in dotted_tokens:
+        prefix, tail = token.rsplit(".", 1)
+        prefixes[prefix] = prefixes.get(prefix, 0) + 1
+        tails.append(int(tail))
+
+    if max(prefixes.values()) / len(dotted_tokens) < 0.8:
+        return False
+    if len(set(tails)) < 12 or (max(tails) - min(tails)) < 12:
+        return False
+
+    residue = DOTTED_NUMERIC_TOKEN_PATTERN.sub(" ", text)
+    residue = re.sub(r"[\d\s.,;:|+\-–—/\\年月·•、。．]+", "", residue)
+    return len(residue.strip()) <= 12
+
+
+def is_ocr_noise_table(table_html: str) -> bool:
+    """Detect OCR table artifacts that should not be carried into EPUB output."""
+    return (
+        is_numeric_only_ocr_table(table_html)
+        or is_dotted_numeric_ocr_table(table_html)
+    )
+
+
+def remove_numeric_only_ocr_tables(markdown_text: str) -> str:
+    """Strip numeric-like HTML tables commonly hallucinated from blank pages."""
+    return HTML_TABLE_PATTERN.sub(
+        lambda match: "" if is_ocr_noise_table(match.group(0)) else match.group(0),
+        markdown_text,
+    )
+
+
+def clean_ocr_noise(markdown_text: str) -> str:
+    """Remove common PaddleOCR layout artifacts while preserving prose."""
+    if not markdown_text:
+        return ""
+
+    cleaned = markdown_text.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = remove_numeric_only_ocr_tables(cleaned)
+
+    # False inline math around emphasized Chinese characters.
+    cleaned = re.sub(
+        r"\$\s*\\underset\{\\cdot\}\{([^{}]+)\}\s*\$",
+        r"\1",
+        cleaned,
+    )
+    # Known OCR split: 2017 rendered as 20 $ \frac{1}{2} $7.
+    cleaned = re.sub(
+        r"20\s*\$\s*\\frac\{1\}\{2\}\s*\$\s*7年",
+        "2017年",
+        cleaned,
+    )
+    # False arrow used as a list separator in CJK prose.
+    cleaned = DOWNARROW_PROSE_SEPARATOR_PATTERN.sub(r"\1、\2", cleaned)
+
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def extract_page_footnotes(page_res: Dict[str, Any]) -> List[str]:
+    """Extract OCR footnote blocks omitted from Paddle's markdown text."""
+    footnotes: List[str] = []
+    blocks = page_res.get("prunedResult", {}).get("parsing_res_list", [])
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("block_label") not in FOOTNOTE_LABELS:
+            continue
+        content = str(block.get("block_content") or "").strip()
+        if not content:
+            continue
+        cleaned = clean_ocr_noise(content)
+        if cleaned:
+            footnotes.append(cleaned)
+    return _infer_missing_footnote_markers(page_res, footnotes)
+
+
+def _infer_missing_footnote_markers(
+    page_res: Dict[str, Any],
+    footnotes: List[str],
+) -> List[str]:
+    inline_numbers = [
+        match.group(1)
+        for match in INLINE_FOOTNOTE_MARKER_PATTERN.finditer(
+            page_res.get("markdown", {}).get("text", "")
+        )
+    ]
+    if not inline_numbers:
+        return footnotes
+
+    explicit_counts: Dict[str, int] = {}
+    parsed_numbers: List[str | None] = []
+    for footnote in footnotes:
+        number, _body = _split_footnote_marker(footnote)
+        parsed_numbers.append(number)
+        if number is not None:
+            explicit_counts[number] = explicit_counts.get(number, 0) + 1
+
+    available_numbers: List[str] = []
+    seen_counts: Dict[str, int] = {}
+    for number in inline_numbers:
+        seen_counts[number] = seen_counts.get(number, 0) + 1
+        if seen_counts[number] > explicit_counts.get(number, 0):
+            available_numbers.append(number)
+
+    if not available_numbers:
+        return footnotes
+
+    inferred: List[str] = []
+    available_index = 0
+    for footnote, number in zip(footnotes, parsed_numbers):
+        if number is None and available_index < len(available_numbers):
+            inferred.append(f"$ ^{{{available_numbers[available_index]}}} $ {footnote}")
+            available_index += 1
+        else:
+            inferred.append(footnote)
+    return inferred
+
+
+def _split_footnote_marker(footnote: str) -> tuple[str | None, str]:
+    marker_match = FOOTNOTE_MARKER_PATTERN.match(footnote)
+    if marker_match:
+        return marker_match.group(1), marker_match.group(2).strip()
+    return None, footnote
+
+
+def _footnote_anchor_id(prefix: str, page_number: int, number: str, occurrence: int) -> str:
+    suffix = f"-{occurrence}" if occurrence > 1 else ""
+    return f"{prefix}-p{page_number}-{number}{suffix}"
+
+
+def _build_page_footnote_refs(
+    footnotes: List[str],
+    page_number: int,
+) -> List[Dict[str, Any]]:
+    refs: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    for footnote in footnotes:
+        number, _body = _split_footnote_marker(footnote)
+        if number is None:
+            refs.append({})
+            continue
+        occurrence = counts.get(number, 0) + 1
+        counts[number] = occurrence
+        refs.append(
+            {
+                "number": number,
+                "note_id": _footnote_anchor_id("fn", page_number, number, occurrence),
+                "ref_id": _footnote_anchor_id("fnref", page_number, number, occurrence),
+                "linked": False,
+            }
+        )
+    return refs
+
+
+def link_page_footnote_references(
+    markdown_text: str,
+    footnotes: List[str],
+    page_number: int,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Turn inline OCR footnote markers into EPUB noteref links when possible."""
+    refs = _build_page_footnote_refs(footnotes, page_number)
+    refs_by_number: Dict[str, List[Dict[str, Any]]] = {}
+    for ref in refs:
+        number = ref.get("number")
+        if number:
+            refs_by_number.setdefault(str(number), []).append(ref)
+
+    used_by_number: Dict[str, int] = {}
+
+    def replace_marker(match: re.Match[str]) -> str:
+        number = match.group(1)
+        used = used_by_number.get(number, 0)
+        numbered_refs = refs_by_number.get(number, [])
+        if used < len(numbered_refs):
+            ref = numbered_refs[used]
+            used_by_number[number] = used + 1
+            ref["linked"] = True
+            return (
+                f'<sup id="{html.escape(ref["ref_id"])}" class="footnote-ref">'
+                f'<a epub:type="noteref" href="#{html.escape(ref["note_id"])}">'
+                f"{html.escape(number)}</a></sup>"
+            )
+        return (
+            '<sup class="unlinked-footnote-marker">'
+            + html.escape(number)
+            + "</sup>"
+        )
+
+    return INLINE_FOOTNOTE_MARKER_PATTERN.sub(replace_marker, markdown_text), refs
+
+
+def _format_single_footnote_html(
+    footnote: str,
+    footnote_ref: Dict[str, Any] | None = None,
+) -> str:
+    number, body = _split_footnote_marker(footnote)
+    linked = bool(footnote_ref and footnote_ref.get("linked"))
+    attrs = ""
+    backlink = ""
+    if linked:
+        attrs = f' id="{html.escape(str(footnote_ref["note_id"]))}"'
+        backlink = (
+            f' <a class="footnote-backlink" epub:type="backlink" '
+            f'href="#{html.escape(str(footnote_ref["ref_id"]))}">&#8617;</a>'
+        )
+    if number is not None:
+        return (
+            f'<p{attrs} class="footnote"><sup>'
+            + html.escape(number)
+            + "</sup> "
+            + html.escape(body)
+            + backlink
+            + "</p>"
+        )
+    return f'<p{attrs} class="footnote">' + html.escape(footnote) + backlink + "</p>"
+
+
+def format_page_footnotes_html(
+    footnotes: List[str],
+    page_number: int,
+    footnote_refs: List[Dict[str, Any]] | None = None,
+) -> str:
+    """Render page footnotes as EPUB-friendly HTML appended near their source page."""
+    if not footnotes:
+        return ""
+    if footnote_refs is None:
+        footnote_refs = [{} for _footnote in footnotes]
+    items = "\n".join(
+        _format_single_footnote_html(
+            footnote,
+            footnote_refs[index] if index < len(footnote_refs) else {},
+        )
+        for index, footnote in enumerate(footnotes)
+    )
+    return (
+        f'<section class="page-footnotes" epub:type="footnotes" '
+        f'data-source-page="{page_number}">\n'
+        f"{items}\n"
+        "</section>"
+    )
+
+
+def scan_epub_for_ocr_noise(epub_path: str) -> List[Dict[str, Any]]:
+    """Return suspicious OCR LaTeX artifacts found in EPUB text files."""
+    findings: List[Dict[str, Any]] = []
+    with zipfile.ZipFile(epub_path) as archive:
+        for name in archive.namelist():
+            lower_name = name.lower()
+            if os.path.basename(lower_name) in EPUB_STRUCTURAL_FILES:
+                continue
+            if not lower_name.endswith((".xhtml", ".html")):
+                continue
+            text = archive.read(name).decode("utf-8", "ignore")
+            for token, pattern in OCR_NOISE_PATTERNS:
+                count = len(pattern.findall(text))
+                if count:
+                    findings.append({"file": name, "token": token, "count": count})
+            numeric_table_count = sum(
+                1
+                for match in HTML_TABLE_PATTERN.finditer(text)
+                if is_numeric_only_ocr_table(match.group(0))
+            )
+            if numeric_table_count:
+                findings.append({
+                    "file": name,
+                    "token": "numeric-only OCR table",
+                    "count": numeric_table_count,
+                })
+            dotted_table_count = sum(
+                1
+                for match in HTML_TABLE_PATTERN.finditer(text)
+                if (
+                    not is_numeric_only_ocr_table(match.group(0))
+                    and is_dotted_numeric_ocr_table(match.group(0))
+                )
+            )
+            if dotted_table_count:
+                findings.append({
+                    "file": name,
+                    "token": "dotted numeric OCR table",
+                    "count": dotted_table_count,
+                })
+    return findings
+
+
+def validate_epub_no_ocr_noise(epub_path: str, strict: bool = False) -> List[Dict[str, Any]]:
+    """Report suspicious OCR artifacts found in the EPUB, optionally failing."""
+    findings = scan_epub_for_ocr_noise(epub_path)
+    if not findings:
+        return []
+
+    examples = ", ".join(
+        f"{item['file']}:{item['token']} x{item['count']}"
+        for item in findings[:8]
+    )
+    truncated = ""
+    if len(findings) > 8:
+        truncated = f" (showing 8 of {len(findings)})"
+    message = (
+        "OCR noise tokens remain in generated EPUB. "
+        f"Inspect and clean these artifacts before using the file: {examples}{truncated}"
+    )
+    if strict:
+        raise RuntimeError(message)
+    print(f"[!] {message}")
+    return findings
+
+
+def write_validated_epub(
+    book: Any,
+    output_file: str,
+    strict_ocr_validation: bool = False,
+) -> None:
+    """Write EPUB to a same-directory temp file and publish only after validation."""
+    output_dir = os.path.dirname(os.path.abspath(output_file))
+    output_name = os.path.basename(output_file)
+    fd, temp_output = tempfile.mkstemp(
+        prefix=f".{output_name}.",
+        suffix=".epub",
+        dir=output_dir,
+    )
+    os.close(fd)
+
+    try:
+        epub.write_epub(temp_output, book, {})
+        if zipfile.is_zipfile(temp_output):
+            ensure_toc_targets_start_pages(temp_output)
+        validate_epub_no_ocr_noise(temp_output, strict=strict_ocr_validation)
+        os.replace(temp_output, output_file)
+    except Exception:
+        try:
+            os.remove(temp_output)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def check_dependencies():
+    """Checks if required libraries are installed."""
+    missing = []
+    try:
+        import requests
+    except ImportError:
+        missing.append("requests")
+    try:
+        import fitz
+    except ImportError:
+        missing.append("pymupdf")
+    try:
+        import ebooklib
+    except ImportError:
+        missing.append("EbookLib")
+
+    if missing:
+        print(f"[!] Missing dependencies: {', '.join(missing)}")
+        print(f"    Please run: pip install {' '.join(missing)}")
+        return False
+    return True
+
+
+def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
+    """
+    Splits a PDF into chunks of `chunk_size` pages.
+    Returns a list of paths to the temporary chunk files.
+    """
+    doc = fitz.open(file_path)
+    total_pages = len(doc)
+    print(f"[*] Total pages: {total_pages}")
+
+    if total_pages > MAX_DAILY_PAGES:
+        print(
+            f"[!] WARNING: This document ({total_pages} pages) exceeds the daily API limit of {MAX_DAILY_PAGES} pages."
+        )
+        print("    Processing may fail or get blocked if you exceed your quota.")
+
+    chunk_paths = []
+    temp_dir = tempfile.mkdtemp(prefix="pdf_chunks_")
+
+    for start_page in range(0, total_pages, chunk_size):
+        end_page = min(start_page + chunk_size, total_pages)
+        # Create a new PDF for this chunk
+        chunk_doc = fitz.open()
+        chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
+
+        chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
+        chunk_doc.save(chunk_filename)
+        chunk_doc.close()
+        chunk_paths.append(chunk_filename)
+
+    doc.close()
+    return chunk_paths
+
+
+def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
+    """
+    Sends a PDF chunk to the PaddleOCR API and returns the parsed result.
+    """
+    print(f"[*] uploading chunk: {os.path.basename(chunk_path)}")
+
+    with open(chunk_path, "rb") as file:
+        file_bytes = file.read()
+        file_data = base64.b64encode(file_bytes).decode("ascii")
+
+    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+
+    payload = {
+        "file": file_data,
+        "fileType": 0,  # 0 for PDF
+        "useDocOrientationClassify": False,
+        "useDocUnwarping": False,
+        "useChartRecognition": False,  # Basic extraction
+    }
+
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                API_URL, json=payload, headers=headers, timeout=API_TIMEOUT_SECONDS
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            # Handle API responses safely
+            # The API seems to return 'result' directly in some cases, or an 'error' field
+            if "error" in result:
+                print(
+                    f"[!] API Error for chunk {os.path.basename(chunk_path)}: {result['error']}"
+                )
+                return None
+
+            # If 'responses' is missing but 'result' is present, adapt the result
+            if "responses" not in result and "result" in result:
+                # Wrap the result to maintain compatibility with the rest of the script
+                # if possible, or just return the result directly if it's already the expected object.
+                pass
+
+            return process_layout_results(result, chunk_path)
+
+        except (requests.exceptions.RequestException, ConnectionError) as e:
+            wait_time = (
+                2**attempt
+            ) * 5  # Exponential backoff: 5, 10, 20, 40, 80 seconds
+            print(f"[!] API Request failed (attempt {attempt + 1}/{max_retries}): {e}")
+            if attempt < max_retries - 1:
+                print(f"    Retrying in {wait_time}s...")
+                import time
+
+                time.sleep(wait_time)
+            else:
+                print(
+                    f"[!] Permanently failed processing chunk: {os.path.basename(chunk_path)}"
+                )
+                return None
+        except Exception as e:
+            print(
+                f"[!] Unexpected error processing chunk {os.path.basename(chunk_path)}: {e}"
+            )
+            return None
+
+
+def process_layout_results(result, chunk_path):
+    """Helper to return the result if the original function is missing."""
+    return result
+
+
+def extract_cover_image(
+    pdf_path: str,
+    output_path: str,
+    max_edge: int = DEFAULT_COVER_MAX_EDGE,
+    jpg_quality: int = DEFAULT_COVER_JPEG_QUALITY,
+) -> str | None:
+    """Renders the first PDF page as a bounded JPEG image for use as an EPUB cover."""
+    doc = fitz.open(pdf_path)
+    try:
+        if len(doc) == 0:
+            print("[!] PDF has no pages; skipping cover extraction.")
+            return None
+        page = doc.load_page(0)
+        if max_edge <= 0:
+            zoom = 2.0
+        else:
+            zoom = min(2.0, max_edge / max(page.rect.width, page.rect.height))
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        pix.save(output_path, jpg_quality=max(1, min(jpg_quality, 100)))
+        print(f"[*] Cover image extracted to {output_path}")
+        return output_path
+    except Exception as e:
+        print(f"[!] Failed to extract cover image: {e}")
+        return None
+    finally:
+        doc.close()
+
+
+def extract_metadata_interactive(results: List[Dict], default_title: str) -> Dict[str, str | None]:
+    """Shows the first page OCR text and prompts the user for title and author."""
+    first_page_text = ""
+    try:
+        first_page_text = results[0]["result"]["layoutParsingResults"][0]["markdown"]["text"]
+    except (IndexError, KeyError, TypeError):
+        pass
+
+    if first_page_text:
+        print("\n--- First page OCR text ---")
+        print(first_page_text.strip())
+        print("----------------------------\n")
+    else:
+        print("\n[!] Could not extract text from the first page.\n")
+
+    title = input(f"Enter book title (or press Enter to use '{default_title}'): ").strip()
+    if not title:
+        title = default_title
+
+    author = input("Enter author name (or press Enter to skip): ").strip()
+
+    return {"title": title, "author": author if author else None}
+
+
+def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
+    """Scans API results and extracts candidate chapter headings with page numbers."""
+    candidates = []
+    any_header_pattern = re.compile(r"^(#{1,2})\s+(.+)$")
+    latex_pattern = re.compile(r"\$\s*\\underline\{(.+?)\}\s*\$")
+    global_page = 0
+
+    for result in results:
+        if not result or "result" not in result:
+            continue
+        for page_res in result["result"].get("layoutParsingResults", []):
+            global_page += 1
+            page_md = clean_ocr_noise(page_res["markdown"]["text"])
+            for line in page_md.split("\n"):
+                if line.strip().isdigit():
+                    continue
+                match = any_header_pattern.match(line)
+                if match:
+                    title = match.group(2).strip()
+                    # Clean LaTeX artifacts (e.g. "$ \underline{3} $ Title" -> "Title")
+                    title = latex_pattern.sub("", title).strip()
+                    # Strip leading bare numbers left after LaTeX cleanup (e.g. "3 What Is..." -> "What Is...")
+                    title = re.sub(r"^\d+\s+", "", title).strip()
+                    candidates.append({
+                        "title": title,
+                        "page": global_page,
+                        "level": len(match.group(1)),
+                        "md_line": line,
+                    })
+    return candidates
+
+
+def filter_heading_candidates(candidates: List[Dict]) -> List[Dict]:
+    """Adaptively filters headings by trying H1-only, then keyword match, then all."""
+    chapter_keyword = re.compile(
+        r"^(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|"
+        r"Conclusion|Acknowledgements|Contents|Abstract|序|前言|导论|目录|附录|后记|"
+        r"第[零一二三四五六七八九十百千0-9]+[篇章节讲])",
+        re.IGNORECASE,
+    )
+
+    # Strategy 1: H1-only (skip front-matter on first 2 pages)
+    h1 = [h for h in candidates if h["level"] == 1 and h["page"] > 2]
+    if len(h1) >= 4:
+        return h1
+
+    # Strategy 2: Keyword-matched headings (any level)
+    keyword_matches = [h for h in candidates if chapter_keyword.match(h["title"])]
+    if len(keyword_matches) >= 3:
+        return keyword_matches
+
+    # Strategy 3: All headings (last resort)
+    return candidates
+
+
+def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = None) -> List[Dict]:
+    """Interactive prompt for reviewing and editing the auto-detected TOC."""
+    if not candidates:
+        print("\n[!] No chapter headings detected. The book will be a single chapter.")
+        return []
+
+    def _print_heading_list(headings):
+        print(f"  {'#':>3}  | {'Pg':>4} | Heading")
+        print(f"  {'---':>3}--+------+{'-' * 40}")
+        for i, h in enumerate(headings):
+            indent = "  " if h["level"] == 1 else "    "
+            print(f"  {i+1:>3}  | {h['page']:>4} | {indent}{h['title']}")
+
+    def _show_options():
+        print()
+        print("Options:")
+        print("  [Enter]    Accept all headings as chapter split points")
+        print("  1,3,5      Remove headings by number (comma-separated)")
+        print("  +1,3,5     Keep ONLY these headings (comma-separated)")
+        if all_candidates and len(all_candidates) > len(candidates):
+            print(f"  all        Show all {len(all_candidates)} headings (including sub-sections)")
+        print("  none       No chapters (entire book as single chapter)")
+        print()
+
+    print("\n--- Detected Chapter Headings ---")
+    _print_heading_list(candidates)
+    _show_options()
+
+    while True:
+        choice = input("Your choice: ").strip()
+
+        if choice == "":
+            return list(candidates)
+        elif choice.lower() == "none":
+            return []
+        elif choice.lower() == "all" and all_candidates and len(all_candidates) > len(candidates):
+            candidates = all_candidates
+            all_candidates = None
+            print(f"\n--- All Headings ({len(candidates)}) ---")
+            _print_heading_list(candidates)
+            _show_options()
+            continue
+        else:
+            try:
+                # Detect keep mode (+) vs remove mode (default)
+                keep_mode = choice.startswith("+")
+                if keep_mode:
+                    choice = choice[1:]  # strip the +
+
+                nums = set()
+                valid = True
+                for part in choice.split(","):
+                    part = part.strip().lstrip("-")  # allow optional - prefix
+                    num = int(part)
+                    if 1 <= num <= len(candidates):
+                        nums.add(num)
+                    else:
+                        print(f"  [!] Invalid number: {num} (must be 1-{len(candidates)})")
+                        valid = False
+                        break
+
+                if not valid:
+                    continue
+
+                if keep_mode:
+                    confirmed = [h for i, h in enumerate(candidates) if (i + 1) in nums]
+                else:
+                    confirmed = [h for i, h in enumerate(candidates) if (i + 1) not in nums]
+
+                if confirmed:
+                    print(f"\nUpdated TOC ({len(confirmed)} chapters):")
+                    _print_heading_list(confirmed)
+                else:
+                    print("\n  All headings removed. Book will be a single chapter.")
+
+                confirm = input("\nConfirm? [Y/n]: ").strip().lower()
+                if confirm in ("", "y", "yes"):
+                    return confirmed
+                else:
+                    print("\n--- Detected Chapter Headings ---")
+                    _print_heading_list(candidates)
+                    _show_options()
+                    continue
+
+            except ValueError:
+                print("  [!] Invalid input. Use numbers like '1,3,5' or '+1,3,5' for keep mode.")
+                continue
+
+
+def download_image(url: str, save_path: str):
+    """Downloads an image from a URL to a local path."""
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 200:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, "wb") as f:
+                f.write(response.content)
+            return True
+    except Exception as e:
+        print(f"[!] Failed to download image {url}: {e}")
+    return False
+
+
+def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
+                cover_image_path: str | None = None, author: str | None = None,
+                confirmed_headings: List[Dict] | None = None,
+                language: str = DEFAULT_EPUB_LANGUAGE,
+                strict_ocr_validation: bool = False):
+    """
+    Creates an EPUB file from the aggregated API results.
+    """
+    book = epub.EpubBook()
+    book.set_identifier(f"id_{title}")
+    book.set_title(title)
+    book.set_language(language)
+
+    if author:
+        book.add_author(author)
+
+    # Set cover image
+    if cover_image_path and os.path.exists(cover_image_path):
+        with open(cover_image_path, "rb") as f:
+            cover_data = f.read()
+        book.set_cover(os.path.basename(cover_image_path), cover_data)
+
+    chapters = []
+
+    # CSS for the book
+    style = """
+    body { font-family: serif; line-height: 1.8; text-align: justify; margin: 1em; }
+    h1 { text-align: center; margin: 1.5em 0 0.8em 0; font-size: 1.6em; }
+    h2 { margin: 1.2em 0 0.6em 0; font-size: 1.3em; }
+    h3 { margin: 1em 0 0.5em 0; font-size: 1.1em; }
+    p { margin-bottom: 0.8em; }
+    blockquote { margin: 1em 2em; font-style: italic; }
+    img { max-width: 100%; height: auto; display: block; margin: 1em auto; }
+    .page-footnotes {
+        margin-top: 1.2em;
+        padding-top: 0.6em;
+        border-top: 1px solid #999;
+        font-size: 0.85em;
+        line-height: 1.5;
+    }
+    .page-footnotes p { margin: 0.35em 0; text-align: left; }
+    .page-footnotes sup { font-size: 0.8em; vertical-align: super; }
+    .footnote-ref a { text-decoration: none; }
+    .unlinked-footnote-marker { font-size: 0.8em; vertical-align: super; }
+    .footnote-backlink { margin-left: 0.4em; text-decoration: none; }
+    """
+    nav_css = epub.EpubItem(
+        uid="style_nav", file_name="style/nav.css", media_type="text/css", content=style
+    )
+    book.add_item(nav_css)
+
+    # Process each chunk's result
+    # The API returns 'result' -> 'layoutParsingResults' (list)
+    # Each item in layoutParsingResults corresponds to a page (usually)
+
+    # Combine all pages into chapters if they have headings, or just page-by-page?
+    # Better to just append text. If we see a H1/H2, we can make a split potentially,
+    # but for simplicity, let's dump pages into one big flow or chapter-per-chunk?
+    # 50 pages per chapter is too much.
+    # Let's try to detect headers in the markdown to split chapters.
+
+    full_markdown = ""
+
+    # Aggregated images to add to the book
+    # Map API image path (e.g. 'images/tmp.jpg') to internal EPUB path
+
+    global_page = 0  # tracks the same counter used by extract_candidate_headings
+
+    for chunk_idx, result in enumerate(results):
+        if not result or "result" not in result:
+            continue
+
+        layout_results = result["result"].get("layoutParsingResults", [])
+
+        for i, page_res in enumerate(layout_results):
+            global_page += 1
+            # 1. Get Markdown Text
+            page_md = clean_ocr_noise(page_res["markdown"]["text"])
+
+            # 2. Handle Images
+            # page_res["markdown"]["images"] is { relative_path: url }
+            # The markdown text uses relative_path: ![](images/xxx.jpg)
+            images_map = page_res["markdown"].get("images", {})
+
+            # Track which image paths were successfully packaged so we can
+            # strip dangling ![...](...) references from the markdown later.
+            missing_image_paths: set[str] = set()
+
+            for rel_path, img_url in images_map.items():
+                # Define local path where we downloaded the image
+                local_img_path = os.path.join(image_dir, rel_path)
+
+                # Check if we successfully downloaded it
+                if os.path.exists(local_img_path):
+                    # Add to EPUB
+                    # Read image data
+                    with open(local_img_path, "rb") as img_f:
+                        img_data = img_f.read()
+
+                    # Create EPUB Image Item
+                    # Use the same relative path as filename to match markdown links
+                    # (assuming markdown is ![](images/xxx))
+                    epub_img = epub.EpubImage()
+                    epub_img.file_name = rel_path
+                    ext = os.path.splitext(rel_path)[1].lower()
+                    _MIME_MAP = {
+                        ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg",
+                        ".png": "image/png",
+                        ".gif": "image/gif",
+                        ".webp": "image/webp",
+                        ".svg": "image/svg+xml",
+                    }
+                    epub_img.media_type = _MIME_MAP.get(ext, "image/jpeg")
+                    epub_img.content = img_data
+
+                    if rel_path not in [item.file_name for item in book.get_items()]:
+                        book.add_item(epub_img)
+                else:
+                    # Download failed or not yet attempted — record so the markdown
+                    # reference can be stripped to avoid broken <img> in the EPUB.
+                    missing_image_paths.add(rel_path)
+                    print(f"    [!] Image not available, removing from markdown: {rel_path}")
+
+            # 3. Concatenate Text with paragraph reflow
+            # Strip markdown image links whose assets were not packaged, so the
+            # generated HTML does not contain broken <img src="images/..."> references.
+            if missing_image_paths:
+                for _missing in missing_image_paths:
+                    page_md = re.sub(
+                        r"!\[[^\]]*\]\(" + re.escape(_missing) + r"\)",
+                        "",
+                        page_md,
+                    )
+
+            # Reflow lines into continuous paragraphs to fix sentence splitting issues
+            # Pages often break sentences mid-flow, and OCR can split paragraphs
+            # into separate lines that should be joined.
+
+            lines = page_md.split("\n")
+            cleaned_lines = []
+            for line in lines:
+                # Basic Page Number Removal (digit only)
+                if line.strip().isdigit():
+                    continue
+                cleaned_lines.append(line)
+
+            # Reflow: join lines that appear to be part of the same paragraph
+            reflowed_paragraphs = []
+            current_para = ""
+
+            # Terminal punctuation that indicates end of sentence/paragraph
+            # Includes CJK full-width equivalents for Chinese/Japanese OCR.
+            terminal_chars = ('.', '!', '?', '"', "'", ')', ']', '}', ':', ';',
+                              '。', '！', '？', '：', '；', '」', '』', '）', '】', '〉', '》')
+            # Patterns that indicate a line is a header or special block
+            header_pattern = re.compile(r'^(#{1,6}\s|>|\s*[-*]\s|\d+\.)')
+            # Characters that indicate a line should not be joined with next
+            non_join_endings = (':', ';', ',', '-', '：', '；', '，')
+
+            for i, line in enumerate(cleaned_lines):
+                stripped = line.rstrip()
+                if not stripped:
+                    # Empty line indicates paragraph break
+                    if current_para:
+                        reflowed_paragraphs.append(current_para)
+                        current_para = ""
+                    continue
+
+                # Check if this line is a header/list/blockquote
+                is_special = header_pattern.match(stripped)
+
+                if is_special:
+                    # Flush current paragraph before special line
+                    if current_para:
+                        reflowed_paragraphs.append(current_para)
+                        current_para = ""
+                    reflowed_paragraphs.append(stripped)
+                elif not current_para:
+                    # Start of new paragraph
+                    current_para = stripped
+                else:
+                    # Check if current_para ends with terminal punctuation
+                    # or if it ends with colon/comma/semicolon (likely list/address item)
+                    current_ends = current_para.rstrip()
+
+                    if current_ends.endswith(terminal_chars):
+                        # Previous paragraph ends with terminal punctuation
+                        # This line starts a new paragraph
+                        reflowed_paragraphs.append(current_para)
+                        current_para = stripped
+                    elif current_ends and current_ends[-1] in non_join_endings:
+                        # Previous line ends with :, ;, , or - - likely list item or address
+                        # Don't join, start new paragraph
+                        reflowed_paragraphs.append(current_para)
+                        current_para = stripped
+                    elif len(stripped) < 20 and not stripped.endswith(terminal_chars):
+                        # Short line that doesn't end with punctuation - might be
+                        # a title, caption, or deliberate short line (poetry, etc.)
+                        reflowed_paragraphs.append(current_para)
+                        current_para = stripped
+                    else:
+                        # Likely continuation of same paragraph
+                        current_para = current_ends + " " + stripped
+
+            # Don't forget the last paragraph
+            if current_para:
+                reflowed_paragraphs.append(current_para)
+
+            # Join paragraphs and append to full_markdown
+            # But first, check if we need to merge with the previous page's content
+            # (sentences can be split across page boundaries)
+            page_markdown = "\n\n".join(reflowed_paragraphs)
+            page_footnotes = extract_page_footnotes(page_res)
+            page_markdown, footnote_refs = link_page_footnote_references(
+                page_markdown,
+                page_footnotes,
+                global_page,
+            )
+            footnote_html = format_page_footnotes_html(
+                page_footnotes,
+                global_page,
+                footnote_refs=footnote_refs,
+            )
+            if footnote_html:
+                page_markdown = (page_markdown.rstrip() + "\n\n" + footnote_html).strip()
+
+            if full_markdown and page_markdown:
+                # Check if full_markdown ends mid-sentence (no terminal punctuation)
+                # and page_markdown starts with a continuation (not a header)
+                full_stripped = full_markdown.rstrip()
+                page_lines = page_markdown.split('\n')
+                first_page_line = page_lines[0].strip() if page_lines else ""
+
+                # Check if we should merge (previous doesn't end with terminal, next isn't a header)
+                ends_mid_sentence = full_stripped and not full_stripped.endswith(terminal_chars)
+                next_is_header = header_pattern.match(first_page_line) if first_page_line else False
+
+                # Prepend page marker AFTER first_page_line is captured so merge logic is unaffected
+                # The marker must be on its own line so the later ^\x00PAGE:\d+\x00$ regex matches it;
+                # in the merge branch we ensure a newline precedes it before joining.
+                tagged_page_markdown = f"\x00PAGE:{global_page}\x00\n" + page_markdown
+
+                if ends_mid_sentence and not next_is_header:
+                    # Merge: strip trailing whitespace, insert marker on its own line,
+                    # then join the first content line of the new page with a space.
+                    full_markdown = full_markdown.rstrip() + "\n" + f"\x00PAGE:{global_page}\x00\n" + page_markdown.lstrip() + "\n\n"
+                else:
+                    full_markdown += tagged_page_markdown + "\n\n"
+            else:
+                full_markdown += f"\x00PAGE:{global_page}\x00\n" + page_markdown + "\n\n"
+
+    # Split markdown into chapters based on headers (# Header)
+    # If no headers found, put everything in one chapter.
+
+    # Split by H1 or H2, BUT only if it looks like a real Chapter/Part title
+    # Regex for headers: ^#+ \s* (Title)
+
+    md_lines = full_markdown.split("\n")
+    current_chapter_title = None  # None means no chapter header seen yet
+    current_chapter_content = []
+    chapter_count = 0
+
+    # Regex to identify "Major" headers (Chapters/Parts) to split on (legacy fallback)
+    major_header_pattern = re.compile(
+        r"^(#{1,2})\s+(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|Conclusion|Book|Acknowledgements|Contents|Abstract|序|前言|导论|目录|第[零一二三四五六七八九十百千0-9]+[篇章讲]).*"
+    )
+
+    # Regex for ANY header to format as H1/H2 in HTML but not necessarily split
+    any_header_pattern = re.compile(r"^(#{1,2})\s+(.+)$")
+
+    # Build (page, title) set for confirmed headings so repeated titles
+    # in running headers or the TOC only split at the reviewed page position
+    _page_marker_re = re.compile(r"^\x00PAGE:(\d+)\x00$")
+    if confirmed_headings is not None:
+        confirmed_set = {(h["page"], h["title"]) for h in confirmed_headings}
+    else:
+        confirmed_set = None  # use legacy regex fallback
+
+    current_page = 0
+
+    for line in md_lines:
+        # Consume page boundary markers (injected during markdown assembly)
+        _pm = _page_marker_re.match(line)
+        if _pm:
+            current_page = int(_pm.group(1))
+            continue
+
+        # Check if line is a header (before LaTeX cleanup, to match extracted candidates)
+        match = any_header_pattern.match(line)
+        is_split_point = False
+        if match:
+            heading_text = match.group(2).strip()
+            # Clean LaTeX artifacts for matching
+            heading_text = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", heading_text).strip()
+            heading_text = re.sub(r"^\d+\s+", "", heading_text).strip()
+            # Determine if this heading is a chapter split point
+            if confirmed_set is not None:
+                is_split_point = (current_page, heading_text) in confirmed_set
+            else:
+                is_split_point = bool(major_header_pattern.match(line))
+
+        # Clean up LaTeX artifacts
+        line = re.sub(r"\$\s*\^\{(.+?)\}\s*\$", r"", line)  # superscripts
+        line = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", line)  # underlines
+
+        if match:
+            if is_split_point:
+                # If we have content for the previous chapter, save it
+                if current_chapter_content:
+                    # Determine filename
+                    display_title = current_chapter_title or "Content"
+                    safe_title = "".join(
+                        [
+                            c
+                            for c in display_title
+                            if c.isalnum() or c in (" ", "_", "-")
+                        ]
+                    ).strip()
+                    if not safe_title:
+                        safe_title = f"chap_{chapter_count}"
+
+                    c = epub.EpubHtml(
+                        title=display_title,
+                        file_name=f"{safe_title}_{chapter_count}.xhtml",
+                        lang=language,
+                    )
+
+                    try:
+                        import markdown
+
+                        html_content = markdown.markdown(
+                            "\n".join(current_chapter_content)
+                        )
+                    except ImportError:
+                        html_content = (
+                            "<p>" + "</p><p>".join(current_chapter_content) + "</p>"
+                        )
+
+                    c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
+                    c.add_item(nav_css)
+                    book.add_item(c)
+                    chapters.append(c)
+                    chapter_count += 1
+
+                current_chapter_title = match.group(2)
+                current_chapter_content = [line]
+            else:
+                # It's a minor header (e.g. Section), just keep it in flow
+                current_chapter_content.append(line)
+        else:
+            current_chapter_content.append(line)
+
+    # Add last chapter
+    if current_chapter_content:
+        # Determine filename
+        display_title = current_chapter_title or "Content"
+        safe_title = "".join(
+            [c for c in display_title if c.isalnum() or c in (" ", "_", "-")]
+        ).strip()
+        if not safe_title:
+            safe_title = f"chap_{chapter_count}"
+
+        c = epub.EpubHtml(
+            title=display_title,
+            file_name=f"{safe_title}_{chapter_count}.xhtml",
+            lang=language,
+        )
+        try:
+            import markdown
+
+            html_content = markdown.markdown("\n".join(current_chapter_content))
+        except ImportError:
+            html_content = "<p>" + "</p><p>".join(current_chapter_content) + "</p>"
+
+        c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
+        c.add_item(nav_css)
+        book.add_item(c)
+        chapters.append(c)
+
+    # If no chapters were created (no headers found), create one big chapter
+    if not chapters and full_markdown:
+        c = epub.EpubHtml(title="Content", file_name="content.xhtml", lang=language)
+        try:
+            import markdown
+
+            html_content = markdown.markdown(full_markdown)
+        except ImportError:
+            html_content = "<p>" + "</p><p>".join(full_markdown.split("\n")) + "</p>"
+        c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
+        book.add_item(c)
+        chapters.append(c)
+
+    book.toc = tuple(chapters)
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
+    book.spine = ["nav"] + chapters
+
+    write_validated_epub(
+        book,
+        output_file,
+        strict_ocr_validation=strict_ocr_validation,
+    )
+    print(f"[*] EPUB saved to {output_file}")
+
+
+def main():
+    if not check_dependencies():
+        return
+
+    parser = argparse.ArgumentParser(description="Scanned PDF to Epub Converter")
+    parser.add_argument("input_pdf", help="Path to input PDF file")
+    parser.add_argument(
+        "--output", "-o", help="Path to output EPUB file (default: input_name.epub)"
+    )
+    parser.add_argument("--title", help="Book title (skips interactive prompt)")
+    parser.add_argument("--author", help="Author name (skips interactive prompt)")
+    parser.add_argument("--language", default=DEFAULT_EPUB_LANGUAGE,
+                        help=f"EPUB language tag (default: {DEFAULT_EPUB_LANGUAGE})")
+    parser.add_argument("--cover-max-edge", type=int, default=DEFAULT_COVER_MAX_EDGE,
+                        help=f"Max cover image edge in pixels (default: {DEFAULT_COVER_MAX_EDGE})")
+    parser.add_argument("--cover-quality", type=int, default=DEFAULT_COVER_JPEG_QUALITY,
+                        help=f"JPEG cover quality 1-100 (default: {DEFAULT_COVER_JPEG_QUALITY})")
+    parser.add_argument("--strict-ocr-noise", action="store_true",
+                        help="Fail EPUB generation when suspicious OCR artifacts remain")
+    parser.add_argument("--auto-toc", action="store_true",
+                        help="Skip interactive TOC review; use auto-detected headings")
+    parser.add_argument("--no-toc", action="store_true",
+                        help="Skip heading detection; produce single-chapter EPUB")
+    args = parser.parse_args()
+
+    input_path = args.input_pdf
+    if not os.path.exists(input_path):
+        print(f"Error: File {input_path} not found.")
+        return
+
+    if args.auto_toc and args.no_toc:
+        print("[!] Error: --auto-toc and --no-toc are mutually exclusive.")
+        return
+
+    if not API_TOKEN:
+        print("[!] Error: PADDLE_API_TOKEN environment variable is not set.")
+        print("    Please set it using: export PADDLE_API_TOKEN='your_token_here'")
+        return
+
+    if not args.output:
+        args.output = os.path.splitext(input_path)[0] + ".epub"
+
+    # Create a unique work directory keyed on both the resolved path and the
+    # file's current content (mtime + size as a fast proxy). This means:
+    #  - Two PDFs with the same name in different directories get separate dirs.
+    #  - Replacing book.pdf in-place invalidates the existing checkpoints so
+    #    stale OCR output is never silently reused for a changed document.
+    import hashlib
+
+    _stat = os.stat(input_path)
+    _content_key = f"{os.path.realpath(input_path)}:{_stat.st_mtime}:{_stat.st_size}"
+    file_hash = hashlib.md5(_content_key.encode("utf-8")).hexdigest()[:8]
+    work_dir = f"paddle_epub_work_{file_hash}"
+
+    print(f"[*] Work directory: {work_dir}")
+
+    image_dir = os.path.join(work_dir, "images")
+    os.makedirs(image_dir, exist_ok=True)
+
+    chunk_paths = []  # populated by split_pdf(); kept here so finally block can clean up
+    chunk_temp_dir = None
+
+    try:
+        # Step 1: Chunking
+        print("[-] Step 1: Splitting PDF...")
+        chunk_paths = split_pdf(input_path)
+        # split_pdf stores chunks in a fresh mkdtemp; capture it for cleanup
+        chunk_temp_dir = os.path.dirname(chunk_paths[0]) if chunk_paths else None
+
+        # Step 1.5: Extract cover image
+        cover_path = extract_cover_image(
+            input_path,
+            os.path.join(work_dir, "cover.jpg"),
+            max_edge=args.cover_max_edge,
+            jpg_quality=args.cover_quality,
+        )
+
+        # Step 2: API Processing
+        results = []
+        print(f"[-] Step 2: Processing {len(chunk_paths)} chunks via PaddleOCR API...")
+        for i, chunk in enumerate(chunk_paths):
+            chunk_name = os.path.basename(chunk)
+            json_checkpoint = os.path.join(work_dir, chunk_name + ".json")
+
+            if os.path.exists(json_checkpoint):
+                print(
+                    f"    [+] Resuming: Found checkpoint for chunk {i + 1}/{len(chunk_paths)}"
+                )
+                with open(json_checkpoint, "r") as f:
+                    res = json.load(f)
+            else:
+                # Rate limiting: Sleep before new request
+                if i > 0:
+                    print("    ...waiting 5s to respect API rate limits...")
+                    import time
+
+                    time.sleep(5)
+
+                print(f"    Processing chunk {i + 1}/{len(chunk_paths)}...")
+                # Increased timeout to 180s
+                res = parse_pdf_chunk(chunk, API_TOKEN)
+
+                if res:
+                    # Save checkpoint
+                    os.makedirs(os.path.dirname(json_checkpoint), exist_ok=True)
+                    with open(json_checkpoint, "w") as f:
+                        json.dump(res, f)
+
+            if res:
+                results.append(res)
+
+                # Download images immediately to save locally
+                layout_results = res.get("result", {}).get("layoutParsingResults", [])
+                for page_res in layout_results:
+                    images_map = page_res["markdown"].get("images", {})
+                    for rel_path, img_url in images_map.items():
+                        local_path = os.path.join(image_dir, rel_path)
+                        if not os.path.exists(
+                            local_path
+                        ):  # Don't re-download if exists
+                            download_image(img_url, local_path)
+            else:
+                print(
+                    f"[!] CRITICAL: Failed to process chunk {i + 1}. Aborting to prevent incomplete book."
+                )
+                print(
+                    "    Please resolve connectivity issues and re-run the script to resume."
+                )
+                sys.exit(1)
+
+        # Step 2.5: Metadata extraction
+        default_title = os.path.splitext(os.path.basename(input_path))[0]
+        if args.title:
+            # Both title and author (if any) supplied via CLI — skip interactive prompt
+            metadata = {"title": args.title, "author": args.author}
+        elif args.author:
+            # Author supplied but not title — infer/prompt for title only
+            inferred = extract_metadata_interactive(results, default_title)
+            metadata = {"title": inferred["title"], "author": args.author}
+        else:
+            metadata = extract_metadata_interactive(results, default_title)
+
+        # Step 2.75: TOC Review
+        if args.no_toc:
+            confirmed_headings = []
+        elif args.auto_toc:
+            print("[-] Step 2.75: Auto-detecting chapter headings...")
+            candidates = extract_candidate_headings(results)
+            confirmed_headings = filter_heading_candidates(candidates)
+            print(f"  ({len(confirmed_headings)} chapter headings detected)")
+        else:
+            print("[-] Step 2.75: Detecting chapter headings...")
+            candidates = extract_candidate_headings(results)
+            filtered = filter_heading_candidates(candidates)
+            if len(candidates) > len(filtered):
+                print(f"  ({len(filtered)} chapter headings found, {len(candidates) - len(filtered)} sub-headings hidden)")
+            confirmed_headings = review_toc_interactive(filtered, all_candidates=candidates)
+
+        # Step 3: Generation
+        print("[-] Step 3: Generating EPUB...")
+        create_epub(metadata["title"], results, args.output, image_dir,
+                    cover_image_path=cover_path, author=metadata["author"],
+                    confirmed_headings=confirmed_headings, language=args.language,
+                    strict_ocr_validation=args.strict_ocr_noise)
+
+    finally:
+        # Clean up the temporary split-PDF directory created by split_pdf().
+        # work_dir is intentionally kept so the user can inspect OCR checkpoints.
+        if chunk_temp_dir and os.path.isdir(chunk_temp_dir):
+            import shutil
+            try:
+                shutil.rmtree(chunk_temp_dir)
+            except OSError as _e:
+                print(f"[!] Could not remove temp chunk dir '{chunk_temp_dir}': {_e}")
+        print(
+            f"[*] Done. Intermediate files are in '{work_dir}'. You can delete this folder if verified."
+        )
+
+
+if __name__ == "__main__":
+    main()

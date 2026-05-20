@@ -1,405 +1,67 @@
-<div align=center>
-  <h1>PDF Craft</h1>
-  <p>
-    <a href="https://github.com/oomol-lab/pdf-craft/actions/workflows/merge-build.yml" target="_blank"><img src="https://img.shields.io/github/actions/workflow/status/oomol-lab/pdf-craft/merge-build.yml" alt="ci" /></a>
-    <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/badge/pip_install-pdf--craft-blue" alt="pip install pdf-craft" /></a>
-    <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/pypi/v/pdf-craft.svg" alt="pypi pdf-craft" /></a>
-    <a href="https://pypi.org/project/pdf-craft/" target="_blank"><img src="https://img.shields.io/pypi/pyversions/pdf-craft.svg" alt="python versions" /></a>
-    <a href="https://deepwiki.com/oomol-lab/pdf-craft" target="_blank"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki" /></a>
-    <a href="https://github.com/oomol-lab/pdf-craft/blob/main/LICENSE" target="_blank"><img src="https://img.shields.io/github/license/oomol-lab/pdf-craft" alt="license" /></a>
-  </p>
-  <p><a href="https://hub.oomol.com/package/pdf-craft?open=true" target="_blank"><img src="https://static.oomol.com/assets/button.svg" alt="Open in OOMOL Studio" /></a></p>
-  <p><a href="./README.md">English</a> | 中文</p>
-</div>
+# PDF to EPUB (PaddleOCR)
 
-## 简介
+使用 PaddleOCR 云端 API 将扫描版 PDF 书籍转换为 EPUB — 无需本地 GPU。
 
-pdf-craft 可以将 PDF 文件转换为各种其他格式，本项目专注于处理扫描版书籍的 PDF 文件。
-
-本项目基于 [DeepSeek OCR](https://github.com/deepseek-ai/DeepSeek-OCR) 进行文档识别。支持表格、公式等复杂内容的识别。通过 GPU 加速，pdf-craft 能够在本地完成从 PDF 到 Markdown 或 EPUB 的完整转换流程。转换过程中，pdf-craft 会自动识别文档结构，准确提取正文内容，同时过滤页眉、页脚等干扰信息。对于包含脚注、公式、表格的学术或技术文档，pdf-craft 也能妥善处理，保留这些重要元素（包括脚注中的图片等资源）。转换为 EPUB 时会自动生成目录。最终生成的 Markdown 或 EPUB 文件保持了原书的内容完整性和可读性。
-
-## 轻装上阵
-
-从 v1.0.0 正式版开始，pdf-craft 全面拥抱 [DeepSeek OCR](https://github.com/deepseek-ai/DeepSeek-OCR)，不再依赖 LLM 进行文本矫正。这一改变带来了显著的性能提升：整个转换流程在本地完成，无需网络请求，告别了旧版本中漫长的等待和偶发的网络失败。
-
-不过，新版本也移除了 LLM 文本矫正功能。如果你的使用场景仍然需要这一特性，可以继续使用 [v0.2.8](https://github.com/oomol-lab/pdf-craft/tree/v0.2.8) 旧版本。
-
-## 快速开始
-
-### 在线体验
-
-我们提供了 [在线演示平台](https://pdf.oomol.com/)，让你无需安装即可体验 PDF Craft 的转换效果。你可以直接上传 PDF 文件并转换。
-
-[![PDF Craft 在线演示](docs/images/website-cn.png)](https://pdf.oomol.com/)
-
-### 安装
+## 安装
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-pip install pdf-craft
+pip install pymupdf ebooklib requests python-dotenv markdown
 ```
 
-上述命令仅用于快速安装。要真正使用 pdf-craft，你需要**安装 Poppler** 用于 PDF 解析（所有使用场景都需要）以及**配置 CUDA 环境**用于 OCR 识别（实际转换时需要）。详细说明请参考[安装指南](docs/INSTALLATION_zh-CN.md)。
+## 配置
 
-### 快速开始
+复制 `.env.example` 为 `.env`，填入百度 AIStudio API token：
 
-#### 转换为 Markdown
-
-```python
-from pdf_craft import transform_markdown
-
-transform_markdown(
-    pdf_path="input.pdf",
-    markdown_path="output.md",
-    markdown_assets_path="images",
-)
+```
+PADDLE_API_TOKEN=你的token
 ```
 
-![](docs/images/pdf2md-cn.png)
+在 [百度 AIStudio](https://aistudio.baidu.com/) 获取 PaddleOCR 版面解析 API 的 token。
 
-#### 转换为 EPUB
-
-```python
-from pdf_craft import transform_epub, BookMeta
-
-transform_epub(
-    pdf_path="input.pdf",
-    epub_path="output.epub",
-    book_meta=BookMeta(
-        title="书名",
-        authors=["作者"],
-    ),
-)
-```
-
-![](docs/images/pdf2epub-cn.png)
-
-### 命令行脚本
-
-如果你已经克隆了本仓库，`scripts/` 目录下提供了可以直接运行的脚本。
-
-**PDF → EPUB**（`scripts/gen_epub.py`）
+## 使用
 
 ```bash
-# 最简用法 —— 输出到 analysing_<文件名>/<文件名>.epub
-python scripts/gen_epub.py book.pdf
-
-# 自定义输出路径
-python scripts/gen_epub.py book.pdf -o output/book.epub
-
-# 所有选项
-python scripts/gen_epub.py book.pdf \
-  -o output/book.epub \
-  --analysing-dir /tmp/ocr-work \
-  --models-cache ~/.cache/models
-```
-
-**PDF → Markdown**（`scripts/gen_md.py`）
-
-编辑文件顶部的 `_IMAGE_STEM` 变量，使其指向你的 PDF 文件，然后运行：
-
-```bash
-python scripts/gen_md.py
-```
-
-**百度 PaddleOCR API → EPUB**（`pdf2epub_paddle.py`）—— *实验性*
-
-一个独立脚本，使用[百度 AIStudio PaddleOCR 版面解析 API](https://aistudio.baidu.com/) 替代本地 DeepSeek OCR，无需本地 GPU。完整说明见下方 [PaddleOCR API 工具](#paddleocr-api-工具实验性) 章节。
-
-```bash
-python pdf2epub_paddle.py input.pdf --output book.epub --auto-toc
-```
-
-## PaddleOCR API 工具（实验性）
-
-这是一个独立脚本（`pdf2epub_paddle.py`），使用百度 AIStudio PaddleOCR 版面分析 API 将扫描版 PDF 书籍转换为 EPUB，无需本地 GPU。
-
-### 功能特性
-
-- **高质量版面分析**：使用 PaddleOCR 智能识别段落、标题、图片和表格。
-- **智能章节分割**：自动检测章节标题，交互式 TOC 审查允许你在生成 EPUB 前确认、删除或调整章节。
-- **封面图片**：自动提取 PDF 第一页作为 EPUB 封面。
-- **元数据支持**：根据 OCR 识别的首页文本交互式提示输入书名和作者，或通过 CLI 参数直接指定。
-- **图片嵌入**：完整保留原 PDF 中的图片。
-- **纯净输出**：自动移除页眉、页脚和页码。
-- **高鲁棒性**：断点续传、速率限制与自动重试。
-
-### 前置要求
-
-- Python 3.8+
-- 百度 AIStudio API Token —— 登录 [百度 AIStudio](https://aistudio.baidu.com/)，找到 PaddleOCR / 版面解析 API 并复制你的 Token。
-- 额外依赖：`pymupdf`、`ebooklib`、`requests`、`python-dotenv`、`markdown`
-
-### 配置
-
-1. 将 `.env.example` 复制为 `.env` 并填入你的 Token：
-
-    ```bash
-    cp .env.example .env
-    # 编辑 .env：
-    # PADDLE_API_TOKEN=your_api_token_here
-    ```
-
-2. 安装依赖（推荐使用 `uv`，或标准 pip）：
-
-    ```bash
-    # 使用 uv（自动处理虚拟环境）
-    uv run pdf2epub_paddle.py /path/to/book.pdf
-
-    # 或使用标准 pip
-    pip install pymupdf ebooklib requests python-dotenv markdown
-    python pdf2epub_paddle.py /path/to/book.pdf
-    ```
-
-    也可以直接设置环境变量代替 `.env` 文件：
-
-    ```bash
-    export PADDLE_API_TOKEN='your_token'
-    ```
-
-### 使用方法
-
-```bash
-# 基本用法（交互式填写书名和作者）
+# 基本用法 — 交互式输入书名和作者
 python pdf2epub_paddle.py book.pdf
 
-# 指定输出路径
-python pdf2epub_paddle.py book.pdf --output book.epub
+# 命令行提供元数据（非交互模式）
+python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc
 
-# 通过 CLI 参数指定元数据（跳过交互提示）
-python pdf2epub_paddle.py book.pdf --title "书名" --author "作者"
+# 不拆分章节，整本合为一个章节
+python pdf2epub_paddle.py book.pdf --title "书名" --no-toc
 
-# 跳过交互式 TOC 审查，使用自动检测的章节
-python pdf2epub_paddle.py book.pdf --auto-toc
-
-# 不分章节，生成单章 EPUB
-python pdf2epub_paddle.py book.pdf --no-toc
+# 严格模式 — 残留 OCR 噪声时报错
+python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 ```
 
-### 配置项
+### 参数说明
 
-- **分块大小**：默认每次 API 请求处理 5 页（脚本中的 `CHUNK_SIZE`）。网络稳定且额度充足时可适当增大。
-- **超时时间**：默认每次请求超时 180 秒。
-- **断点续传**：每处理完一个分块后，进度保存在 `paddle_epub_work_<hash>/` 目录。中断后重新运行相同命令即可续传。
+| 参数 | 说明 |
+|---|---|
+| `--output`, `-o` | 输出 EPUB 路径（默认：`<输入文件名>.epub`） |
+| `--title` | 书名（跳过交互式提示） |
+| `--author` | 作者名 |
+| `--language` | EPUB 语言标签（默认：`zh-Hant`） |
+| `--auto-toc` | 跳过目录审查，直接使用自动检测的章节 |
+| `--no-toc` | 不拆分章节 — 整本书作为一个章节 |
+| `--strict-ocr-noise` | 输出中残留 OCR 噪声时中断报错 |
+| `--cover-max-edge` | 封面图片最大边长像素（默认：2000） |
+| `--cover-quality` | JPEG 封面质量 1–100（默认：82） |
 
-## 详细使用
+### 断点续传
 
-### 转换为 Markdown
+每个 chunk 的处理进度保存在 `paddle_epub_work_<hash>/` 目录中。中断后重新运行相同命令即可从上次位置继续。
 
-```python
-from pdf_craft import transform_markdown
+## 功能
 
-transform_markdown(
-    pdf_path="input.pdf",
-    markdown_path="output.md",
-    markdown_assets_path="images",
-    analysing_path="temp",  # 可选：指定临时文件夹
-    ocr_size="gundam",  # 可选：tiny, small, base, large, gundam
-    models_cache_path="models",  # 可选：模型缓存路径
-    ocr_model=None,  # 可选：模型仓库 ID（如 "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR"）
-    ocr_version="v1",  # 可选："v1"（默认）、"v2" 或 "glm-ocr"
-    dpi=300,  # 可选：渲染 PDF 页面的 DPI（默认：300）
-    max_page_image_file_size=None,  # 可选：最大图像文件大小（字节），超出时自动调整 DPI
-    includes_cover=False,  # 可选：包含封面
-    includes_footnotes=True,  # 可选：包含脚注
-    ignore_pdf_errors=False,  # 可选：遇到 PDF 渲染错误时继续处理
-    ignore_ocr_errors=False,  # 可选：遇到 OCR 识别错误时继续处理
-    generate_plot=False,  # 可选：生成可视化图表
-    toc_assumed=False,  # 可选：假设 PDF 包含目录页
-)
-```
-
-### 转换为 EPUB
-
-```python
-from pdf_craft import transform_epub, BookMeta, TableRender, LaTeXRender
-
-transform_epub(
-    pdf_path="input.pdf",
-    epub_path="output.epub",
-    analysing_path="temp",  # 可选：指定临时文件夹
-    ocr_size="gundam",  # 可选：tiny, small, base, large, gundam
-    models_cache_path="models",  # 可选：模型缓存路径
-    ocr_model=None,  # 可选：模型仓库 ID（如 "deepseek-ai/DeepSeek-OCR-2", "zai-org/GLM-OCR"）
-    ocr_version="v1",  # 可选："v1"（默认）、"v2" 或 "glm-ocr"
-    dpi=300,  # 可选：渲染 PDF 页面的 DPI（默认：300）
-    max_page_image_file_size=None,  # 可选：最大图像文件大小（字节），超出时自动调整 DPI
-    includes_cover=True,  # 可选：包含封面
-    includes_footnotes=True,  # 可选：包含脚注
-    ignore_pdf_errors=False,  # 可选：遇到 PDF 渲染错误时继续处理
-    ignore_ocr_errors=False,  # 可选：遇到 OCR 识别错误时继续处理
-    generate_plot=False,  # 可选：生成可视化图表
-    toc_assumed=True,  # 可选：假设 PDF 包含目录页
-    book_meta=BookMeta(
-        title="书名",
-        authors=["作者1", "作者2"],
-        publisher="出版社",
-        language="zh",
-    ),
-    lan="zh",  # 可选：语言 (zh/en)
-    table_render=TableRender.HTML,  # 可选：表格渲染方式
-    latex_render=LaTeXRender.MATHML,  # 可选：公式渲染方式
-    inline_latex=True,  # 可选：保留内联 LaTeX 表达式
-)
-```
-
-### 模型管理
-
-pdf-craft 依赖 DeepSeek OCR 模型，首次运行时会自动从 Hugging Face 下载。你可以通过 `models_cache_path` 和 `local_only` 参数控制模型的存储和加载行为。
-
-对于 DeepSeek-OCR-2，设置 `ocr_version="v2"`（可选配合 `ocr_model="deepseek-ai/DeepSeek-OCR-2"`）。OCR-2 目前作为单一大模型发布，v2 模式下 `ocr_size` 参数将被忽略。
-
-对于 GLM-OCR，设置 `ocr_version="glm-ocr"`（可选配合 `ocr_model="zai-org/GLM-OCR"`）。GLM-OCR 是一个轻量级（0.9B 参数）的多模态 OCR 模型，具有高精度和多语言支持。与 v2 类似，glm-ocr 模式下 `ocr_size` 参数将被忽略。
-
-#### 预下载模型
-
-在生产环境中，建议提前下载模型，避免首次运行时下载：
-
-```python
-from pdf_craft import predownload_models
-
-predownload_models(
-    models_cache_path="models",  # 指定模型缓存目录
-    revision=None,  # 可选：指定模型版本
-)
-```
-
-#### 指定模型缓存路径
-
-默认情况下，模型会下载到系统的 Hugging Face 缓存目录。你可以通过 `models_cache_path` 参数自定义缓存位置：
-
-```python
-from pdf_craft import transform_markdown
-
-transform_markdown(
-    pdf_path="input.pdf",
-    markdown_path="output.md",
-    models_cache_path="./my_models",  # 自定义模型缓存目录
-)
-```
-
-#### 离线模式
-
-如果你已经预先下载了模型，可以使用 `local_only=True` 禁止网络下载，确保仅使用本地模型：
-
-```python
-from pdf_craft import transform_markdown
-
-transform_markdown(
-    pdf_path="input.pdf",
-    markdown_path="output.md",
-    models_cache_path="./my_models",
-    local_only=True,  # 仅使用本地模型，不从网络下载
-)
-```
-
-## API 参考
-
-### OCR 模型
-
-`ocr_size` 参数接受 `DeepSeekOCRSize` 类型：
-
-- `tiny` - 最小模型，速度最快
-- `small` - 小型模型
-- `base` - 基础模型
-- `large` - 大型模型
-- `gundam` - 最大模型，质量最高（默认）
-
-### 表格渲染方式
-
-- `TableRender.HTML` - HTML 格式（默认）
-- `TableRender.CLIPPING` - Clipping 格式（直接从原书扫描件上裁剪表格图像）
-
-### 公式渲染方式
-
-- `LaTeXRender.MATHML` - MathML 格式（默认）
-- `LaTeXRender.SVG` - SVG 格式
-- `LaTeXRender.CLIPPING` - Clipping 格式（直接从原书扫描件上裁剪公式图像）
-
-### 内联 LaTeX
-
-`inline_latex` 参数（仅 EPUB，默认：`True`）控制是否在输出中保留内联 LaTeX 表达式。启用后，内联数学公式将以 LaTeX 代码形式保留，可由支持的 EPUB 阅读器渲染。
-
-### 目录检测
-
-`toc_assumed` 参数控制 pdf-craft 是否假设 PDF 包含目录页：
-
-- 当为 `True` 时（EPUB 默认值）：pdf-craft 会尝试在 PDF 中定位并提取目录，使用它来构建文档结构
-- 当为 `False` 时（Markdown 默认值）：pdf-craft 仅基于文档标题生成目录
-
-对于包含专门目录部分的书籍，设置 `toc_assumed=True` 通常能生成更好的章节组织。
-
-### 自定义 PDF 处理器
-
-默认情况下，pdf-craft 使用本地 Poppler（通过 `pdf2image`）进行 PDF 解析和渲染。如果 Poppler 不在系统 PATH 中，你可以指定自定义路径：
-
-```python
-from pdf_craft import transform_markdown, DefaultPDFHandler
-
-# 指定自定义 Poppler 路径
-transform_markdown(
-    pdf_path="input.pdf",
-    markdown_path="output.md",
-    pdf_handler=DefaultPDFHandler(poppler_path="/path/to/poppler/bin"),
-)
-```
-
-如果不指定，pdf-craft 会从系统 PATH 中查找 Poppler。对于高级使用场景，你也可以实现 `PDFHandler` protocol 来使用其他 PDF 库。
-
-### 错误处理
-
-`ignore_pdf_errors` 和 `ignore_ocr_errors` 参数提供了灵活的错误处理选项。你可以通过两种方式使用它们：
-
-**1. 布尔模式** - 简单的开关控制：
-
-```python
-from pdf_craft import transform_markdown
-
-transform_markdown(
-    pdf_path="input.pdf",
-    markdown_path="output.md",
-    ignore_pdf_errors=True,  # 忽略所有 PDF 渲染错误
-    ignore_ocr_errors=True,  # 忽略所有 OCR 识别错误
-)
-```
-
-当设置为 `True` 时，在单个页面出现错误时继续处理，插入占位符消息而不是停止整个转换过程。
-
-**2. 自定义函数模式** - 细粒度控制：
-
-```python
-from pdf_craft import transform_markdown, OCRError, PDFError
-
-def should_ignore_ocr_error(error: OCRError) -> bool:
-    # 仅忽略特定类型的 OCR 错误
-    return error.kind == "recognition_failed"
-
-def should_ignore_pdf_error(error: PDFError) -> bool:
-    # 自定义逻辑来决定忽略哪些 PDF 错误
-    return "timeout" in str(error)
-
-transform_markdown(
-    pdf_path="input.pdf",
-    markdown_path="output.md",
-    ignore_ocr_errors=should_ignore_ocr_error,  # 传递自定义函数
-    ignore_pdf_errors=should_ignore_pdf_error,  # 传递自定义函数
-)
-```
-
-这允许你实现自定义逻辑，以决定在转换过程中应该忽略哪些特定错误。
-
-## 相关开源库
-
-[epub-translator](https://github.com/oomol-lab/epub-translator) 利用 AI 大模型自动翻译 EPUB 电子书，并 100% 保留原书的格式、插图、目录和排版，同时生成 双语对照版本，方便语言学习或国际分享。与本库搭配，可将扫描 PDF 书籍转换并翻译。搭配使用可参考 [视频：PDF 扫描件书籍转 EPUB 格式，翻译成双语书](https://www.bilibili.com/video/BV1tMQZY5EYY)。
+- **版面解析**：调用 PaddleOCR API 检测段落、标题、图片和表格
+- **章节检测**：从 OCR 结果中自动检测章节标题，支持交互式审查
+- **封面提取**：将 PDF 第一页渲染为 EPUB 封面图片
+- **图片嵌入**：保留原 PDF 中的插图、照片和图表
+- **脚注处理**：提取并链接 OCR 检测到的脚注
+- **OCR 噪声清理**：过滤常见的 PaddleOCR 识别噪声（纯数字表格、伪 LaTeX 等）
+- **目录修复**：修正 TOC 目录链接指向正确的章节标题
 
 ## 许可证
 
-本项目采用 MIT 许可证。详见 [LICENSE](./LICENSE) 文件。
-
-自 v1.0.0 起，pdf-craft 全面迁移到 DeepSeek OCR（MIT 协议），移除了原有的 AGPL-3.0 依赖，使得整个项目能够以更宽松的 MIT 协议发布。注意 pdf-craft 通过 DeepSeek OCR 间接依赖了 easydict（LGPLv3 协议）。感谢社区的支持与贡献！
-
-## 致谢
-
-- [DeepSeekOCR](https://github.com/deepseek-ai/DeepSeek-OCR)
-- [doc-page-extractor](https://github.com/Moskize91/doc-page-extractor)
-- [pyahocorasick](https://github.com/WojciechMula/pyahocorasick)
+MIT
