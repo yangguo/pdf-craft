@@ -11,11 +11,13 @@ try:
     import fitz  # PyMuPDF
     from ebooklib import epub
     from dotenv import load_dotenv
+    from tqdm import tqdm
     load_dotenv()
 except ImportError:
     requests = None  # type: ignore[assignment]
     fitz = None  # type: ignore[assignment]
     epub = None  # type: ignore[assignment]
+    tqdm = None  # type: ignore[assignment]
 
 
 # --- Configuration ---

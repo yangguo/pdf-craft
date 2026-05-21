@@ -77,6 +77,9 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
     any_header_pattern = re.compile(r"^(#{1,2})\s+(.+)$")
     latex_pattern = re.compile(r"\$\s*\\underline\{(.+?)\}\s*\$")
     chapter_number_pattern = re.compile(r"^第[零一二三四五六七八九十百千0-9]+章$")
+    plain_chapter_pattern = re.compile(
+        r"^(第[零一二三四五六七八九十百千0-9]+[章編编篇部卷])\s+(.+)"
+    )
     global_page = 0
 
     for result in results:
@@ -101,6 +104,41 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
                         "level": len(match.group(1)),
                         "md_line": line,
                     })
+
+    # Second pass: detect chapter headings that OCR output as plain text
+    # (no # / ## prefix). Only accept when a single chapter heading appears
+    # near the top of a page that has no existing heading candidates, to
+    # avoid false positives from TOC listing pages.
+    pages_with_headings = {c["page"] for c in candidates}
+    global_page = 0
+    for result in results:
+        if not result or "result" not in result:
+            continue
+        for page_res in result["result"].get("layoutParsingResults", []):
+            global_page += 1
+            if global_page in pages_with_headings:
+                continue
+            page_md = clean_ocr_noise(page_res["markdown"]["text"])
+            lines = [l.strip() for l in page_md.split("\n")
+                     if l.strip() and not l.strip().isdigit()]
+            # Count plain-text chapter headings on this page.
+            # Tolerate up to 3 occurrences (OCR may duplicate the chapter
+            # title on its start page) but reject TOC pages that list many
+            # chapters together (typically 10+).
+            chapter_count = sum(1 for l in lines if plain_chapter_pattern.match(l))
+            if chapter_count > 3:
+                continue
+            # Accept if it's within the first 3 non-empty lines
+            for i, line in enumerate(lines):
+                pm = plain_chapter_pattern.match(line)
+                if pm and i <= 2:
+                    candidates.append({
+                        "title": pm.group(0).strip(),
+                        "page": global_page,
+                        "level": 1,
+                        "md_line": line,
+                    })
+                    break
 
     # Merge chapter-number H2 with the following H1 title.
     # PaddleOCR may place them on the same page or adjacent pages.
@@ -131,6 +169,72 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
     return merged
 
 
+def _parse_chapter_num(title: str) -> int | None:
+    """Parse the chapter number from a '第X章' heading, e.g. '第十二章' -> 12."""
+    m = re.match(r"^第([零一二三四五六七八九十百千0-9]+)章", title)
+    if not m:
+        return None
+    s = m.group(1)
+    if s.isdigit():
+        return int(s)
+    # Chinese numeral → integer (handles 1-999)
+    cn = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+          "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+          "百": 100, "千": 1000}
+    result = 0
+    # Handle leading '十' (e.g. '十二' = 12)
+    if s.startswith("十"):
+        result = 10
+        s = s[1:]
+    for ch in s:
+        val = cn.get(ch, 0)
+        if val >= 10:
+            result = (result or 1) * val
+        else:
+            result += val
+    return result
+
+
+def _prune_inline_headings(headings: List[Dict]) -> List[Dict]:
+    """Remove non-chapter headings that sit between main chapters (sub-sections,
+    inserted articles, etc.) while keeping appendix / back-matter entries that
+    appear after the last sequential chapter."""
+    if len(headings) < 3:
+        return headings
+
+    headings = sorted(headings, key=lambda h: h["page"])
+
+    # Find the last page of the main sequential chapter numbering.
+    # When numbering restarts (e.g. chapter 16 → chapter 4 from an
+    # appendix), everything before the restart is the main sequence.
+    last_main_page = 0
+    last_num = 0
+    for h in headings:
+        num = _parse_chapter_num(h["title"])
+        if num is not None:
+            if num < last_num:
+                break  # restart — appendix chapters begin
+            last_num = num
+            last_main_page = h["page"]
+
+    if last_main_page == 0:
+        return headings
+
+    # Keep headings that are either:
+    #   (a) a 第X章 heading within the main page range, OR
+    #   (b) any heading *after* the last main chapter (appendix / back-matter)
+    result = []
+    for h in headings:
+        num = _parse_chapter_num(h["title"])
+        is_main_chapter = num is not None and h["page"] <= last_main_page
+        is_appendix = h["page"] > last_main_page
+        if is_main_chapter or is_appendix:
+            result.append(h)
+        # Non-第X章 headings within the main chapter range are dropped
+
+    return result
+
+
 def filter_heading_candidates(candidates: List[Dict]) -> List[Dict]:
     """Adaptively filters headings by trying H1-only, then keyword match, then all."""
     chapter_keyword = re.compile(
@@ -143,15 +247,15 @@ def filter_heading_candidates(candidates: List[Dict]) -> List[Dict]:
     # Strategy 1: H1-only (skip front-matter on first 2 pages)
     h1 = [h for h in candidates if h["level"] == 1 and h["page"] > 2]
     if len(h1) >= 4:
-        return h1
+        return _prune_inline_headings(h1)
 
     # Strategy 2: Keyword-matched headings (any level)
     keyword_matches = [h for h in candidates if chapter_keyword.match(h["title"])]
     if len(keyword_matches) >= 3:
-        return keyword_matches
+        return _prune_inline_headings(keyword_matches)
 
     # Strategy 3: All headings (last resort)
-    return candidates
+    return sorted(candidates, key=lambda h: h["page"])
 
 
 def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = None) -> List[Dict]:

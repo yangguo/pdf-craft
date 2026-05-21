@@ -9,6 +9,7 @@ import sys
 import time
 
 from .config import (
+    tqdm,
     API_TOKEN,
     DEFAULT_COVER_JPEG_QUALITY,
     DEFAULT_COVER_MAX_EDGE,
@@ -107,25 +108,28 @@ def main():
 
         # Step 2: API Processing
         results = []
-        print(f"[-] Step 2: Processing {len(chunk_paths)} chunks via PaddleOCR API...")
+        total = len(chunk_paths)
+        print(f"[-] Step 2: Processing {total} chunks via PaddleOCR API...")
+        if tqdm is not None:
+            pbar = tqdm(total=total, unit="chunk", ncols=80,
+                        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
+            _write = pbar.write
+        else:
+            pbar = None
+            _write = print
         for i, chunk in enumerate(chunk_paths):
             chunk_name = os.path.basename(chunk)
             json_checkpoint = os.path.join(work_dir, chunk_name + ".json")
 
             if os.path.exists(json_checkpoint):
-                print(
-                    f"    [+] Resuming: Found checkpoint for chunk {i + 1}/{len(chunk_paths)}"
-                )
                 with open(json_checkpoint, "r") as f:
                     res = json.load(f)
             else:
                 # Rate limiting: Sleep before new request
                 if i > 0:
-                    print("    ...waiting 5s to respect API rate limits...")
+                    _write("    ...waiting 5s to respect API rate limits...")
                     time.sleep(5)
 
-                print(f"    Processing chunk {i + 1}/{len(chunk_paths)}...")
-                # Increased timeout to 180s
                 res = parse_pdf_chunk(chunk, API_TOKEN)
 
                 if res:
@@ -148,13 +152,21 @@ def main():
                         ):  # Don't re-download if exists
                             download_image(img_url, local_path)
             else:
-                print(
+                _write(
                     f"[!] CRITICAL: Failed to process chunk {i + 1}. Aborting to prevent incomplete book."
                 )
-                print(
+                _write(
                     "    Please resolve connectivity issues and re-run the script to resume."
                 )
+                if pbar is not None:
+                    pbar.close()
                 sys.exit(1)
+
+            if pbar is not None:
+                pbar.update(1)
+
+        if pbar is not None:
+            pbar.close()
 
         # Step 2.5: Metadata extraction
         default_title = os.path.splitext(os.path.basename(input_path))[0]

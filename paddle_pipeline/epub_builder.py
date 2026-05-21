@@ -308,6 +308,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         confirmed_map = {}  # use legacy regex fallback
 
     current_page = 0
+    last_split_page = -1  # guard against duplicate splits on the same page
 
     for line in md_lines:
         # Consume page boundary markers (injected during markdown assembly)
@@ -319,6 +320,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         # Check if line is a header (before LaTeX cleanup, to match extracted candidates)
         match = any_header_pattern.match(line)
         is_split_point = False
+        heading_text = None
         if match:
             heading_text = match.group(2).strip()
             # Clean LaTeX artifacts for matching
@@ -332,51 +334,60 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                 is_split_point = lookup_title is not None
             else:
                 is_split_point = bool(major_header_pattern.match(line))
+        elif confirmed_headings is not None and current_page != last_split_page:
+            # Detect chapter headings that OCR output as plain text (no # prefix).
+            # Skip if we already split on this page (guards against OCR outputting
+            # the same heading as both # H1 and plain text on the same page).
+            stripped = line.strip()
+            if stripped and not stripped.isdigit():
+                lookup_title = confirmed_map.get((current_page, stripped))
+                if lookup_title is None:
+                    lookup_title = confirmed_map.get((current_page - 1, stripped))
+                if lookup_title is not None:
+                    heading_text = stripped
+                    is_split_point = True
 
         # Clean up LaTeX artifacts
         line = re.sub(r"\$\s*\^\{(.+?)\}\s*\$", r"", line)  # superscripts
         line = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", line)  # underlines
 
-        if match:
-            if is_split_point:
-                # Save previous chapter
-                if current_chapter_content:
-                    display_title = current_chapter_title or "Content"
-                    safe_title = "".join(
-                        c for c in display_title
-                        if c.isalnum() or c in (" ", "_", "-")
-                    ).strip()
-                    if not safe_title:
-                        safe_title = f"chap_{chapter_count}"
+        if is_split_point:
+            # Save previous chapter
+            if current_chapter_content:
+                display_title = current_chapter_title or "Content"
+                safe_title = "".join(
+                    c for c in display_title
+                    if c.isalnum() or c in (" ", "_", "-")
+                ).strip()
+                if not safe_title:
+                    safe_title = f"chap_{chapter_count}"
 
-                    c = epub.EpubHtml(
-                        title=display_title,
-                        file_name=f"{safe_title}_{chapter_count}.xhtml",
-                        lang=language,
+                c = epub.EpubHtml(
+                    title=display_title,
+                    file_name=f"{safe_title}_{chapter_count}.xhtml",
+                    lang=language,
+                )
+
+                try:
+                    import markdown
+                    html_content = markdown.markdown(
+                        "\n".join(current_chapter_content)
+                    )
+                except ImportError:
+                    html_content = (
+                        "<p>" + "</p><p>".join(current_chapter_content) + "</p>"
                     )
 
-                    try:
-                        import markdown
-                        html_content = markdown.markdown(
-                            "\n".join(current_chapter_content)
-                        )
-                    except ImportError:
-                        html_content = (
-                            "<p>" + "</p><p>".join(current_chapter_content) + "</p>"
-                        )
+                c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
+                c.add_item(nav_css)
+                book.add_item(c)
+                chapters.append(c)
+                chapter_count += 1
 
-                    c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
-                    c.add_item(nav_css)
-                    book.add_item(c)
-                    chapters.append(c)
-                    chapter_count += 1
-
-                # Use the full merged title from confirmed_map when available
-                current_chapter_title = lookup_title or match.group(2)
-                current_chapter_content = [line]
-            else:
-                # Minor header or non-split heading — keep it in flow
-                current_chapter_content.append(line)
+            # Use the full merged title from confirmed_map when available
+            current_chapter_title = lookup_title or (match.group(2) if match else heading_text)
+            current_chapter_content = [line]
+            last_split_page = current_page
         else:
             current_chapter_content.append(line)
 
