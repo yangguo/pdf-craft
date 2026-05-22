@@ -61,6 +61,18 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
         chunk_doc = fitz.open()
         chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
 
+        # Add bottom padding to prevent OCR model from cropping text at
+        # the page edge (observed on scanned books where the last line
+        # sits very close to the physical page bottom).
+        for page in chunk_doc:
+            rect = page.rect
+            new_h = rect.height * 1.05
+            page.set_mediabox(fitz.Rect(0, 0, rect.width, new_h))
+            page.draw_rect(
+                fitz.Rect(0, rect.height, rect.width, new_h),
+                color=None, fill=(1, 1, 1),
+            )
+
         chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
         chunk_doc.save(chunk_filename)
         chunk_doc.close()
@@ -85,9 +97,11 @@ def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
     payload = {
         "file": file_data,
         "fileType": 0,  # 0 for PDF
-        "useDocOrientationClassify": False,
-        "useDocUnwarping": False,
-        "useChartRecognition": False,  # Basic extraction
+        "useDocOrientationClassify": True,
+        "useDocUnwarping": True,
+        "useChartRecognition": False,
+        "layoutThreshold": 0.3,
+        "textRecScoreThresh": 0.3,
     }
 
     max_retries = 5

@@ -15,6 +15,72 @@ from .footnotes import (
 )
 from .ocr_noise import clean_ocr_noise
 
+# Chinese numerals used in page numbers
+_CN_NUMERALS = set("零一二三四五六七八九十百千")
+
+
+def _build_header_fingerprints(confirmed_headings: List[Dict] | None) -> set:
+    """Build a set of whitespace-stripped chapter titles for page-header detection."""
+    fingerprints = set()
+    if confirmed_headings:
+        for h in confirmed_headings:
+            title = h.get("title", "")
+            fp = re.sub(r"\s+", "", title)
+            if fp:
+                fingerprints.add(fp)
+    return fingerprints
+
+
+def _strip_page_headers(lines: list, fingerprints: set) -> list:
+    """Remove OCR page headers / footers and Chinese page numbers from a page.
+
+    Page headers appear as standalone lines at page boundaries and match:
+    - A known chapter-title fingerprint (whitespace removed)
+    - A chapter-like pattern (e.g. '第X章...') without markdown heading markup
+    - A Chinese-numeral page number (e.g. '五', '二七')
+    """
+    if len(lines) < 2:
+        return lines
+
+    _chapterish = re.compile(r"第[零一二三四五六七八九十百千0-9]+[章節编編篇卷]")
+
+    def _is_page_number(s: str) -> bool:
+        s = s.strip()
+        if not s:
+            return False
+        if s.isdigit():
+            return True
+        return all(c in _CN_NUMERALS for c in s) and len(s) <= 3
+
+    def _is_header_line(s: str) -> bool:
+        s = s.strip()
+        if not s:
+            return False
+        fp = re.sub(r"\s+", "", s)
+        if fp in fingerprints:
+            return True
+        if _chapterish.match(s) and not s.startswith("#"):
+            return True
+        return False
+
+    result = list(lines)
+    n = len(result)
+
+    # Only check the bottom 3 lines — page headers appear after body text
+    # in the OCR output. Top-of-page headers would also be chapter starts.
+    for idx in range(max(0, n - 3), n):
+        line = result[idx]
+        if not line.strip():
+            continue
+        if _is_page_number(line) and idx > 0:
+            result[idx] = ""
+        elif _is_header_line(line):
+            result[idx] = ""
+            if idx + 1 < n and _is_page_number(result[idx + 1]):
+                result[idx + 1] = ""
+
+    return [l for l in result if l.strip() or l == ""]
+
 
 def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
                 cover_image_path: str | None = None, author: str | None = None,
@@ -78,6 +144,9 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     # Let's try to detect headers in the markdown to split chapters.
 
     full_markdown = ""
+
+    # Build chapter title fingerprints for page-header detection
+    _header_fingerprints = _build_header_fingerprints(confirmed_headings)
 
     # Aggregated images to add to the book
     # Map API image path (e.g. 'images/tmp.jpg') to internal EPUB path
@@ -163,6 +232,10 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                     continue
                 cleaned_lines.append(line)
 
+            # Remove page headers / footers and Chinese page numbers
+            if _header_fingerprints:
+                cleaned_lines = _strip_page_headers(cleaned_lines, _header_fingerprints)
+
             # Reflow: join lines that appear to be part of the same paragraph
             reflowed_paragraphs = []
             current_para = ""
@@ -171,55 +244,66 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             # Includes CJK full-width equivalents for Chinese/Japanese OCR.
             terminal_chars = ('.', '!', '?', '"', "'", ')', ']', '}', ':', ';',
                               '。', '！', '？', '：', '；', '」', '』', '）', '】', '〉', '》')
-            # Patterns that indicate a line is a header or special block
-            header_pattern = re.compile(r'^(#{1,6}\s|>|\s*[-*]\s|\d+\.)')
+            # Patterns that indicate a line is a header or special block.
+            # Includes plain-text chapter headings (第X章) that OCR output
+            # without markdown markup — these must stay standalone for the
+            # chapter split detection to find them.
+            header_pattern = re.compile(
+                r'^(#{1,6}\s|>|\s*[-*]\s|\d+\.|'
+                r'第[零一二三四五六七八九十百千0-9]+[章節编編篇卷])'
+            )
             # Characters that indicate a line should not be joined with next
             non_join_endings = (':', ';', ',', '-', '：', '；', '，')
+
+            consecutive_blanks = 0
 
             for i, line in enumerate(cleaned_lines):
                 stripped = line.rstrip()
                 if not stripped:
-                    # Empty line indicates paragraph break
-                    if current_para:
-                        reflowed_paragraphs.append(current_para)
-                        current_para = ""
+                    consecutive_blanks += 1
                     continue
 
                 # Check if this line is a header/list/blockquote
                 is_special = header_pattern.match(stripped)
 
                 if is_special:
-                    # Flush current paragraph before special line
                     if current_para:
                         reflowed_paragraphs.append(current_para)
                         current_para = ""
                     reflowed_paragraphs.append(stripped)
+                    consecutive_blanks = 0
                 elif not current_para:
-                    # Start of new paragraph
                     current_para = stripped
+                    consecutive_blanks = 0
                 else:
-                    # Check if current_para ends with terminal punctuation
-                    # or if it ends with colon/comma/semicolon (likely list/address item)
                     current_ends = current_para.rstrip()
 
-                    if current_ends.endswith(terminal_chars):
-                        # Previous paragraph ends with terminal punctuation
-                        # This line starts a new paragraph
+                    if consecutive_blanks >= 2:
+                        # Multiple blank lines — real paragraph break
+                        reflowed_paragraphs.append(current_para)
+                        current_para = stripped
+                    elif consecutive_blanks == 1:
+                        # Single blank between text lines — OCR line-wrap noise
+                        # unless the previous line ends with terminal punctuation
+                        if current_ends.endswith(terminal_chars):
+                            reflowed_paragraphs.append(current_para)
+                            current_para = stripped
+                        else:
+                            current_para = current_ends + " " + stripped
+                    elif current_ends.endswith(terminal_chars):
+                        # No blank but terminal punctuation — new sentence
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     elif current_ends and current_ends[-1] in non_join_endings:
-                        # Previous line ends with :, ;, , or - - likely list item or address
-                        # Don't join, start new paragraph
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     elif len(stripped) < 20 and not stripped.endswith(terminal_chars):
-                        # Short line that doesn't end with punctuation - might be
-                        # a title, caption, or deliberate short line (poetry, etc.)
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     else:
-                        # Likely continuation of same paragraph
                         current_para = current_ends + " " + stripped
+
+                    consecutive_blanks = 0
 
             # Don't forget the last paragraph
             if current_para:

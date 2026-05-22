@@ -78,7 +78,11 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
     latex_pattern = re.compile(r"\$\s*\\underline\{(.+?)\}\s*\$")
     chapter_number_pattern = re.compile(r"^第[零一二三四五六七八九十百千0-9]+章$")
     plain_chapter_pattern = re.compile(
-        r"^(第[零一二三四五六七八九十百千0-9]+[章編编篇部卷])\s+(.+)"
+        r"^(第[零一二三四五六七八九十百千0-9]+[章編编篇部卷])(?:\s+(.+))?$"
+    )
+    # Standalone chapter number (no title on same line) — title follows on next line
+    _bare_chapter_num = re.compile(
+        r"^第[零一二三四五六七八九十百千0-9]+[章編编篇部卷]$"
     )
     global_page = 0
 
@@ -131,14 +135,22 @@ def extract_candidate_headings(results: List[Dict]) -> List[Dict]:
             # Accept if it's within the first 3 non-empty lines
             for i, line in enumerate(lines):
                 pm = plain_chapter_pattern.match(line)
-                if pm and i <= 2:
-                    candidates.append({
-                        "title": pm.group(0).strip(),
-                        "page": global_page,
-                        "level": 1,
-                        "md_line": line,
-                    })
-                    break
+                if not pm or i > 2:
+                    continue
+                title = pm.group(0).strip()
+                # Handle split headings: "第四章" alone on one line,
+                # title on the next (e.g. "「統戰」之戰")
+                if _bare_chapter_num.match(title) and i + 1 < len(lines):
+                    next_line = lines[i + 1]
+                    if next_line and not next_line.isdigit():
+                        title = f"{title} {next_line}"
+                candidates.append({
+                    "title": title,
+                    "page": global_page,
+                    "level": 1,
+                    "md_line": line,
+                })
+                break
 
     # Merge chapter-number H2 with the following H1 title.
     # PaddleOCR may place them on the same page or adjacent pages.
