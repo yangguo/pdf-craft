@@ -172,6 +172,9 @@ def main():
 
         # Step 2.25: Render whole-page fallbacks for visual pages Paddle did not
         # expose as image assets (for example rotated genealogy diagrams).
+        # NOTE: This runs before page order repair. Visual pages rarely carry
+        # printed page numbers, but if they do, the fallback image may end up
+        # at the wrong position after repair_page_order_by_printed_numbers swaps pages.
         apply_page_image_fallbacks(input_path, results, image_dir)
 
         # Step 2.35: Repair scanner page-order inversions before TOC detection

@@ -79,11 +79,9 @@ def apply_page_image_fallbacks(pdf_path: str, results: List[Dict[str, Any]],
             rel_path = f"imgs/page_fallback_{global_page:04d}.png"
             local_path = os.path.join(image_dir, rel_path)
 
-            if rel_path not in images:
+            if rel_path not in images or not os.path.exists(local_path):
                 _render_page_png(pdf_path, global_page, local_path, markdown_text)
                 images[rel_path] = ""
-            elif not os.path.exists(local_path):
-                _render_page_png(pdf_path, global_page, local_path, markdown_text)
 
             if rel_path not in markdown_text:
                 alt_text = (

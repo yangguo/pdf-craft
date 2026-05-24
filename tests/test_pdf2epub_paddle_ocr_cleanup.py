@@ -1201,9 +1201,6 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         ]
 
         class FakePixmap:
-            width = 1200
-            height = 800
-
             def save(self, path):
                 Path(path).write_bytes(b"fake png")
 

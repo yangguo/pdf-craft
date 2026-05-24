@@ -3,7 +3,7 @@
 import re
 
 from collections import Counter
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from .config import fitz  # Optional dependency
 
@@ -15,7 +15,7 @@ _PRINTED_PAGE_PATTERNS = (
 )
 
 
-def _extract_printed_page_number(text: str) -> int | None:
+def _extract_printed_page_number(text: str) -> Optional[int]:
     head = re.sub(r"\s+", " ", text[:300])
     for pattern in _PRINTED_PAGE_PATTERNS:
         for match in pattern.finditer(head):
@@ -25,7 +25,7 @@ def _extract_printed_page_number(text: str) -> int | None:
     return None
 
 
-def _printed_page_numbers(pdf_path: str) -> List[int | None]:
+def _printed_page_numbers(pdf_path: str) -> List[Optional[int]]:
     if fitz is None:
         return []
 
