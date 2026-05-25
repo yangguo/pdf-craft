@@ -1,6 +1,6 @@
-# PDF to EPUB (PaddleOCR)
+# PDF to EPUB
 
-Convert scanned PDF books to EPUB using the PaddleOCR cloud API — no local GPU required.
+Convert scanned PDF books to EPUB using PaddleOCR or MinerU cloud APIs — no local GPU required.
 
 ## Installation
 
@@ -10,22 +10,27 @@ pip install pymupdf ebooklib requests python-dotenv markdown
 
 ## Setup
 
-Copy `.env.example` to `.env` and add your Baidu AIStudio API token:
+Copy `.env.example` to `.env` and add your API token(s):
 
 ```
-PADDLE_API_TOKEN=your_token_here
+PADDLE_API_TOKEN=your_token_here   # for --api paddle (default)
+MINERU_API_TOKEN=your_token_here   # for --api mineru
 ```
 
-Get a token from [Baidu AIStudio](https://aistudio.baidu.com/) — find the PaddleOCR Layout Parsing API.
+Get a PaddleOCR token from [Baidu AIStudio](https://aistudio.baidu.com/) (Layout Parsing API).
+Get a MinerU token from [MinerU](https://mineru.net/) (v4 API).
 
 ## Usage
 
 ```bash
+# PaddleOCR (default)
+python pdf2epub_paddle.py book.pdf --title "Book Title" --author "Author" --auto-toc
+
+# MinerU (faster, 20-page chunks)
+python pdf2epub_paddle.py book.pdf --title "Book Title" --author "Author" --auto-toc --api mineru
+
 # Basic — prompts for title and author
 python pdf2epub_paddle.py book.pdf
-
-# With metadata (non-interactive)
-python pdf2epub_paddle.py book.pdf --title "Book Title" --author "Author" --auto-toc
 
 # Single-chapter EPUB (no chapter splitting)
 python pdf2epub_paddle.py book.pdf --title "Title" --no-toc
@@ -42,11 +47,22 @@ python pdf2epub_paddle.py book.pdf --title "Title" --strict-ocr-noise
 | `--title` | Book title (skips interactive prompt) |
 | `--author` | Author name |
 | `--language` | EPUB language tag (default: `zh-Hant`) |
+| `--api` | OCR backend: `paddle` (default) or `mineru` |
 | `--auto-toc` | Skip TOC review, use auto-detected chapters |
 | `--no-toc` | No chapter splitting — single-chapter EPUB |
 | `--strict-ocr-noise` | Fail if OCR artifacts remain in output |
 | `--cover-max-edge` | Max cover image edge in pixels (default: 2000) |
 | `--cover-quality` | JPEG cover quality 1–100 (default: 82) |
+
+### MinerU Configuration
+
+| Env Var | Default | Description |
+|---|---|---|
+| `MINERU_API_TOKEN` | — | MinerU v4 API Bearer token |
+| `MINERU_CHUNK_SIZE` | `20` | Pages per chunk (max 200) |
+| `MINERU_POLL_INTERVAL` | `5` | Seconds between batch result polls |
+| `MINERU_MAX_POLL_TIME` | `600` | Max seconds to wait for a batch |
+| `MINERU_VERIFY_SSL` | `1` | Set to `0` to disable SSL verification |
 
 ### Checkpointing
 

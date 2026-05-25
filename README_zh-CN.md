@@ -1,6 +1,6 @@
-# PDF to EPUB (PaddleOCR)
+# PDF to EPUB
 
-使用 PaddleOCR 云端 API 将扫描版 PDF 书籍转换为 EPUB — 无需本地 GPU。
+使用 PaddleOCR 或 MinerU 云端 API 将扫描版 PDF 书籍转换为 EPUB — 无需本地 GPU。
 
 ## 安装
 
@@ -10,22 +10,27 @@ pip install pymupdf ebooklib requests python-dotenv markdown
 
 ## 配置
 
-复制 `.env.example` 为 `.env`，填入百度 AIStudio API token：
+复制 `.env.example` 为 `.env`，填入 API token：
 
 ```
-PADDLE_API_TOKEN=你的token
+PADDLE_API_TOKEN=你的token   # --api paddle（默认）
+MINERU_API_TOKEN=你的token   # --api mineru
 ```
 
-在 [百度 AIStudio](https://aistudio.baidu.com/) 获取 PaddleOCR 版面解析 API 的 token。
+在 [百度 AIStudio](https://aistudio.baidu.com/) 获取 PaddleOCR 版面解析 API token。
+在 [MinerU](https://mineru.net/) 获取 MinerU v4 API token。
 
 ## 使用
 
 ```bash
+# PaddleOCR（默认）
+python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc
+
+# MinerU（更快，20页/块）
+python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc --api mineru
+
 # 基本用法 — 交互式输入书名和作者
 python pdf2epub_paddle.py book.pdf
-
-# 命令行提供元数据（非交互模式）
-python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc
 
 # 不拆分章节，整本合为一个章节
 python pdf2epub_paddle.py book.pdf --title "书名" --no-toc
@@ -42,11 +47,22 @@ python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 | `--title` | 书名（跳过交互式提示） |
 | `--author` | 作者名 |
 | `--language` | EPUB 语言标签（默认：`zh-Hant`） |
+| `--api` | OCR 后端：`paddle`（默认）或 `mineru` |
 | `--auto-toc` | 跳过目录审查，直接使用自动检测的章节 |
 | `--no-toc` | 不拆分章节 — 整本书作为一个章节 |
 | `--strict-ocr-noise` | 输出中残留 OCR 噪声时中断报错 |
 | `--cover-max-edge` | 封面图片最大边长像素（默认：2000） |
 | `--cover-quality` | JPEG 封面质量 1–100（默认：82） |
+
+### MinerU 配置
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `MINERU_API_TOKEN` | — | MinerU v4 API Bearer token |
+| `MINERU_CHUNK_SIZE` | `20` | 每块页数（最大 200） |
+| `MINERU_POLL_INTERVAL` | `5` | 结果轮询间隔（秒） |
+| `MINERU_MAX_POLL_TIME` | `600` | 单批次最大等待时间（秒） |
+| `MINERU_VERIFY_SSL` | `1` | 设为 `0` 关闭 SSL 验证 |
 
 ### 断点续传
 

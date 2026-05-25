@@ -1,0 +1,441 @@
+"""MinerU API integration — file upload, batch polling, result download.
+
+Flow (per https://mineru.net/doc/docs/):
+  1. POST /api/v4/file-urls/batch → get signed PUT URLs + batch_id
+  2. PUT chunk file to signed URL → task auto-submitted
+  3. GET /api/v4/extract-results/batch/{batch_id} → poll until done
+  4. Download result ZIP from full_zip_url → parse markdown
+"""
+
+import io
+import json
+import os
+import re
+import time
+import zipfile
+
+from typing import Any, Dict, List
+
+from .config import (
+    MINERU_API_URL,
+    MINERU_API_TOKEN,
+    MINERU_CHUNK_SIZE,
+    MINERU_MAX_POLL_TIME,
+    MINERU_POLL_INTERVAL,
+    fitz,
+    requests,
+)
+
+_VERIFY_SSL = os.getenv("MINERU_VERIFY_SSL", "1") not in ("0", "false", "no", "off")
+if not _VERIFY_SSL:
+    import warnings as _warnings
+    _warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+_API_BASE = re.sub(r"/api/v\d+/.*$", "", MINERU_API_URL)
+
+
+def split_pdf(file_path: str, chunk_size: int | None = None) -> List[str]:
+    """Split a PDF into chunks for the MinerU API (default 20 pages per chunk)."""
+    import tempfile
+
+    if chunk_size is None:
+        chunk_size = MINERU_CHUNK_SIZE
+
+    doc = fitz.open(file_path)
+    total_pages = len(doc)
+    print(f"[*] Total pages: {total_pages}")
+
+    chunk_paths = []
+    temp_dir = tempfile.mkdtemp(prefix="mineru_chunks_")
+
+    for start_page in range(0, total_pages, chunk_size):
+        end_page = min(start_page + chunk_size, total_pages)
+        chunk_doc = fitz.open()
+        chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
+
+        for page in chunk_doc:
+            rect = page.rect
+            new_h = rect.height * 1.05
+            page.set_mediabox(fitz.Rect(0, 0, rect.width, new_h))
+            page.draw_rect(
+                fitz.Rect(0, rect.height, rect.width, new_h),
+                color=None, fill=(1, 1, 1),
+            )
+
+        chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
+        chunk_doc.save(chunk_filename)
+        chunk_doc.close()
+        chunk_paths.append(chunk_filename)
+
+    doc.close()
+    return chunk_paths
+
+
+def _api_headers(token: str) -> Dict[str, str]:
+    return {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+
+
+def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any] | None:
+    """Process a PDF chunk through the MinerU v4 API.
+
+    1. Request signed upload URL + PUT file
+    2. Poll GET /api/v4/extract-results/batch/{batch_id} until done
+    3. Download and parse the result ZIP
+
+    Returns a dict compatible with the epub_builder pipeline, or None on failure.
+    """
+    if token is None:
+        token = MINERU_API_TOKEN
+
+    if not token:
+        print("[!] MINERU_API_TOKEN is not set.")
+        return None
+
+    file_name = os.path.basename(chunk_path)
+    print(f"[*] MinerU: uploading {file_name}")
+
+    # Step 1: Get signed upload URL (with retry)
+    data = None
+    for attempt in range(5):
+        if attempt > 0:
+            wait = (2 ** (attempt - 1)) * 5
+            print(f"    ...retrying in {wait}s...")
+            time.sleep(wait)
+        try:
+            resp = requests.post(
+                f"{_API_BASE}/api/v4/file-urls/batch",
+                json={
+                    "files": [{"name": file_name}],
+                    "model_version": "vlm",
+                    "is_ocr": True,
+                    "enable_formula": True,
+                    "enable_table": True,
+                    "language": "ch",
+                },
+                headers=_api_headers(token),
+                timeout=60,
+                verify=_VERIFY_SSL,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == 0:
+                    break
+                print(f"[!] Upload URL request failed: {data.get('msg')}")
+                if attempt == 4:
+                    return None
+            else:
+                print(f"[!] Upload URL request HTTP {resp.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[!] Upload URL request error: {e}")
+            if attempt == 4:
+                return None
+
+    if not data:
+        return None
+
+    batch_id = data["data"]["batch_id"]
+    upload_url = data["data"]["file_urls"][0]
+
+    # Step 2: PUT file (with retry)
+    for attempt in range(5):
+        if attempt > 0:
+            wait = (2 ** (attempt - 1)) * 5
+            print(f"    ...retrying in {wait}s...")
+            time.sleep(wait)
+        try:
+            with open(chunk_path, "rb") as f:
+                put_resp = requests.put(upload_url, data=f, timeout=300, verify=_VERIFY_SSL)
+            if put_resp.status_code in (200, 204):
+                break
+            print(f"[!] File upload HTTP {put_resp.status_code}")
+            if attempt == 4:
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"[!] File upload error: {e}")
+            if attempt == 4:
+                return None
+
+    print(f"[*] MinerU: uploaded, batch {batch_id}")
+
+    # Step 3: Poll batch results
+    batch_url = f"{_API_BASE}/api/v4/extract-results/batch/{batch_id}"
+    start_time = time.time()
+    first_poll = True
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > MINERU_MAX_POLL_TIME:
+            print(f"[!] Timed out waiting for batch {batch_id}")
+            return None
+
+        if not first_poll:
+            time.sleep(MINERU_POLL_INTERVAL)
+        first_poll = False
+
+        try:
+            r = requests.get(
+                batch_url, headers=_api_headers(token), timeout=30, verify=_VERIFY_SSL,
+            )
+            if r.status_code == 401:
+                print("[!] MinerU API: Unauthorized — check MINERU_API_TOKEN")
+                return None
+            if r.status_code in (403, 404):
+                print(f"[!] MinerU API: Batch {batch_id} HTTP {r.status_code}")
+                return None
+            if r.status_code != 200:
+                continue
+
+            result = r.json()
+            if result.get("code") != 0:
+                continue
+
+            results_list = result.get("data", {}).get("extract_result", [])
+            if not results_list:
+                continue
+
+            first = results_list[0]
+            state = first.get("state", "")
+
+            if state == "done":
+                zip_url = first.get("full_zip_url", "")
+                if not zip_url:
+                    print("[!] No zip URL in result")
+                    return None
+
+                # Step 4: Download and parse ZIP
+                zr = requests.get(
+                    zip_url, headers=_api_headers(token), timeout=120, verify=_VERIFY_SSL,
+                )
+                if zr.status_code != 200:
+                    print(f"[!] ZIP download HTTP {zr.status_code}")
+                    return None
+
+                parsed = _parse_zip(zr.content)
+                if parsed:
+                    # Stash the ZIP URL so the checkpoint can re-parse
+                    # later when the parsing logic changes.
+                    parsed["_mineru_zip_url"] = zip_url
+                    print(f"[*] MinerU: batch {batch_id} done")
+                    return parsed
+                return None
+
+            elif state == "failed":
+                print(f"[!] Batch {batch_id} failed: {first.get('err_msg', 'unknown')}")
+                return None
+
+            # else: still processing — continue polling
+
+        except requests.exceptions.RequestException as e:
+            print(f"[!] Poll error: {e}")
+
+
+def _parse_zip(zip_data: bytes) -> Dict[str, Any] | None:
+    """Parse a MinerU result ZIP into pipeline-compatible format.
+
+    Extracts markdown and converts bundled images to data URIs.
+    Splits combined markdown at repeated page-header headings so the
+    downstream EPUB builder gets per-page granularity for chapter detection.
+    """
+    import base64
+
+    _MIME = {
+        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".png": "image/png", ".gif": "image/gif",
+        ".webp": "image/webp",
+    }
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_data)) as zf:
+            file_list = zf.namelist()
+
+            md_files = sorted([f for f in file_list if f.endswith(".md")])
+            image_files = [f for f in file_list if f.lower().endswith(
+                tuple(_MIME.keys())
+            )]
+
+            if not md_files:
+                print("[!] No .md files in result ZIP")
+                return None
+
+            # Pre-encode all images to data URIs
+            all_images: Dict[str, str] = {}
+            for img_name in image_files:
+                try:
+                    img_bytes = zf.read(img_name)
+                    img_b64 = base64.b64encode(img_bytes).decode("ascii")
+                    ext = os.path.splitext(img_name)[1].lower()
+                    mime = _MIME.get(ext, "image/jpeg")
+                    all_images[img_name] = f"data:{mime};base64,{img_b64}"
+                except Exception as e:
+                    print(f"[!] Failed to read image {img_name}: {e}")
+
+            layout_results = []
+            for md_name in md_files:
+                md_text = zf.read(md_name).decode("utf-8", errors="replace")
+
+                # Split combined markdown at repeated page-header headings.
+                # MinerU bundles an entire chunk into one .md file where
+                # each physical page starts with an H1 that repeats on
+                # every page (e.g. book title).
+                pages = _split_by_page_headers(md_text)
+
+                for page_md in pages:
+                    if not page_md.strip():
+                        continue
+                    # Drop fragments that are just page numbers or
+                    # a lone header (ghost pages).  Real pages have
+                    # at least ~100 chars of body text.
+                    if len(page_md) < 80:
+                        continue
+                    layout_results.append({
+                        "markdown": {"text": page_md, "images": dict(all_images)}
+                    })
+
+            return {"result": {"layoutParsingResults": layout_results}}
+
+    except zipfile.BadZipFile:
+        print("[!] Corrupted result ZIP")
+        return None
+
+
+def _detect_page_headers(md_lines: List[str]) -> tuple[set, set]:
+    """Find H1 headings that are page numbers or repeated 2+ times.
+
+    Returns (markdown_headers, plain_text_headers) where markdown_headers
+    are ``# ...`` lines to split on and plain_text_headers are the text
+    without the ``# `` prefix for body-stripping.
+    """
+    from collections import Counter
+    h1_headings = []
+    for line in md_lines:
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            h1_headings.append(stripped)
+    counts = Counter(h1_headings)
+
+    md_headers = set()
+    for h, c in counts.items():
+        text = h[2:]  # strip "# " prefix
+        # Standalone page numbers (1-4 digits)
+        if text.isdigit() and len(text) <= 4:
+            md_headers.add(h)
+        # Repeated headings (book title as running header)
+        elif c >= 2:
+            md_headers.add(h)
+
+    plain_headers = {h[2:] for h in md_headers}
+    return md_headers, plain_headers
+
+
+def _split_by_page_headers(md_text: str) -> list:
+    """Split markdown at repeated page-header boundaries.
+
+    Auto-detects H1 headings that repeat 2+ times as page headers,
+    splits at each occurrence, strips the header line and any
+    plain-text header repetition from the start of every segment.
+    Also strips standalone page numbers.
+    """
+    lines = md_text.split("\n")
+    md_headers, plain_headers = _detect_page_headers(lines)
+
+    if not md_headers:
+        return [md_text]
+
+    split_indices = []
+    for i, line in enumerate(lines):
+        if line.strip() in md_headers:
+            split_indices.append(i)
+
+    if not split_indices:
+        return [md_text]
+
+    segments = []
+    for j, start_idx in enumerate(split_indices):
+        content_start = start_idx + 1  # skip header line
+        content_end = split_indices[j + 1] if j + 1 < len(split_indices) else len(lines)
+        segment_lines = lines[content_start:content_end]
+
+        # Strip plain-text header repetition from the top of the segment
+        # (MinerU sometimes outputs the header as the first text line too)
+        segment_lines = _strip_leading_headers(segment_lines, plain_headers)
+        # Strip leading standalone page numbers
+        segment_lines = _strip_leading_page_numbers(segment_lines)
+
+        segment = "\n".join(segment_lines).strip()
+        if segment:
+            segments.append(segment)
+
+    # Content before the first page header (e.g. cover page lead-in)
+    if split_indices[0] > 0:
+        prefix = "\n".join(lines[:split_indices[0]]).strip()
+        if prefix:
+            segments.insert(0, prefix)
+
+    return segments
+
+
+def _strip_leading_headers(lines: list, plain_headers: set) -> list:
+    """Remove page-header text when it appears as the first content line(s)."""
+    while lines and lines[0].strip() in plain_headers:
+        lines = lines[1:]
+    # Also handle "HEADER HEADER" (doubled OCR repetition)
+    if lines:
+        first = lines[0].strip()
+        for h in plain_headers:
+            if first == f"{h} {h}":
+                lines = lines[1:]
+                break
+            # "HEADER real content" → strip prefix only
+            if first.startswith(h + " ") and len(first) > len(h) + 1:
+                lines[0] = lines[0].replace(h + " ", "", 1).strip()
+                break
+            if first.startswith(h + " ") and len(first) == len(h) + 1:
+                lines = lines[1:]
+                break
+    return lines
+
+
+def _strip_leading_page_numbers(lines: list) -> list:
+    """Remove standalone page numbers from the top of a segment."""
+    while lines:
+        stripped = lines[0].strip()
+        if stripped.isdigit() and len(stripped) <= 4:
+            lines = lines[1:]
+        else:
+            break
+    return lines
+
+
+def reparse_checkpoint(checkpoint: Dict[str, Any],
+                       token: str | None = None) -> Dict[str, Any]:
+    """Re-parse a MinerU checkpoint using the current parsing logic.
+
+    When the checkpoint contains ``_mineru_zip_url`` (stashed by
+    ``parse_pdf_chunk``), this re-downloads the ZIP and applies the
+    latest version of ``_parse_zip``.  If the URL is no longer valid
+    or the field is absent, the checkpoint is returned as-is.
+    """
+    zip_url = checkpoint.get("_mineru_zip_url")
+    if not zip_url:
+        return checkpoint
+
+    if token is None:
+        token = MINERU_API_TOKEN
+    if not token:
+        return checkpoint
+
+    try:
+        zr = requests.get(
+            zip_url, headers=_api_headers(token), timeout=120, verify=_VERIFY_SSL,
+        )
+        if zr.status_code != 200:
+            print(f"[!] Re-download ZIP HTTP {zr.status_code}, using cached result")
+            return checkpoint
+
+        reparsed = _parse_zip(zr.content)
+        if reparsed:
+            reparsed["_mineru_zip_url"] = zip_url
+            return reparsed
+    except requests.exceptions.RequestException as e:
+        print(f"[!] Re-download ZIP error: {e}, using cached result")
+
+    return checkpoint

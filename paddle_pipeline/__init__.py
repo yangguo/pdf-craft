@@ -31,6 +31,8 @@ from .footnotes import (
 )
 from .ocr_noise import clean_ocr_noise
 from .paddle_api import check_dependencies
+from .mineru_api import parse_pdf_chunk as parse_pdf_chunk_mineru
+from .mineru_api import split_pdf as split_pdf_mineru
 from .toc_retarget import ensure_toc_targets_start_pages
 
 __all__ = [
@@ -42,6 +44,8 @@ __all__ = [
     "extract_page_footnotes",
     "format_page_footnotes_html",
     "link_page_footnote_references",
+    "parse_pdf_chunk_mineru",
     "scan_epub_for_ocr_noise",
+    "split_pdf_mineru",
     "validate_epub_no_ocr_noise",
 ]

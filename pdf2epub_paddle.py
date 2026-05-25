@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""PaddleOCR PDF to EPUB converter — thin wrapper.
+"""PDF to EPUB converter — supports PaddleOCR and MinerU backends.
 
 Usage:
-    python pdf2epub_paddle.py input.pdf [--output output.epub] [--title "..."] [--author "..."]
+    python pdf2epub_paddle.py input.pdf [--output output.epub] [--title "..."] [--author "..."] [--api mineru]
 """
 from paddle_pipeline.main import main
 

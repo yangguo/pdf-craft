@@ -14,7 +14,7 @@ Convert PDFs into EPUBs that are readable in Calibre and usable on e-readers. Th
 1. Inspect the PDF before converting: page count, metadata, text layer, embedded images, drawing-heavy pages, list of figures/tables, and chapter starts.
 2. Choose the path:
    - Use a text-layer hybrid conversion when most pages already contain extractable text.
-   - Use `pdf2epub_paddle.py` or the project OCR workflow first when pages are scanned or text length is near zero across body pages.
+   - Use `pdf2epub_paddle.py --api mineru` (faster) or `--api paddle` (default) when pages are scanned or text length is near zero across body pages.
    - Use page images only as a last resort; Calibre and e-readers handle text EPUBs better.
 3. Preserve local visuals selectively: cover, photos, diagrams, charts, and table pages. Do not link remote images from XHTML.
 4. Build the EPUB with title, author, language, cover metadata, nav, NCX, CSS, and local manifest items.
@@ -22,17 +22,18 @@ Convert PDFs into EPUBs that are readable in Calibre and usable on e-readers. Th
 
 ## OCR Decision
 
-Call `pdf2epub_paddle.py` only when OCR is actually needed:
+Call `pdf2epub_paddle.py` only when OCR is actually needed. Use `--api mineru` for faster processing with the MinerU v4 API (set `MINERU_API_TOKEN` in `.env`).
 
-| Inspection result | Use Paddle OCR? |
-|---|---|
-| User explicitly requests Paddle/OCR | Yes |
-| Body pages are scanned images with little/no text | Yes |
-| `inspect` shows a low text-layer ratio or many body pages with `text_len` near zero | Yes |
-| Extracted text is unreadable garbage, wrong script, or badly corrupted | Yes |
-| PDF has readable prose text but cover/photos/tables are images | No; use hybrid text+visual conversion |
-| PDF has vector charts/tables with searchable captions/text | No; add visual snapshots for those pages |
-| Only the cover page is an image | No; embed the cover locally |
+| Inspection result | Use OCR? | Backend |
+|---|---|---|
+| User explicitly requests Paddle/OCR | Yes | `paddle` (default) |
+| User explicitly requests MinerU | Yes | `mineru` |
+| Body pages are scanned images with little/no text | Yes | `paddle` or `mineru` |
+| `inspect` shows a low text-layer ratio or many body pages with `text_len` near zero | Yes | `mineru` (faster) |
+| Extracted text is unreadable garbage, wrong script, or badly corrupted | Yes | `mineru` (faster) |
+| PDF has readable prose text but cover/photos/tables are images | No | Use hybrid text+visual conversion |
+| PDF has vector charts/tables with searchable captions/text | No | Add visual snapshots for those pages |
+| Only the cover page is an image | No | Embed the cover locally |
 
 For mixed PDFs, OCR only the scanned page ranges if the project OCR workflow supports it; otherwise use OCR for the source pass, then still run EPUB validation and visual-retention checks.
 

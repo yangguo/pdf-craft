@@ -11,6 +11,7 @@ import time
 from .config import (
     tqdm,
     API_TOKEN,
+    MINERU_API_TOKEN,
     DEFAULT_COVER_JPEG_QUALITY,
     DEFAULT_COVER_MAX_EDGE,
     DEFAULT_EPUB_LANGUAGE,
@@ -29,6 +30,7 @@ from .paddle_api import (
     parse_pdf_chunk,
     split_pdf,
 )
+from . import mineru_api
 
 
 def main():
@@ -54,6 +56,8 @@ def main():
                         help="Skip interactive TOC review; use auto-detected headings")
     parser.add_argument("--no-toc", action="store_true",
                         help="Skip heading detection; produce single-chapter EPUB")
+    parser.add_argument("--api", choices=["paddle", "mineru"], default="paddle",
+                        help="OCR API backend to use (default: paddle)")
     args = parser.parse_args()
 
     input_path = args.input_pdf
@@ -65,7 +69,12 @@ def main():
         print("[!] Error: --auto-toc and --no-toc are mutually exclusive.")
         return
 
-    if not API_TOKEN:
+    if args.api == "mineru":
+        if not MINERU_API_TOKEN:
+            print("[!] Error: MINERU_API_TOKEN environment variable is not set.")
+            print("    Please set it using: export MINERU_API_TOKEN='your_token_here'")
+            return
+    elif not API_TOKEN:
         print("[!] Error: PADDLE_API_TOKEN environment variable is not set.")
         print("    Please set it using: export PADDLE_API_TOKEN='your_token_here'")
         return
@@ -94,7 +103,10 @@ def main():
     try:
         # Step 1: Chunking
         print("[-] Step 1: Splitting PDF...")
-        chunk_paths = split_pdf(input_path)
+        if args.api == "mineru":
+            chunk_paths = mineru_api.split_pdf(input_path)
+        else:
+            chunk_paths = split_pdf(input_path)
         # split_pdf stores chunks in a fresh mkdtemp; capture it for cleanup
         chunk_temp_dir = os.path.dirname(chunk_paths[0]) if chunk_paths else None
 
@@ -109,7 +121,10 @@ def main():
         # Step 2: API Processing
         results = []
         total = len(chunk_paths)
-        print(f"[-] Step 2: Processing {total} chunks via PaddleOCR API...")
+        api_label = "MinerU" if args.api == "mineru" else "PaddleOCR"
+        api_token = MINERU_API_TOKEN if args.api == "mineru" else API_TOKEN
+        parse_func = mineru_api.parse_pdf_chunk if args.api == "mineru" else parse_pdf_chunk
+        print(f"[-] Step 2: Processing {total} chunks via {api_label} API...")
         if tqdm is not None:
             pbar = tqdm(total=total, unit="chunk", ncols=80,
                         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]")
@@ -124,13 +139,21 @@ def main():
             if os.path.exists(json_checkpoint):
                 with open(json_checkpoint, "r") as f:
                     res = json.load(f)
+                # MinerU checkpoints stash the result ZIP URL so they
+                # can be re-parsed with the latest _parse_zip logic.
+                if args.api == "mineru" and "_mineru_zip_url" in res:
+                    reparsed = mineru_api.reparse_checkpoint(res, api_token)
+                    if reparsed is not res:
+                        res = reparsed
+                        with open(json_checkpoint, "w") as f:
+                            json.dump(res, f)
             else:
                 # Rate limiting: Sleep before new request
                 if i > 0:
                     _write("    ...waiting 5s to respect API rate limits...")
                     time.sleep(5)
 
-                res = parse_pdf_chunk(chunk, API_TOKEN)
+                res = parse_func(chunk, api_token)
 
                 if res:
                     # Save checkpoint

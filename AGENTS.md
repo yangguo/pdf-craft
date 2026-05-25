@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Project Structure
-- `paddle_pipeline/`: core package — PaddleOCR PDF-to-EPUB conversion pipeline.
+- `paddle_pipeline/`: core package — PaddleOCR/MinerU PDF-to-EPUB conversion pipeline.
 - `tests/`: unit tests; `tests/assets/` holds sample PDFs used by tests.
 - `skills/`: Claude Code skill definitions (hybrid text+visual EPUB pipeline).
 - `docs/`: documentation and design plans.

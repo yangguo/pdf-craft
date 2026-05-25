@@ -436,6 +436,17 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         line = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", line)  # underlines
 
         if is_split_point:
+            # Use the full merged title from confirmed_map when available
+            new_title = lookup_title or (match.group(2) if match else heading_text)
+
+            # If this split point has the same title as the current chapter,
+            # it is a page-boundary duplicate (e.g. page header repeating
+            # the chapter title).  Merge instead of splitting.
+            if current_chapter_title and new_title == current_chapter_title:
+                current_chapter_content.append(line)
+                last_split_page = current_page
+                continue
+
             # Save previous chapter
             if current_chapter_content:
                 display_title = current_chapter_title or "Content"
@@ -468,8 +479,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                 chapters.append(c)
                 chapter_count += 1
 
-            # Use the full merged title from confirmed_map when available
-            current_chapter_title = lookup_title or (match.group(2) if match else heading_text)
+            current_chapter_title = new_title
             current_chapter_content = [line]
             last_split_page = current_page
         else:

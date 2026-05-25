@@ -360,8 +360,18 @@ def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = 
 
 
 def download_image(url: str, save_path: str):
-    """Downloads an image from a URL to a local path."""
+    """Downloads an image from a URL or data URI to a local path."""
     try:
+        if url.startswith("data:"):
+            # data URI (e.g. "data:image/jpeg;base64,...")
+            header, b64_data = url.split(",", 1)
+            import base64
+            img_bytes = base64.b64decode(b64_data)
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            with open(save_path, "wb") as f:
+                f.write(img_bytes)
+            return True
+
         response = requests.get(url, timeout=10, verify=False)
         if response.status_code == 200:
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -369,7 +379,7 @@ def download_image(url: str, save_path: str):
                 f.write(response.content)
             return True
     except Exception as e:
-        print(f"[!] Failed to download image {url}: {e}")
+        print(f"[!] Failed to download image {url[:80]}: {e}")
     return False
 
 
