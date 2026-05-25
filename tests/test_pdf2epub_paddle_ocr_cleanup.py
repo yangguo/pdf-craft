@@ -395,6 +395,94 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         self.assertEqual([], findings)
 
+    def test_scan_epub_for_ocr_noise_detects_garbled_cjk_text(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        # Build a run of random CJK characters long enough to trigger detection:
+        # window_size=12 (11 bigrams), min_singletons=10, min_consecutive=5
+        # => need ~16+ consecutive CJK chars where most bigrams are singletons.
+        # A sequence of 30 random unique chars guarantees all bigrams are novel.
+        cjk_start = 0x4E00
+        garbled_run = "".join(chr(cjk_start + i) for i in range(30))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    f"<html><body><p>Normal intro text. {garbled_run} Normal outro.</p></body></html>",
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        self.assertTrue(
+            any("garbled CJK" in item.get("token", "") for item in findings),
+            f"Expected garbled CJK finding, got: {findings}",
+        )
+
+    def test_scan_epub_for_ocr_noise_allows_normal_chinese_prose(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        # The self-calibrating detector builds a bigram model from the full
+        # book text.  A short passage would have too many singleton bigrams,
+        # so we repeat the prose enough times to simulate a book-length
+        # corpus where common character transitions reappear.
+        normal_passage = (
+            "今天天氣很好，我和朋友一起去公園散步。公園裡有很多花草樹木，"
+            "還有一些小朋友在玩耍。我們找了一張長椅坐下來，欣賞周圍的風景。"
+            "朋友說他最近工作很忙，很少有時間出來走走。我告訴他要多注意休息，"
+            "不要總是加班到很晚。身體健康比什麼都重要，這是大家都知道的道理。"
+        )
+        normal_text = (normal_passage + "\n") * 20
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    f"<html><body><p>{normal_text}</p></body></html>",
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        garbled_findings = [
+            item for item in findings if "garbled CJK" in item.get("token", "")
+        ]
+        self.assertEqual(
+            [], garbled_findings,
+            f"Normal Chinese should not trigger garbled detection, got: {garbled_findings}",
+        )
+
+    def test_scan_epub_for_ocr_noise_garbled_detection_ignores_short_text(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        # Fewer than window_size (12) CJK chars → cannot even form one window.
+        short_garbled = "九戎所均勞"
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    f"<html><body><p>{short_garbled}</p></body></html>",
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        garbled_findings = [
+            item for item in findings if "garbled CJK" in item.get("token", "")
+        ]
+        self.assertEqual(
+            [], garbled_findings,
+            f"Short text should not trigger garbled detection, got: {garbled_findings}",
+        )
+
     def test_validate_epub_no_ocr_noise_reports_truncated_finding_count(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "validate_epub_no_ocr_noise"))

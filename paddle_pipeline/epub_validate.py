@@ -8,7 +8,11 @@ from typing import Any, Dict, List
 
 from .config import EPUB_STRUCTURAL_FILES, HTML_TABLE_PATTERN, OCR_NOISE_PATTERNS
 from .config import epub  # Optional dependency, checked at runtime
-from .ocr_noise import is_dotted_numeric_ocr_table, is_numeric_only_ocr_table
+from .ocr_noise import (
+    find_garbled_cjk_in_epub,
+    is_dotted_numeric_ocr_table,
+    is_numeric_only_ocr_table,
+)
 from .toc_retarget import ensure_toc_targets_start_pages
 
 
@@ -52,6 +56,13 @@ def scan_epub_for_ocr_noise(epub_path: str) -> List[Dict[str, Any]]:
                     "token": "dotted numeric OCR table",
                     "count": dotted_table_count,
                 })
+
+    # Garbled CJK text detection (self-calibrating bigram model).
+    garbled_findings = find_garbled_cjk_in_epub(
+        epub_path, EPUB_STRUCTURAL_FILES,
+    )
+    findings.extend(garbled_findings)
+
     return findings
 
 

@@ -3,11 +3,142 @@
 import html
 import re
 
+from collections import Counter
+from typing import Dict, List
+
 from .config import (
     DOTTED_NUMERIC_TOKEN_PATTERN,
     DOWNARROW_PROSE_SEPARATOR_PATTERN,
     HTML_TABLE_PATTERN,
 )
+
+
+# --- Garbled CJK text detection (self-calibrating bigram model) ---
+# Detects OCR-hallucinated Chinese text by finding character spans whose
+# bigrams are almost entirely singletons (appearing nowhere else in the book).
+# Natural text re-uses common character transitions; garbled text does not.
+
+_GARBLED_WINDOW_SIZE = 12
+_GARBLED_MIN_SINGLETONS = 10  # singletons out of (window_size - 1) bigrams
+_GARBLED_MIN_CONSECUTIVE = 5  # consecutive flagged windows to form a span
+
+
+def _build_cjk_bigram_model(cjk_chars: List[str]) -> Dict[str, int]:
+    """Build a character-bigram frequency Counter from a list of CJK characters."""
+    bigrams = [
+        cjk_chars[i] + cjk_chars[i + 1]
+        for i in range(len(cjk_chars) - 1)
+    ]
+    return Counter(bigrams)
+
+
+def _scan_text_for_garbled_cjk_spans(
+    plain_text: str,
+    bigram_freq: Dict[str, int],
+) -> List[str]:
+    """Return garbled-CJK spans found in *plain_text* using a pre-built bigram model.
+
+    A sliding window flags positions where nearly all character bigrams are
+    singletons (frequency == 1).  Contiguous flagged windows are merged into
+    spans and returned when the run is long enough.
+    """
+    chars = re.findall(r"[一-鿿]", plain_text)
+    w = _GARBLED_WINDOW_SIZE
+    if len(chars) < w:
+        return []
+
+    # Flag each window position.
+    flagged = []
+    for i in range(len(chars) - w + 1):
+        window = chars[i : i + w]
+        window_bigrams = [
+            window[j] + window[j + 1] for j in range(len(window) - 1)
+        ]
+        singletons = sum(
+            1 for bg in window_bigrams if bigram_freq.get(bg, 0) == 1
+        )
+        flagged.append(singletons >= _GARBLED_MIN_SINGLETONS)
+
+    # Merge consecutive flagged windows into spans.
+    spans: List[str] = []
+    run_start: int | None = None
+    for i, f in enumerate(flagged):
+        if f and run_start is None:
+            run_start = i
+        elif not f and run_start is not None:
+            run_len = i - run_start
+            if run_len >= _GARBLED_MIN_CONSECUTIVE:
+                spans.append("".join(chars[run_start : i + w - 1]))
+            run_start = None
+    if run_start is not None:
+        run_len = len(flagged) - run_start
+        if run_len >= _GARBLED_MIN_CONSECUTIVE:
+            spans.append("".join(chars[run_start:]))
+
+    return spans
+
+
+def _strip_html_tags(html_text: str) -> str:
+    """Remove HTML tags and decode entities, returning plain text."""
+    plain = re.sub(r"(?is)<[^>]+>", " ", html_text)
+    plain = html.unescape(plain)
+    return plain
+
+
+def find_garbled_cjk_in_epub(
+    epub_path: str,
+    structural_files: set,
+) -> List[Dict]:
+    """Scan an EPUB for garbled CJK text spans using self-calibrating bigram analysis.
+
+    Builds a character-bigram frequency model from the full book text, then
+    scans each content file for spans where nearly all bigrams are singletons
+    (appearing nowhere else in the book).  Such spans are likely OCR
+    hallucinations.
+
+    Returns a list of finding dicts with keys ``file``, ``token``, and ``count``,
+    suitable for consumption by the OCR-noise validation pipeline.
+    """
+    import os
+    import zipfile
+
+    # First pass: collect all CJK text from content files.
+    all_cjk: List[str] = []
+    file_texts: Dict[str, str] = {}
+    with zipfile.ZipFile(epub_path) as archive:
+        for name in archive.namelist():
+            lower = name.lower()
+            if os.path.basename(lower) in structural_files:
+                continue
+            if not lower.endswith((".xhtml", ".html")):
+                continue
+            html_content = archive.read(name).decode("utf-8", "ignore")
+            plain = _strip_html_tags(html_content)
+            file_texts[name] = plain
+            all_cjk.extend(re.findall(r"[一-鿿]", plain))
+
+    if not all_cjk:
+        return []
+
+    # Build self-calibrating bigram model from the full book text.
+    bigram_freq = _build_cjk_bigram_model(all_cjk)
+
+    # Second pass: scan each file for garbled spans.
+    findings: List[Dict] = []
+    for name, text in file_texts.items():
+        spans = _scan_text_for_garbled_cjk_spans(text, bigram_freq)
+        if spans:
+            findings.append({
+                "file": name,
+                "token": (
+                    f"potential garbled CJK text ({len(spans)} span"
+                    + ("s" if len(spans) > 1 else "")
+                    + ")"
+                ),
+                "count": len(spans),
+            })
+
+    return findings
 
 
 def is_numeric_only_ocr_table(table_html: str) -> bool:
