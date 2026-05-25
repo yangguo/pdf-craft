@@ -25,6 +25,8 @@ from .metadata import (
     filter_heading_candidates,
     review_toc_interactive,
 )
+from .page_image_fallback import apply_page_image_fallbacks
+from .page_order_repair import repair_page_order_by_printed_numbers
 from .paddle_api import (
     check_dependencies,
     parse_pdf_chunk,
@@ -190,6 +192,18 @@ def main():
 
         if pbar is not None:
             pbar.close()
+
+        # Step 2.25: Render whole-page fallbacks for visual pages Paddle did not
+        # expose as image assets (for example rotated genealogy diagrams).
+        # NOTE: This runs before page order repair. Visual pages rarely carry
+        # printed page numbers, but if they do, the fallback image may end up
+        # at the wrong position after repair_page_order_by_printed_numbers swaps pages.
+        apply_page_image_fallbacks(input_path, results, image_dir)
+
+        # Step 2.35: Repair scanner page-order inversions before TOC detection
+        # and chapter splitting. Some scans alternate adjacent printed pages
+        # (e.g. 257, 256), while OCR results preserve PDF physical order.
+        repair_page_order_by_printed_numbers(input_path, results)
 
         # Step 2.5: Metadata extraction
         default_title = os.path.splitext(os.path.basename(input_path))[0]

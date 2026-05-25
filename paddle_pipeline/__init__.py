@@ -30,6 +30,8 @@ from .footnotes import (
     link_page_footnote_references,
 )
 from .ocr_noise import clean_ocr_noise
+from .page_image_fallback import apply_page_image_fallbacks
+from .page_order_repair import repair_page_order_by_printed_numbers
 from .paddle_api import check_dependencies
 from .mineru_api import parse_pdf_chunk as parse_pdf_chunk_mineru
 from .mineru_api import split_pdf as split_pdf_mineru
@@ -37,6 +39,7 @@ from .toc_retarget import ensure_toc_targets_start_pages
 
 __all__ = [
     "main",
+    "apply_page_image_fallbacks",
     "check_dependencies",
     "clean_ocr_noise",
     "create_epub",
@@ -46,6 +49,7 @@ __all__ = [
     "link_page_footnote_references",
     "parse_pdf_chunk_mineru",
     "scan_epub_for_ocr_noise",
+    "repair_page_order_by_printed_numbers",
     "split_pdf_mineru",
     "validate_epub_no_ocr_noise",
 ]

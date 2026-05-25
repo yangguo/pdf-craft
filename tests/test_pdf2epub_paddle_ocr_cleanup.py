@@ -15,6 +15,13 @@ def _load_script_module():
     return paddle_pipeline
 
 
+def _load_fresh_script_module():
+    for module_name in list(sys.modules):
+        if module_name == "paddle_pipeline" or module_name.startswith("paddle_pipeline."):
+            del sys.modules[module_name]
+    return _load_script_module()
+
+
 class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
     def test_clean_ocr_noise_preserves_display_array_and_keeps_prose(self):
         mod = _load_script_module()
@@ -1174,6 +1181,195 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
             self.assertFalse(output_path.exists())
 
+    def test_apply_page_image_fallbacks_renders_sparse_family_tree_page(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "apply_page_image_fallbacks"))
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "## 家 系 圖",
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        class FakePixmap:
+            def save(self, path):
+                Path(path).write_bytes(b"fake png")
+
+        class FakePage:
+            def get_pixmap(self, matrix=None, clip=None, alpha=False):
+                return FakePixmap()
+
+        class FakeDoc:
+            page_count = 1
+
+            def __getitem__(self, index):
+                if index != 0:
+                    raise IndexError(index)
+                return FakePage()
+
+            def close(self):
+                pass
+
+        fake_fitz = SimpleNamespace(
+            open=lambda _path: FakeDoc(),
+            Matrix=lambda _x, _y: object(),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            image_dir = Path(td) / "images"
+            with mock.patch.object(mod.page_image_fallback, "fitz", fake_fitz):
+                count = mod.apply_page_image_fallbacks(
+                    "source.pdf",
+                    results,
+                    str(image_dir),
+                )
+
+            rel_path = "imgs/page_fallback_0001.png"
+            self.assertEqual(1, count)
+            markdown = results[0]["result"]["layoutParsingResults"][0]["markdown"]
+            self.assertEqual(
+                "",
+                markdown["images"][rel_path],
+            )
+            self.assertIn(
+                f'<img src="{rel_path}" alt="家 系 圖" width="100%" />',
+                markdown["text"],
+            )
+            self.assertEqual(b"fake png", (image_dir / rel_path).read_bytes())
+
+    def test_repair_page_order_by_printed_numbers_swaps_adjacent_inversion(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "repair_page_order_by_printed_numbers"))
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {"markdown": {"text": "page 257 body"}},
+                        {"markdown": {"text": "page 256 body"}},
+                        {"markdown": {"text": "page 259 body"}},
+                        {"markdown": {"text": "page 258 body"}},
+                    ]
+                }
+            }
+        ]
+
+        class FakePage:
+            def __init__(self, text):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class FakeDoc:
+            def __init__(self):
+                self.pages = [
+                    FakePage("• 257 •"),
+                    FakePage("• 256 •"),
+                    FakePage("• 259 •"),
+                    FakePage("• 258 •"),
+                ]
+                self.page_count = len(self.pages)
+
+            def __getitem__(self, index):
+                return self.pages[index]
+
+            def close(self):
+                pass
+
+        fake_fitz = SimpleNamespace(open=lambda _path: FakeDoc())
+
+        with mock.patch.object(mod.page_order_repair, "fitz", fake_fitz):
+            swaps = mod.repair_page_order_by_printed_numbers("source.pdf", results)
+
+        pages = results[0]["result"]["layoutParsingResults"]
+        self.assertEqual(2, swaps)
+        self.assertEqual(
+            ["page 256 body", "page 257 body", "page 258 body", "page 259 body"],
+            [page["markdown"]["text"] for page in pages],
+        )
+
+    def test_repair_page_order_by_printed_numbers_infers_systematic_pair_inversion(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "repair_page_order_by_printed_numbers"))
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {"markdown": {"text": "front matter"}},
+                        {"markdown": {"text": "page 1 body"}},
+                        {"markdown": {"text": "blank verso"}},
+                        {"markdown": {"text": "page 3 body"}},
+                        {"markdown": {"text": "page 2 body"}},
+                        {"markdown": {"text": "page 5 body"}},
+                        {"markdown": {"text": "page 4 body"}},
+                        {"markdown": {"text": "page 7 body"}},
+                        {"markdown": {"text": "page 6 body"}},
+                    ]
+                }
+            }
+        ]
+
+        class FakePage:
+            def __init__(self, text):
+                self._text = text
+
+            def get_text(self):
+                return self._text
+
+        class FakeDoc:
+            def __init__(self):
+                self.pages = [
+                    FakePage(""),
+                    FakePage("• 1 •"),
+                    FakePage(""),
+                    FakePage(""),
+                    FakePage(""),
+                    FakePage("• 5 •"),
+                    FakePage("• 4 •"),
+                    FakePage("• 7 •"),
+                    FakePage("• 6 •"),
+                ]
+                self.page_count = len(self.pages)
+
+            def __getitem__(self, index):
+                return self.pages[index]
+
+            def close(self):
+                pass
+
+        fake_fitz = SimpleNamespace(open=lambda _path: FakeDoc())
+
+        with mock.patch.object(mod.page_order_repair, "fitz", fake_fitz):
+            swaps = mod.repair_page_order_by_printed_numbers("source.pdf", results)
+
+        pages = results[0]["result"]["layoutParsingResults"]
+        self.assertEqual(3, swaps)
+        self.assertEqual(
+            [
+                "front matter",
+                "page 1 body",
+                "blank verso",
+                "page 2 body",
+                "page 3 body",
+                "page 4 body",
+                "page 5 body",
+                "page 6 body",
+                "page 7 body",
+            ],
+            [page["markdown"]["text"] for page in pages],
+        )
+
     def test_invalid_numeric_env_values_fall_back_to_defaults(self):
         env_overrides = {
             "PADDLE_CHUNK_SIZE": "abc",
@@ -1189,7 +1385,7 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         clean_env.update(env_overrides)
 
         with mock.patch.dict(os.environ, clean_env, clear=True):
-            mod = _load_script_module()
+            mod = _load_fresh_script_module()
 
         self.assertEqual(5, mod.CHUNK_SIZE)
         self.assertEqual(600, mod.API_TIMEOUT_SECONDS)
@@ -1211,7 +1407,7 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         clean_env.update(env_overrides)
 
         with mock.patch.dict(os.environ, clean_env, clear=True):
-            mod = _load_script_module()
+            mod = _load_fresh_script_module()
 
         self.assertEqual(5, mod.CHUNK_SIZE)
         self.assertEqual(600, mod.API_TIMEOUT_SECONDS)
