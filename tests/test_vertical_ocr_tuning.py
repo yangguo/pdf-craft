@@ -104,17 +104,19 @@ class TestMineruVerticalTuning(unittest.TestCase):
 
 
 class TestTraditionalSentenceStarters(unittest.TestCase):
-    def test_preserves_paragraph_break_for_yu_sentence_start(self):
+    def test_preserves_paragraph_break_for_traditional_sentence_starters(self):
         from paddle_pipeline.mineru_api import _clean_mineru_markdown
 
-        md = (
-            "前面一段結尾沒有標點\n\n"
-            "於是新的段落開始了\n"
-        )
+        for starter in ("於", "其", "吾", "余", "餘", "蓋", "嗟", "夫", "凡"):
+            with self.subTest(starter=starter):
+                md = (
+                    "前面一段結尾沒有標點\n\n"
+                    f"{starter}是新的段落開始了\n"
+                )
 
-        result = _clean_mineru_markdown(md)
+                result = _clean_mineru_markdown(md)
 
-        self.assertIn("沒有標點\n\n於是新的段落開始了", result)
+                self.assertIn(f"沒有標點\n\n{starter}是新的段落開始了", result)
 
 
 if __name__ == "__main__":
