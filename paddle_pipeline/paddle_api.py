@@ -2,7 +2,6 @@
 
 import json
 import os
-import sys
 import tempfile
 import time
 
@@ -191,7 +190,7 @@ def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
                 try:
                     page_result = json.loads(line).get("result", {})
                 except json.JSONDecodeError:
-                    print(f"[!] Skipping malformed JSONL line")
+                    print("[!] Skipping malformed JSONL line")
                     continue
                 for page_res in page_result.get("layoutParsingResults", []):
                     layout_results.append(page_res)

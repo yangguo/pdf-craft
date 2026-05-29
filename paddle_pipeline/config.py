@@ -3,8 +3,6 @@
 import os
 import re
 
-from typing import List, Dict, Any
-
 # Optional third-party dependencies – checked at runtime via check_dependencies()
 try:
     import requests
