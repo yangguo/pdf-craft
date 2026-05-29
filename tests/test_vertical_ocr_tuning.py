@@ -39,6 +39,7 @@ class TestPaddleVerticalTuning(unittest.TestCase):
 
     def test_split_pdf_adds_top_and_bottom_padding(self):
         from paddle_pipeline import paddle_api
+        from unittest import mock
 
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "source.pdf"
@@ -47,7 +48,9 @@ class TestPaddleVerticalTuning(unittest.TestCase):
             doc.save(src)
             doc.close()
 
-            chunk_path = paddle_api.split_pdf(str(src), chunk_size=1)[0]
+            # Patch fitz in paddle_api module to use the real fitz
+            with mock.patch.object(paddle_api, "fitz", fitz):
+                chunk_path = paddle_api.split_pdf(str(src), chunk_size=1)[0]
 
             chunk_doc = fitz.open(chunk_path)
             try:
@@ -83,6 +86,7 @@ class TestMineruVerticalTuning(unittest.TestCase):
 
     def test_split_pdf_adds_left_top_and_bottom_padding(self):
         from paddle_pipeline import mineru_api
+        from unittest import mock
 
         with tempfile.TemporaryDirectory() as td:
             src = Path(td) / "source.pdf"
@@ -91,7 +95,9 @@ class TestMineruVerticalTuning(unittest.TestCase):
             doc.save(src)
             doc.close()
 
-            chunk_path = mineru_api.split_pdf(str(src), chunk_size=1)[0]
+            # Patch fitz in mineru_api module to use the real fitz
+            with mock.patch.object(mineru_api, "fitz", fitz):
+                chunk_path = mineru_api.split_pdf(str(src), chunk_size=1)[0]
 
             chunk_doc = fitz.open(chunk_path)
             try:
