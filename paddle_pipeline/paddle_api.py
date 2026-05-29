@@ -16,6 +16,27 @@ from .config import (
     MODEL_VERSION,
     PADDLE_MAX_POLL_TIME,
     PADDLE_POLL_INTERVAL,
+    PADDLE_FORCE_ROTATE,
+    PADDLE_LAYOUT_MERGE_BBOXES_MODE,
+    PADDLE_LAYOUT_NMS,
+    PADDLE_LAYOUT_SHAPE_MODE,
+    PADDLE_LAYOUT_THRESHOLD,
+    PADDLE_LAYOUT_UNCLIP_RATIO,
+    PADDLE_MAX_PIXELS,
+    PADDLE_MIN_PIXELS,
+    PADDLE_PAGE_PADDING_BOTTOM,
+    PADDLE_PAGE_PADDING_TOP,
+    PADDLE_PAGE_PADDING_X,
+    PADDLE_PRETTIFY_MARKDOWN,
+    PADDLE_PROMPT_LABEL,
+    PADDLE_REPETITION_PENALTY,
+    PADDLE_TEMPERATURE,
+    PADDLE_TOP_P,
+    PADDLE_USE_CHART_RECOGNITION,
+    PADDLE_USE_DOC_ORIENTATION_CLASSIFY,
+    PADDLE_USE_DOC_UNWARPING,
+    PADDLE_USE_LAYOUT_DETECTION,
+    PADDLE_VISUALIZE,
     epub,      # Optional dependency
     fitz,      # Optional dependency
     requests,  # Optional dependency
@@ -39,7 +60,11 @@ def check_dependencies():
     return True
 
 
-def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
+def split_pdf(
+    file_path: str,
+    chunk_size: int = CHUNK_SIZE,
+    options: Dict[str, Any] | None = None,
+) -> List[str]:
     """
     Splits a PDF into chunks of `chunk_size` pages.
     Returns a list of paths to the temporary chunk files.
@@ -63,17 +88,63 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
         chunk_doc = fitz.open()
         chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
 
-        # Add bottom padding to prevent OCR model from cropping text at
-        # the page edge (observed on scanned books where the last line
-        # sits very close to the physical page bottom).
         for page in chunk_doc:
+            force_rotate = PADDLE_FORCE_ROTATE
+            pad_x_ratio = PADDLE_PAGE_PADDING_X
+            pad_top_ratio = PADDLE_PAGE_PADDING_TOP
+            pad_bottom_ratio = PADDLE_PAGE_PADDING_BOTTOM
+
+            if options:
+                if isinstance(options.get("force_rotate"), int):
+                    force_rotate = options["force_rotate"]
+                if isinstance(options.get("padding_x"), (int, float)):
+                    pad_x_ratio = float(options["padding_x"])
+                if isinstance(options.get("padding_top"), (int, float)):
+                    pad_top_ratio = float(options["padding_top"])
+                if isinstance(options.get("padding_bottom"), (int, float)):
+                    pad_bottom_ratio = float(options["padding_bottom"])
+
+            if force_rotate:
+                page.set_rotation((page.rotation + force_rotate) % 360)
+
             rect = page.rect
-            new_h = rect.height * 1.05
-            page.set_mediabox(fitz.Rect(0, 0, rect.width, new_h))
-            page.draw_rect(
-                fitz.Rect(0, rect.height, rect.width, new_h),
-                color=None, fill=(1, 1, 1),
-            )
+            pad_x = rect.width * max(0.0, pad_x_ratio)
+            pad_top = rect.height * max(0.0, pad_top_ratio)
+            pad_bottom = rect.height * max(0.0, pad_bottom_ratio)
+
+            if pad_x or pad_top or pad_bottom:
+                page.set_mediabox(
+                    fitz.Rect(
+                        -pad_x,
+                        -pad_top,
+                        rect.width + pad_x,
+                        rect.height + pad_bottom,
+                    )
+                )
+
+                if pad_x:
+                    page.draw_rect(
+                        fitz.Rect(-pad_x, -pad_top, 0, rect.height + pad_bottom),
+                        color=None,
+                        fill=(1, 1, 1),
+                    )
+                    page.draw_rect(
+                        fitz.Rect(rect.width, -pad_top, rect.width + pad_x, rect.height + pad_bottom),
+                        color=None,
+                        fill=(1, 1, 1),
+                    )
+                if pad_top:
+                    page.draw_rect(
+                        fitz.Rect(0, -pad_top, rect.width, 0),
+                        color=None,
+                        fill=(1, 1, 1),
+                    )
+                if pad_bottom:
+                    page.draw_rect(
+                        fitz.Rect(0, rect.height, rect.width, rect.height + pad_bottom),
+                        color=None,
+                        fill=(1, 1, 1),
+                    )
 
         chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
         chunk_doc.save(chunk_filename)
@@ -84,7 +155,43 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     return chunk_paths
 
 
-def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
+def build_paddle_optional_payload(overrides: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "useDocOrientationClassify": PADDLE_USE_DOC_ORIENTATION_CLASSIFY,
+        "useDocUnwarping": PADDLE_USE_DOC_UNWARPING,
+        "useChartRecognition": PADDLE_USE_CHART_RECOGNITION,
+        "layoutThreshold": PADDLE_LAYOUT_THRESHOLD,
+        "temperature": PADDLE_TEMPERATURE,
+        "repetitionPenalty": PADDLE_REPETITION_PENALTY,
+        "topP": PADDLE_TOP_P,
+    }
+
+    def set_opt(key: str, value: Any) -> None:
+        if value is not None:
+            payload[key] = value
+
+    set_opt("useLayoutDetection", PADDLE_USE_LAYOUT_DETECTION)
+    set_opt("layoutNms", PADDLE_LAYOUT_NMS)
+    set_opt("layoutUnclipRatio", PADDLE_LAYOUT_UNCLIP_RATIO)
+    set_opt("layoutMergeBboxesMode", PADDLE_LAYOUT_MERGE_BBOXES_MODE)
+    set_opt("layoutShapeMode", PADDLE_LAYOUT_SHAPE_MODE)
+    set_opt("promptLabel", PADDLE_PROMPT_LABEL)
+    set_opt("minPixels", PADDLE_MIN_PIXELS)
+    set_opt("maxPixels", PADDLE_MAX_PIXELS)
+    set_opt("prettifyMarkdown", PADDLE_PRETTIFY_MARKDOWN)
+    set_opt("visualize", PADDLE_VISUALIZE)
+
+    if overrides:
+        payload.update(overrides)
+
+    return payload
+
+
+def parse_pdf_chunk(
+    chunk_path: str,
+    token: str,
+    optional_payload_overrides: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
     """
     Sends a PDF chunk to the PaddleOCR async job API and returns the parsed result.
     Submits a job, polls until completion, then downloads and aggregates JSONL results.
@@ -93,15 +200,7 @@ def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    optional_payload = {
-        "useDocOrientationClassify": True,
-        "useDocUnwarping": True,
-        "useChartRecognition": False,
-        "layoutThreshold": 0.5,
-        "temperature": 0.2,
-        "repetitionPenalty": 1.2,
-        "topP": 0.85,
-    }
+    optional_payload = build_paddle_optional_payload(optional_payload_overrides)
 
     data = {
         "model": MODEL_VERSION,
@@ -200,4 +299,3 @@ def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
                 f"[!] Unexpected error processing chunk {os.path.basename(chunk_path)}: {e}"
             )
             return None
-

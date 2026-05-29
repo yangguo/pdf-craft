@@ -39,6 +39,14 @@ def main():
     if not check_dependencies():
         return
 
+    def _parse_bool_string(value: str) -> bool:
+        value = value.strip().lower()
+        if value in {"1", "true", "yes", "y", "on"}:
+            return True
+        if value in {"0", "false", "no", "n", "off"}:
+            return False
+        raise argparse.ArgumentTypeError("expected a boolean value")
+
     parser = argparse.ArgumentParser(description="Scanned PDF to Epub Converter")
     parser.add_argument("input_pdf", help="Path to input PDF file")
     parser.add_argument(
@@ -60,6 +68,96 @@ def main():
                         help="Skip heading detection; produce single-chapter EPUB")
     parser.add_argument("--api", choices=["paddle", "mineru"], default="paddle",
                         help="OCR API backend to use (default: paddle)")
+    parser.add_argument(
+        "--ocr-preset",
+        choices=["default", "vertical-zh-hant"],
+        default="default",
+        help="OCR tuning preset (default: default)",
+    )
+    parser.add_argument(
+        "--paddle-use-layout-detection",
+        type=_parse_bool_string,
+        default=None,
+        help="Paddle optionalPayload.useLayoutDetection (true/false)",
+    )
+    parser.add_argument(
+        "--paddle-layout-shape-mode",
+        choices=["rect", "quad", "poly", "auto"],
+        default=None,
+        help="Paddle optionalPayload.layoutShapeMode",
+    )
+    parser.add_argument(
+        "--paddle-layout-merge-bboxes-mode",
+        choices=["large", "small", "union"],
+        default=None,
+        help="Paddle optionalPayload.layoutMergeBboxesMode",
+    )
+    parser.add_argument(
+        "--paddle-temperature",
+        type=float,
+        default=None,
+        help="Paddle optionalPayload.temperature",
+    )
+    parser.add_argument(
+        "--paddle-top-p",
+        type=float,
+        default=None,
+        help="Paddle optionalPayload.topP",
+    )
+    parser.add_argument(
+        "--paddle-repetition-penalty",
+        type=float,
+        default=None,
+        help="Paddle optionalPayload.repetitionPenalty",
+    )
+    parser.add_argument(
+        "--paddle-min-pixels",
+        type=int,
+        default=None,
+        help="Paddle optionalPayload.minPixels",
+    )
+    parser.add_argument(
+        "--paddle-max-pixels",
+        type=int,
+        default=None,
+        help="Paddle optionalPayload.maxPixels",
+    )
+    parser.add_argument(
+        "--paddle-prettify-markdown",
+        type=_parse_bool_string,
+        default=None,
+        help="Paddle optionalPayload.prettifyMarkdown (true/false)",
+    )
+    parser.add_argument(
+        "--paddle-visualize",
+        type=_parse_bool_string,
+        default=None,
+        help="Paddle optionalPayload.visualize (true/false)",
+    )
+    parser.add_argument(
+        "--paddle-force-rotate",
+        type=int,
+        choices=[0, 90, 180, 270],
+        default=None,
+        help="Rotate pages before OCR (0/90/180/270)",
+    )
+    parser.add_argument(
+        "--paddle-padding-x",
+        type=float,
+        default=None,
+        help="Horizontal page padding ratio (applied to both left and right)",
+    )
+    parser.add_argument(
+        "--paddle-padding-y",
+        type=float,
+        default=None,
+        help="Vertical page padding ratio (applied to both top and bottom)",
+    )
+    parser.add_argument(
+        "--mineru-language",
+        default=None,
+        help="MinerU OCR language (e.g. chinese_cht, ch_server)",
+    )
     args = parser.parse_args()
 
     input_path = args.input_pdf
@@ -103,12 +201,54 @@ def main():
     chunk_temp_dir = None
 
     try:
+        paddle_optional_payload_overrides = {}
+        paddle_split_options = {}
+        mineru_options = {}
+
+        if args.ocr_preset == "vertical-zh-hant":
+            paddle_optional_payload_overrides.update(
+                {"temperature": 0.1, "topP": 0.75, "useLayoutDetection": True}
+            )
+            mineru_options["language"] = "chinese_cht"
+
+        if args.paddle_use_layout_detection is not None:
+            paddle_optional_payload_overrides["useLayoutDetection"] = args.paddle_use_layout_detection
+        if args.paddle_layout_shape_mode is not None:
+            paddle_optional_payload_overrides["layoutShapeMode"] = args.paddle_layout_shape_mode
+        if args.paddle_layout_merge_bboxes_mode is not None:
+            paddle_optional_payload_overrides["layoutMergeBboxesMode"] = args.paddle_layout_merge_bboxes_mode
+        if args.paddle_temperature is not None:
+            paddle_optional_payload_overrides["temperature"] = args.paddle_temperature
+        if args.paddle_top_p is not None:
+            paddle_optional_payload_overrides["topP"] = args.paddle_top_p
+        if args.paddle_repetition_penalty is not None:
+            paddle_optional_payload_overrides["repetitionPenalty"] = args.paddle_repetition_penalty
+        if args.paddle_min_pixels is not None:
+            paddle_optional_payload_overrides["minPixels"] = args.paddle_min_pixels
+        if args.paddle_max_pixels is not None:
+            paddle_optional_payload_overrides["maxPixels"] = args.paddle_max_pixels
+        if args.paddle_prettify_markdown is not None:
+            paddle_optional_payload_overrides["prettifyMarkdown"] = args.paddle_prettify_markdown
+        if args.paddle_visualize is not None:
+            paddle_optional_payload_overrides["visualize"] = args.paddle_visualize
+
+        if args.paddle_force_rotate is not None:
+            paddle_split_options["force_rotate"] = args.paddle_force_rotate
+        if args.paddle_padding_x is not None:
+            paddle_split_options["padding_x"] = args.paddle_padding_x
+        if args.paddle_padding_y is not None:
+            paddle_split_options["padding_top"] = args.paddle_padding_y
+            paddle_split_options["padding_bottom"] = args.paddle_padding_y
+
+        if args.mineru_language is not None and args.mineru_language.strip():
+            mineru_options["language"] = args.mineru_language.strip()
+
         # Step 1: Chunking
         print("[-] Step 1: Splitting PDF...")
         if args.api == "mineru":
             chunk_paths = mineru_api.split_pdf(input_path)
         else:
-            chunk_paths = split_pdf(input_path)
+            chunk_paths = split_pdf(input_path, options=paddle_split_options)
         # split_pdf stores chunks in a fresh mkdtemp; capture it for cleanup
         chunk_temp_dir = os.path.dirname(chunk_paths[0]) if chunk_paths else None
 
@@ -125,7 +265,6 @@ def main():
         total = len(chunk_paths)
         api_label = "MinerU" if args.api == "mineru" else "PaddleOCR"
         api_token = MINERU_API_TOKEN if args.api == "mineru" else API_TOKEN
-        parse_func = mineru_api.parse_pdf_chunk if args.api == "mineru" else parse_pdf_chunk
         print(f"[-] Step 2: Processing {total} chunks via {api_label} API...")
         if tqdm is not None:
             pbar = tqdm(total=total, unit="chunk", ncols=80,
@@ -157,7 +296,10 @@ def main():
 
                 _MAX_RETRIES = 3
                 for attempt in range(1, _MAX_RETRIES + 1):
-                    res = parse_func(chunk, api_token)
+                    if args.api == "mineru":
+                        res = mineru_api.parse_pdf_chunk(chunk, api_token, mineru_options)
+                    else:
+                        res = parse_pdf_chunk(chunk, api_token, paddle_optional_payload_overrides)
                     if res:
                         break
                     if attempt < _MAX_RETRIES:

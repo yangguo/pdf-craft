@@ -29,6 +29,15 @@ python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc
 # MinerU（更快，20页/块）
 python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc --api mineru
 
+# 竖排繁体推荐：预设（同时影响 Paddle/MinerU 的默认调参）
+python pdf2epub_paddle.py book.pdf --title "书名" --auto-toc --ocr-preset vertical-zh-hant
+
+# 竖排繁体推荐：MinerU 指定繁体语言模型
+python pdf2epub_paddle.py book.pdf --title "书名" --auto-toc --api mineru --mineru-language chinese_cht
+
+# 竖排繁体推荐：Paddle 强制旋转（尝试 90 或 270）
+python pdf2epub_paddle.py book.pdf --title "书名" --auto-toc --paddle-force-rotate 90
+
 # 基本用法 — 交互式输入书名和作者
 python pdf2epub_paddle.py book.pdf
 
@@ -48,11 +57,19 @@ python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 | `--author` | 作者名 |
 | `--language` | EPUB 语言标签（默认：`zh-Hant`） |
 | `--api` | OCR 后端：`paddle`（默认）或 `mineru` |
+| `--ocr-preset` | OCR 调参预设：`default` 或 `vertical-zh-hant` |
 | `--auto-toc` | 跳过目录审查，直接使用自动检测的章节 |
 | `--no-toc` | 不拆分章节 — 整本书作为一个章节 |
 | `--strict-ocr-noise` | 输出中残留 OCR 噪声时中断报错 |
 | `--cover-max-edge` | 封面图片最大边长像素（默认：2000） |
 | `--cover-quality` | JPEG 封面质量 1–100（默认：82） |
+| `--mineru-language` | MinerU OCR 语言（如 `chinese_cht`、`ch_server`） |
+| `--paddle-force-rotate` | Paddle 送 OCR 前旋转页面（`0/90/180/270`） |
+| `--paddle-padding-x` | Paddle 页面左右 padding 比例（装订侧裁切可调大） |
+| `--paddle-padding-y` | Paddle 页面上下 padding 比例 |
+| `--paddle-use-layout-detection` | Paddle 版面区域检测与排序（true/false） |
+| `--paddle-temperature` | Paddle 识别稳定性（越低越保守） |
+| `--paddle-top-p` | Paddle 结果可信范围（越低越保守） |
 
 ### MinerU 配置
 
@@ -63,6 +80,7 @@ python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 | `MINERU_POLL_INTERVAL` | `5` | 结果轮询间隔（秒） |
 | `MINERU_MAX_POLL_TIME` | `600` | 单批次最大等待时间（秒） |
 | `MINERU_VERIFY_SSL` | `1` | 设为 `0` 关闭 SSL 验证 |
+| `MINERU_LANGUAGE` | `ch_server` | OCR 语言（竖排繁体可试 `chinese_cht`） |
 
 ### 断点续传
 

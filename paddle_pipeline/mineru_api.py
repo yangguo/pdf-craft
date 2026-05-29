@@ -20,6 +20,7 @@ from .config import (
     MINERU_API_URL,
     MINERU_API_TOKEN,
     MINERU_CHUNK_SIZE,
+    MINERU_LANGUAGE,
     MINERU_MAX_POLL_TIME,
     MINERU_MODEL_VERSION,
     MINERU_POLL_INTERVAL,
@@ -83,7 +84,11 @@ def _api_headers(token: str) -> Dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
 
 
-def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any] | None:
+def parse_pdf_chunk(
+    chunk_path: str,
+    token: str | None = None,
+    options: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
     """Process a PDF chunk through the MinerU v4 API.
 
     1. Request signed upload URL + PUT file
@@ -98,6 +103,10 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
     if not token:
         print("[!] MINERU_API_TOKEN is not set.")
         return None
+
+    language = MINERU_LANGUAGE
+    if options and isinstance(options.get("language"), str) and options["language"].strip():
+        language = options["language"].strip()
 
     file_name = os.path.basename(chunk_path)
     print(f"[*] MinerU: uploading {file_name}")
@@ -118,7 +127,7 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
                     "is_ocr": True,
                     "enable_formula": False,
                     "enable_table": True,
-                    "language": "ch_server",
+                    "language": language,
                 },
                 headers=_api_headers(token),
                 timeout=60,

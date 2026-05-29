@@ -48,6 +48,94 @@ def _env_int(name: str, default: int, minimum: int | None = None) -> int:
     return parsed
 
 
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    if minimum is not None and parsed < minimum:
+        return default
+    if maximum is not None and parsed > maximum:
+        return default
+    return parsed
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _env_opt_int(name: str, minimum: int | None = None) -> int | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    if minimum is not None and parsed < minimum:
+        return None
+    return parsed
+
+
+def _env_opt_float(
+    name: str,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        return None
+    if minimum is not None and parsed < minimum:
+        return None
+    if maximum is not None and parsed > maximum:
+        return None
+    return parsed
+
+
+def _env_opt_bool(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _env_opt_str(name: str, allowed: set[str] | None = None) -> str | None:
+    value = os.getenv(name)
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if allowed is not None and value not in allowed:
+        return None
+    return value
+
+
 CHUNK_SIZE = _env_int("PADDLE_CHUNK_SIZE", 5, minimum=1)
 API_TIMEOUT_SECONDS = _env_int("PADDLE_API_TIMEOUT_SECONDS", 600, minimum=1)
 PADDLE_POLL_INTERVAL = _env_int("PADDLE_POLL_INTERVAL", 5, minimum=1)
@@ -56,8 +144,42 @@ MINERU_POLL_INTERVAL = _env_int("MINERU_POLL_INTERVAL", 5, minimum=1)
 MINERU_MAX_POLL_TIME = _env_int("MINERU_MAX_POLL_TIME", 1800, minimum=1)
 MINERU_CHUNK_SIZE = _env_int("MINERU_CHUNK_SIZE", 20, minimum=1)
 MINERU_MODEL_VERSION = os.getenv("MINERU_MODEL_VERSION", "vlm")
+MINERU_LANGUAGE = os.getenv("MINERU_LANGUAGE", "ch_server")
 DEFAULT_COVER_MAX_EDGE = _env_int("EPUB_COVER_MAX_EDGE", 2000, minimum=1)
 DEFAULT_COVER_JPEG_QUALITY = _env_int("EPUB_COVER_JPEG_QUALITY", 82, minimum=1)
+
+MODEL_VERSION = os.getenv("PADDLE_MODEL_VERSION", MODEL_VERSION)
+PADDLE_USE_DOC_ORIENTATION_CLASSIFY = _env_bool("PADDLE_USE_DOC_ORIENTATION_CLASSIFY", True)
+PADDLE_USE_DOC_UNWARPING = _env_bool("PADDLE_USE_DOC_UNWARPING", True)
+PADDLE_USE_CHART_RECOGNITION = _env_bool("PADDLE_USE_CHART_RECOGNITION", False)
+PADDLE_USE_LAYOUT_DETECTION = _env_opt_bool("PADDLE_USE_LAYOUT_DETECTION")
+PADDLE_LAYOUT_THRESHOLD = _env_float("PADDLE_LAYOUT_THRESHOLD", 0.5, minimum=0.0, maximum=1.0)
+PADDLE_LAYOUT_NMS = _env_opt_bool("PADDLE_LAYOUT_NMS")
+PADDLE_LAYOUT_UNCLIP_RATIO = _env_opt_float("PADDLE_LAYOUT_UNCLIP_RATIO", minimum=0.0)
+PADDLE_LAYOUT_MERGE_BBOXES_MODE = _env_opt_str(
+    "PADDLE_LAYOUT_MERGE_BBOXES_MODE",
+    allowed={"large", "small", "union"},
+)
+PADDLE_LAYOUT_SHAPE_MODE = _env_opt_str(
+    "PADDLE_LAYOUT_SHAPE_MODE",
+    allowed={"rect", "quad", "poly", "auto"},
+)
+PADDLE_PROMPT_LABEL = _env_opt_str(
+    "PADDLE_PROMPT_LABEL",
+    allowed={"ocr", "formula", "table", "chart"},
+)
+PADDLE_REPETITION_PENALTY = _env_float("PADDLE_REPETITION_PENALTY", 1.2, minimum=0.0)
+PADDLE_TEMPERATURE = _env_float("PADDLE_TEMPERATURE", 0.2, minimum=0.0)
+PADDLE_TOP_P = _env_float("PADDLE_TOP_P", 0.85, minimum=0.0, maximum=1.0)
+PADDLE_MIN_PIXELS = _env_opt_int("PADDLE_MIN_PIXELS", minimum=1)
+PADDLE_MAX_PIXELS = _env_opt_int("PADDLE_MAX_PIXELS", minimum=1)
+PADDLE_PRETTIFY_MARKDOWN = _env_opt_bool("PADDLE_PRETTIFY_MARKDOWN")
+PADDLE_VISUALIZE = _env_opt_bool("PADDLE_VISUALIZE")
+
+PADDLE_FORCE_ROTATE = _env_int("PADDLE_FORCE_ROTATE", 0, minimum=0)
+PADDLE_PAGE_PADDING_X = _env_float("PADDLE_PAGE_PADDING_X", 0.0, minimum=0.0)
+PADDLE_PAGE_PADDING_TOP = _env_float("PADDLE_PAGE_PADDING_TOP", 0.0, minimum=0.0)
+PADDLE_PAGE_PADDING_BOTTOM = _env_float("PADDLE_PAGE_PADDING_BOTTOM", 0.05, minimum=0.0)
 
 DOWNARROW_PROSE_SEPARATOR_PATTERN = re.compile(
     r"([㐀-鿿])\s*\$\s*\\downarrow\s*\$\s*([㐀-鿿])"
