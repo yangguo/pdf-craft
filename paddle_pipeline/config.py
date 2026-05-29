@@ -48,14 +48,67 @@ def _env_int(name: str, default: int, minimum: int | None = None) -> int:
     return parsed
 
 
+def _env_float(
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    """Parse float env vars without making import fail on bad local config."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    if minimum is not None and parsed < minimum:
+        return default
+    if maximum is not None and parsed > maximum:
+        return default
+    return parsed
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    """Parse bool-like env vars without making import fail on bad local config."""
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 CHUNK_SIZE = _env_int("PADDLE_CHUNK_SIZE", 5, minimum=1)
 API_TIMEOUT_SECONDS = _env_int("PADDLE_API_TIMEOUT_SECONDS", 600, minimum=1)
 PADDLE_POLL_INTERVAL = _env_int("PADDLE_POLL_INTERVAL", 5, minimum=1)
 PADDLE_MAX_POLL_TIME = _env_int("PADDLE_MAX_POLL_TIME", 1800, minimum=1)
+PADDLE_LAYOUT_THRESHOLD = _env_float("PADDLE_LAYOUT_THRESHOLD", 0.35, minimum=0.0, maximum=1.0)
+PADDLE_TEMPERATURE = _env_float("PADDLE_TEMPERATURE", 0.1, minimum=0.0, maximum=2.0)
+PADDLE_REPETITION_PENALTY = _env_float("PADDLE_REPETITION_PENALTY", 1.05, minimum=0.0)
+PADDLE_TOP_P = _env_float("PADDLE_TOP_P", 0.75, minimum=0.0, maximum=1.0)
+PADDLE_PAGE_TOP_PADDING_RATIO = _env_float(
+    "PADDLE_PAGE_TOP_PADDING_RATIO", 0.05, minimum=0.0, maximum=1.0
+)
+PADDLE_PAGE_BOTTOM_PADDING_RATIO = _env_float(
+    "PADDLE_PAGE_BOTTOM_PADDING_RATIO", 0.05, minimum=0.0, maximum=1.0
+)
 MINERU_POLL_INTERVAL = _env_int("MINERU_POLL_INTERVAL", 5, minimum=1)
 MINERU_MAX_POLL_TIME = _env_int("MINERU_MAX_POLL_TIME", 1800, minimum=1)
 MINERU_CHUNK_SIZE = _env_int("MINERU_CHUNK_SIZE", 20, minimum=1)
 MINERU_MODEL_VERSION = os.getenv("MINERU_MODEL_VERSION", "vlm")
+MINERU_LANGUAGE = os.getenv("MINERU_LANGUAGE", "ch_tra")
+MINERU_ENABLE_TABLE = _env_bool("MINERU_ENABLE_TABLE", False)
+MINERU_PAGE_LEFT_MARGIN_POINTS = _env_float("MINERU_PAGE_LEFT_MARGIN_POINTS", 8.0, minimum=0.0)
+MINERU_PAGE_TOP_PADDING_RATIO = _env_float(
+    "MINERU_PAGE_TOP_PADDING_RATIO", 0.05, minimum=0.0, maximum=1.0
+)
+MINERU_PAGE_BOTTOM_PADDING_RATIO = _env_float(
+    "MINERU_PAGE_BOTTOM_PADDING_RATIO", 0.05, minimum=0.0, maximum=1.0
+)
 DEFAULT_COVER_MAX_EDGE = _env_int("EPUB_COVER_MAX_EDGE", 2000, minimum=1)
 DEFAULT_COVER_JPEG_QUALITY = _env_int("EPUB_COVER_JPEG_QUALITY", 82, minimum=1)
 

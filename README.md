@@ -15,6 +15,9 @@ Copy `.env.example` to `.env` and add your API token(s):
 ```
 PADDLE_API_TOKEN=your_token_here   # for --api paddle (default)
 MINERU_API_TOKEN=your_token_here   # for --api mineru
+MINERU_LANGUAGE=ch_tra            # traditional Chinese OCR
+MINERU_ENABLE_TABLE=0             # avoid vertical text being treated as tables
+PADDLE_LAYOUT_THRESHOLD=0.35      # better retain narrow vertical text blocks
 ```
 
 Get a PaddleOCR token from [Baidu AIStudio](https://aistudio.baidu.com/) (Layout Parsing API).
@@ -61,8 +64,19 @@ python pdf2epub_paddle.py book.pdf --title "Title" --strict-ocr-noise
 | `MINERU_API_TOKEN` | — | MinerU v4 API Bearer token |
 | `MINERU_CHUNK_SIZE` | `20` | Pages per chunk (max 200) |
 | `MINERU_POLL_INTERVAL` | `5` | Seconds between batch result polls |
-| `MINERU_MAX_POLL_TIME` | `600` | Max seconds to wait for a batch |
+| `MINERU_MAX_POLL_TIME` | `1800` | Max seconds to wait for a batch |
+| `MINERU_LANGUAGE` | `ch_tra` | OCR language for traditional Chinese books |
+| `MINERU_ENABLE_TABLE` | `0` | Set to `1` only when table extraction is needed |
 | `MINERU_VERIFY_SSL` | `1` | Set to `0` to disable SSL verification |
+
+### PaddleOCR Tuning
+
+| Env Var | Default | Description |
+|---|---|---|
+| `PADDLE_LAYOUT_THRESHOLD` | `0.35` | Lower threshold to keep narrow vertical text blocks |
+| `PADDLE_TEMPERATURE` | `0.1` | Lower decoding randomness for traditional text |
+| `PADDLE_REPETITION_PENALTY` | `1.05` | Preserve legitimate repeated classical Chinese characters |
+| `PADDLE_TOP_P` | `0.75` | Narrow decoding candidates to reduce garbled output |
 
 ### Checkpointing
 

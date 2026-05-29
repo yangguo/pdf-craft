@@ -15,6 +15,9 @@ pip install pymupdf ebooklib requests python-dotenv markdown
 ```
 PADDLE_API_TOKEN=你的token   # --api paddle（默认）
 MINERU_API_TOKEN=你的token   # --api mineru
+MINERU_LANGUAGE=ch_tra      # 繁体中文 OCR
+MINERU_ENABLE_TABLE=0       # 避免把竖排文字误判成表格
+PADDLE_LAYOUT_THRESHOLD=0.35  # 保留较窄的竖排文字块
 ```
 
 在 [百度 AIStudio](https://aistudio.baidu.com/) 获取 PaddleOCR 版面解析 API token。
@@ -61,8 +64,19 @@ python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 | `MINERU_API_TOKEN` | — | MinerU v4 API Bearer token |
 | `MINERU_CHUNK_SIZE` | `20` | 每块页数（最大 200） |
 | `MINERU_POLL_INTERVAL` | `5` | 结果轮询间隔（秒） |
-| `MINERU_MAX_POLL_TIME` | `600` | 单批次最大等待时间（秒） |
+| `MINERU_MAX_POLL_TIME` | `1800` | 单批次最大等待时间（秒） |
+| `MINERU_LANGUAGE` | `ch_tra` | 繁体中文书籍的 OCR 语言 |
+| `MINERU_ENABLE_TABLE` | `0` | 仅在确实需要表格提取时设为 `1` |
 | `MINERU_VERIFY_SSL` | `1` | 设为 `0` 关闭 SSL 验证 |
+
+### PaddleOCR 调优
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `PADDLE_LAYOUT_THRESHOLD` | `0.35` | 降低阈值以保留较窄的竖排文字块 |
+| `PADDLE_TEMPERATURE` | `0.1` | 降低解码随机性，减少繁体误识别 |
+| `PADDLE_REPETITION_PENALTY` | `1.05` | 保留文言文中合理的重复字 |
+| `PADDLE_TOP_P` | `0.75` | 收窄候选范围，减少乱码 |
 
 ### 断点续传
 

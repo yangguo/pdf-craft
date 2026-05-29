@@ -20,8 +20,13 @@ from .config import (
     MINERU_API_URL,
     MINERU_API_TOKEN,
     MINERU_CHUNK_SIZE,
+    MINERU_ENABLE_TABLE,
+    MINERU_LANGUAGE,
     MINERU_MAX_POLL_TIME,
     MINERU_MODEL_VERSION,
+    MINERU_PAGE_BOTTOM_PADDING_RATIO,
+    MINERU_PAGE_LEFT_MARGIN_POINTS,
+    MINERU_PAGE_TOP_PADDING_RATIO,
     MINERU_POLL_INTERVAL,
     fitz,
     requests,
@@ -32,6 +37,18 @@ if not _VERIFY_SSL:
     import warnings as _warnings
     _warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 _API_BASE = re.sub(r"/api/v\d+/.*$", "", MINERU_API_URL)
+
+
+def _build_upload_request(file_name: str) -> Dict[str, Any]:
+    """Return the MinerU upload request tuned for vertical/traditional books."""
+    return {
+        "files": [{"name": file_name}],
+        "model_version": MINERU_MODEL_VERSION,
+        "is_ocr": True,
+        "enable_formula": False,
+        "enable_table": MINERU_ENABLE_TABLE,
+        "language": MINERU_LANGUAGE,
+    }
 
 
 def split_pdf(file_path: str, chunk_size: int | None = None) -> List[str]:
@@ -55,18 +72,27 @@ def split_pdf(file_path: str, chunk_size: int | None = None) -> List[str]:
 
         for page in chunk_doc:
             rect = page.rect
-            # Add a small left margin (book spine side) so OCR can read
-            # characters near the inner edge that would otherwise be clipped.
-            # Keep margin small (8pt) to avoid confusing the VLM layout model.
-            _lm = 8
-            new_h = rect.height * 1.05
-            page.set_mediabox(fitz.Rect(-_lm, 0, rect.width, new_h))
+            left_margin = MINERU_PAGE_LEFT_MARGIN_POINTS
+            top_padding = rect.height * MINERU_PAGE_TOP_PADDING_RATIO
+            bottom_padding = rect.height * MINERU_PAGE_BOTTOM_PADDING_RATIO
+            page.set_mediabox(
+                fitz.Rect(
+                    -left_margin,
+                    -top_padding,
+                    rect.width,
+                    rect.height + bottom_padding,
+                )
+            )
             page.draw_rect(
-                fitz.Rect(-_lm, 0, 0, new_h),
+                fitz.Rect(-left_margin, -top_padding, 0, rect.height + bottom_padding),
                 color=None, fill=(1, 1, 1),
             )
             page.draw_rect(
-                fitz.Rect(0, rect.height, rect.width, new_h),
+                fitz.Rect(0, -top_padding, rect.width, 0),
+                color=None, fill=(1, 1, 1),
+            )
+            page.draw_rect(
+                fitz.Rect(0, rect.height, rect.width, rect.height + bottom_padding),
                 color=None, fill=(1, 1, 1),
             )
 
@@ -112,14 +138,7 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
         try:
             resp = requests.post(
                 f"{_API_BASE}/api/v4/file-urls/batch",
-                json={
-                    "files": [{"name": file_name}],
-                    "model_version": MINERU_MODEL_VERSION,
-                    "is_ocr": True,
-                    "enable_formula": False,
-                    "enable_table": True,
-                    "language": "ch_server",
-                },
+                json=_build_upload_request(file_name),
                 headers=_api_headers(token),
                 timeout=60,
                 verify=_VERIFY_SSL,
@@ -390,7 +409,7 @@ def _clean_mineru_markdown(md_text: str) -> str:
     #     the next non-blank line starts with a character that doesn't
     #     look like the beginning of a new sentence.
     _sentence_starters = frozenset(
-        "第這那如但可因爲所而若則又並且或雖然何當從對與以"
+        "第這那如但可因爲為於其吾余餘蓋嗟夫凡所而若則又並且或雖然何當從對與以"
         "一二三四五六七八九十"
     )
     _cjk_punct = frozenset("，。！？、：；」「『』（）【】《》…—")

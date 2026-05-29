@@ -14,8 +14,14 @@ from .config import (
     CHUNK_SIZE,
     MAX_DAILY_PAGES,
     MODEL_VERSION,
+    PADDLE_LAYOUT_THRESHOLD,
     PADDLE_MAX_POLL_TIME,
+    PADDLE_PAGE_BOTTOM_PADDING_RATIO,
+    PADDLE_PAGE_TOP_PADDING_RATIO,
     PADDLE_POLL_INTERVAL,
+    PADDLE_REPETITION_PENALTY,
+    PADDLE_TEMPERATURE,
+    PADDLE_TOP_P,
     epub,      # Optional dependency
     fitz,      # Optional dependency
     requests,  # Optional dependency
@@ -37,6 +43,19 @@ def check_dependencies():
         print(f"    Please run: pip install {' '.join(missing)}")
         return False
     return True
+
+
+def _build_optional_payload() -> Dict[str, Any]:
+    """Return PaddleOCR optional payload tuned for vertical/traditional books."""
+    return {
+        "useDocOrientationClassify": True,
+        "useDocUnwarping": True,
+        "useChartRecognition": False,
+        "layoutThreshold": PADDLE_LAYOUT_THRESHOLD,
+        "temperature": PADDLE_TEMPERATURE,
+        "repetitionPenalty": PADDLE_REPETITION_PENALTY,
+        "topP": PADDLE_TOP_P,
+    }
 
 
 def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
@@ -63,15 +82,21 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
         chunk_doc = fitz.open()
         chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
 
-        # Add bottom padding to prevent OCR model from cropping text at
-        # the page edge (observed on scanned books where the last line
-        # sits very close to the physical page bottom).
+        # Add vertical padding to reduce cropping for scanned books whose
+        # first/last vertical-text characters sit close to the page edge.
         for page in chunk_doc:
             rect = page.rect
-            new_h = rect.height * 1.05
-            page.set_mediabox(fitz.Rect(0, 0, rect.width, new_h))
+            top_padding = rect.height * PADDLE_PAGE_TOP_PADDING_RATIO
+            bottom_padding = rect.height * PADDLE_PAGE_BOTTOM_PADDING_RATIO
+            page.set_mediabox(
+                fitz.Rect(0, -top_padding, rect.width, rect.height + bottom_padding)
+            )
             page.draw_rect(
-                fitz.Rect(0, rect.height, rect.width, new_h),
+                fitz.Rect(0, -top_padding, rect.width, 0),
+                color=None, fill=(1, 1, 1),
+            )
+            page.draw_rect(
+                fitz.Rect(0, rect.height, rect.width, rect.height + bottom_padding),
                 color=None, fill=(1, 1, 1),
             )
 
@@ -93,19 +118,9 @@ def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
 
     headers = {"Authorization": f"Bearer {token}"}
 
-    optional_payload = {
-        "useDocOrientationClassify": True,
-        "useDocUnwarping": True,
-        "useChartRecognition": False,
-        "layoutThreshold": 0.5,
-        "temperature": 0.2,
-        "repetitionPenalty": 1.2,
-        "topP": 0.85,
-    }
-
     data = {
         "model": MODEL_VERSION,
-        "optionalPayload": json.dumps(optional_payload),
+        "optionalPayload": json.dumps(_build_optional_payload()),
     }
 
     max_retries = 5
@@ -200,4 +215,3 @@ def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
                 f"[!] Unexpected error processing chunk {os.path.basename(chunk_path)}: {e}"
             )
             return None
-
