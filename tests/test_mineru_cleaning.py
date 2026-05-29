@@ -151,6 +151,39 @@ class TestMineruCleaning(unittest.TestCase):
         self.assertIn("before", result)
         self.assertIn("after", result)
 
+    # --- OCR mid-line truncation repair (step 3.6) ---
+
+    def test_merges_truncated_line_with_continuation(self):
+        clean = _load_clean()
+        md = (
+            "第二，中國不是阿根廷，英國無力用福島的方式，賴在香港不走。"
+            "第三，英方已知中國收回香港的「底牌」：採用「一國兩制」方針\n\n"
+            "國在香港既有的利益，還可利用這一方針，争取更多的利益。\n"
+        )
+        result = clean(md)
+        self.assertIn("方針國在香港既有的利益", result)
+        # Should not have the broken split
+        self.assertNotIn("方針\n\n國", result)
+
+    def test_preserves_real_paragraph_break(self):
+        clean = _load_clean()
+        md = (
+            "這是一段正文結束。\n\n"
+            "第二段從這裡開始。\n"
+        )
+        result = clean(md)
+        self.assertIn("結束。\n\n第二段", result)
+
+    def test_preserves_sentence_start_with_第(self):
+        clean = _load_clean()
+        md = (
+            "前面一段結尾文字沒有標點\n\n"
+            "第二節新的開始\n"
+        )
+        result = clean(md)
+        # "第" is a sentence starter, should NOT merge
+        self.assertIn("文字沒有標點\n\n第二節", result)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -399,9 +399,8 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
 
-        # Build a run of random CJK characters long enough to trigger detection:
-        # window_size=12 (11 bigrams), min_singletons=10, min_consecutive=5
-        # => need ~16+ consecutive CJK chars where most bigrams are singletons.
+        # window_size=12 (11 bigrams), min_singletons=9, min_consecutive=2
+        # => need ~13+ consecutive CJK chars where most bigrams are singletons.
         # A sequence of 30 random unique chars guarantees all bigrams are novel.
         cjk_start = 0x4E00
         garbled_run = "".join(chr(cjk_start + i) for i in range(30))

@@ -21,6 +21,7 @@ from .config import (
     MINERU_API_TOKEN,
     MINERU_CHUNK_SIZE,
     MINERU_MAX_POLL_TIME,
+    MINERU_MODEL_VERSION,
     MINERU_POLL_INTERVAL,
     fitz,
     requests,
@@ -54,8 +55,16 @@ def split_pdf(file_path: str, chunk_size: int | None = None) -> List[str]:
 
         for page in chunk_doc:
             rect = page.rect
+            # Add a small left margin (book spine side) so OCR can read
+            # characters near the inner edge that would otherwise be clipped.
+            # Keep margin small (8pt) to avoid confusing the VLM layout model.
+            _lm = 8
             new_h = rect.height * 1.05
-            page.set_mediabox(fitz.Rect(0, 0, rect.width, new_h))
+            page.set_mediabox(fitz.Rect(-_lm, 0, rect.width, new_h))
+            page.draw_rect(
+                fitz.Rect(-_lm, 0, 0, new_h),
+                color=None, fill=(1, 1, 1),
+            )
             page.draw_rect(
                 fitz.Rect(0, rect.height, rect.width, new_h),
                 color=None, fill=(1, 1, 1),
@@ -105,11 +114,11 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
                 f"{_API_BASE}/api/v4/file-urls/batch",
                 json={
                     "files": [{"name": file_name}],
-                    "model_version": "vlm",
+                    "model_version": MINERU_MODEL_VERSION,
                     "is_ocr": True,
-                    "enable_formula": True,
+                    "enable_formula": False,
                     "enable_table": True,
-                    "language": "ch",
+                    "language": "ch_server",
                 },
                 headers=_api_headers(token),
                 timeout=60,
@@ -341,7 +350,84 @@ def _clean_mineru_markdown(md_text: str) -> str:
                     continue
         result.append(line)
 
-    return "\n".join(result)
+    md_text = "\n".join(result)
+
+    # 3.5 Repair OCR reading-order errors where a short sentence-ending
+    #     fragment appears before a sentence-starting fragment.
+    #     Example: "話！\n\n就在這時刻...我要講幾句" →
+    #              "就在這時刻...我要講幾句話！"
+    terminal_set = frozenset({"。", "！", "？", ".", "!", "?", "」", "』"})
+    lines = md_text.split("\n")
+    repaired = list(lines)
+    i = 0
+    while i < len(repaired) - 2:
+        a = repaired[i].strip()
+        # Find the next non-empty line after a (skipping blanks)
+        j = i + 1
+        while j < len(repaired) and not repaired[j].strip():
+            j += 1
+        if j >= len(repaired):
+            break
+        b = repaired[j].strip()
+        # a is very short and ends with terminal punctuation —
+        # it's likely the tail of the sentence starting on b.
+        if (len(a) <= 5 and a and a[-1] in terminal_set
+            and len(b) > 10 and b[-1] not in terminal_set):
+            # Merge: b becomes the full sentence, a is removed
+            repaired[j] = b + a
+            repaired[i] = ""
+            i = j + 1
+        else:
+            i = j
+
+    md_text = "\n".join(repaired)
+
+    # 3.6 Repair OCR mid-line truncation where text near the page spine
+    #     is missed, splitting one sentence across two lines.
+    #     Example: "...採用「一國兩制」方針\n\n國在香港既有的利益..."
+    #              → "...採用「一國兩制」方針國在香港既有的利益..."
+    #     The first line ends mid-sentence (no terminal punctuation), and
+    #     the next non-blank line starts with a character that doesn't
+    #     look like the beginning of a new sentence.
+    _sentence_starters = frozenset(
+        "第這那如但可因爲所而若則又並且或雖然何當從對與以"
+        "一二三四五六七八九十"
+    )
+    _cjk_punct = frozenset("，。！？、：；」「『』（）【】《》…—")
+    lines = md_text.split("\n")
+    repaired = list(lines)
+    i = 0
+    while i < len(repaired) - 2:
+        a = repaired[i].strip()
+        if not a or a.startswith("#") or a.startswith("!"):
+            i += 1
+            continue
+        # Find next non-empty line
+        j = i + 1
+        while j < len(repaired) and not repaired[j].strip():
+            j += 1
+        if j >= len(repaired):
+            break
+        b = repaired[j].strip()
+        if not b or b.startswith("#") or b.startswith("!"):
+            i = j
+            continue
+        # Line a ends without terminal punctuation, and line b starts
+        # with a CJK character that doesn't look like a sentence start.
+        if (len(a) > 15 and a[-1] not in terminal_set
+            and a[-1] not in _cjk_punct
+            and len(b) > 5 and b[0] not in _sentence_starters
+            and b[0] not in _cjk_punct
+            and not b[0].isdigit()
+            and not b[0].isascii()):
+            # Merge: a and b are one sentence split by OCR truncation
+            repaired[i] = a + b
+            repaired[j] = ""
+            i = j + 1
+        else:
+            i = j
+
+    return "\n".join(repaired)
 
 
 def _parse_zip(zip_data: bytes) -> Dict[str, Any] | None:
@@ -400,10 +486,10 @@ def _parse_zip(zip_data: bytes) -> Dict[str, Any] | None:
                     # Drop fragments that are just page numbers or
                     # a lone header (ghost pages).  Real pages have
                     # at least ~100 chars of body text.
-                    if len(page_md) < 80:
+                    if len(page_md.strip()) < 80:
                         continue
                     page_md = _clean_mineru_markdown(page_md)
-                    if len(page_md) < 80:
+                    if len(page_md.strip()) < 80:
                         continue
                     layout_results.append({
                         "markdown": {"text": page_md, "images": dict(all_images)}
@@ -417,14 +503,17 @@ def _parse_zip(zip_data: bytes) -> Dict[str, Any] | None:
 
 
 def _detect_page_headers(md_lines: List[str]) -> tuple[set, set]:
-    """Find H1 headings that are page numbers or repeated 2+ times.
+    """Find headings that are page numbers or repeated across pages.
 
     Returns (markdown_headers, plain_text_headers) where markdown_headers
     are ``# ...`` lines to split on and plain_text_headers are the text
-    without the ``# `` prefix for body-stripping.
+    without the ``# `` prefix for body-stripping.  Also detects plain-text
+    lines that repeat 3+ times in the same chunk — these are running page
+    headers that MinerU outputs without markdown markup.
     """
     from collections import Counter
     h1_headings = []
+    chapterish = re.compile(r"第[零一二三四五六七八九十百千0-9]+[章節编編篇卷]")
     for line in md_lines:
         stripped = line.strip()
         if stripped.startswith("# ") and not stripped.startswith("## "):
@@ -442,6 +531,36 @@ def _detect_page_headers(md_lines: List[str]) -> tuple[set, set]:
             md_headers.add(h)
 
     plain_headers = {h[2:] for h in md_headers}
+
+    # Also detect plain-text lines that repeat — these are running page
+    # headers / chapter titles that MinerU outputs without markdown markup.
+    _titleish = re.compile(r"^[「『\"][^」』\"]{1,20}[」』\"]$")
+    plain_lines = []
+    for line in md_lines:
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        # Skip very short or number-only lines (page numbers)
+        if len(s) < 3 or s.isdigit():
+            continue
+        plain_lines.append(s)
+    plain_counts = Counter(plain_lines)
+    for line_text, c in plain_counts.items():
+        if c >= 3:
+            # Accept lines that look like chapter titles, are in bracket
+            # quotes, or are short enough to be page headers (not body text
+            # that coincidentally repeats)
+            if (chapterish.match(line_text) or len(line_text) <= 15
+                    or _titleish.match(line_text)):
+                plain_headers.add(line_text)
+        elif c >= 2:
+            # Lines appearing 2+ times: accept if short, chapterish,
+            # or in title brackets (e.g. book title as running header)
+            if (len(line_text) <= 10
+                    or (chapterish.match(line_text) and len(line_text) <= 25)
+                    or _titleish.match(line_text)):
+                plain_headers.add(line_text)
+
     return md_headers, plain_headers
 
 
@@ -456,13 +575,21 @@ def _split_by_page_headers(md_text: str) -> list:
     lines = md_text.split("\n")
     md_headers, plain_headers = _detect_page_headers(lines)
 
-    if not md_headers:
-        return [md_text]
-
+    # Collect split points from H1 headers first, then fall back to
+    # plain-text headers when MinerU outputs them without markdown markup.
     split_indices = []
     for i, line in enumerate(lines):
         if line.strip() in md_headers:
             split_indices.append(i)
+
+    if not split_indices and plain_headers:
+        # No H1-anchored split points — use plain-text repeated headers
+        # as page boundaries so the chunk does not flow through as one
+        # monolithic block (which would let truncation repair merge
+        # across page boundaries).
+        for i, line in enumerate(lines):
+            if line.strip() in plain_headers:
+                split_indices.append(i)
 
     if not split_indices:
         return [md_text]
@@ -493,7 +620,8 @@ def _split_by_page_headers(md_text: str) -> list:
 
 
 def _strip_leading_headers(lines: list, plain_headers: set) -> list:
-    """Remove page-header text when it appears as the first content line(s)."""
+    """Remove page-header text when it appears as leading or trailing lines."""
+    # Strip from the top
     while lines and lines[0].strip() in plain_headers:
         lines = lines[1:]
     # Also handle "HEADER HEADER" (doubled OCR repetition)
@@ -510,6 +638,9 @@ def _strip_leading_headers(lines: list, plain_headers: set) -> list:
             if first.startswith(h + " ") and len(first) == len(h) + 1:
                 lines = lines[1:]
                 break
+    # Strip from the bottom
+    while lines and lines[-1].strip() in plain_headers:
+        lines = lines[:-1]
     return lines
 
 

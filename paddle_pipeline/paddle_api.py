@@ -1,6 +1,5 @@
 """PDF chunking, Paddle OCR API calls, and dependency checking."""
 
-import base64
 import json
 import os
 import sys
@@ -14,6 +13,9 @@ from .config import (
     API_URL,
     CHUNK_SIZE,
     MAX_DAILY_PAGES,
+    MODEL_VERSION,
+    PADDLE_MAX_POLL_TIME,
+    PADDLE_POLL_INTERVAL,
     epub,      # Optional dependency
     fitz,      # Optional dependency
     requests,  # Optional dependency
@@ -84,49 +86,106 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
 
 def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:
     """
-    Sends a PDF chunk to the PaddleOCR API and returns the parsed result.
+    Sends a PDF chunk to the PaddleOCR async job API and returns the parsed result.
+    Submits a job, polls until completion, then downloads and aggregates JSONL results.
     """
     print(f"[*] uploading chunk: {os.path.basename(chunk_path)}")
 
-    with open(chunk_path, "rb") as file:
-        file_bytes = file.read()
-        file_data = base64.b64encode(file_bytes).decode("ascii")
+    headers = {"Authorization": f"Bearer {token}"}
 
-    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-
-    payload = {
-        "file": file_data,
-        "fileType": 0,  # 0 for PDF
+    optional_payload = {
         "useDocOrientationClassify": True,
         "useDocUnwarping": True,
         "useChartRecognition": False,
-        "layoutThreshold": 0.3,
-        "textRecScoreThresh": 0.3,
+        "layoutThreshold": 0.5,
+        "temperature": 0.2,
+        "repetitionPenalty": 1.2,
+        "topP": 0.85,
+    }
+
+    data = {
+        "model": MODEL_VERSION,
+        "optionalPayload": json.dumps(optional_payload),
     }
 
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            response = requests.post(
-                API_URL, json=payload, headers=headers, timeout=API_TIMEOUT_SECONDS
-            )
-            response.raise_for_status()
-            result = response.json()
+            with open(chunk_path, "rb") as f:
+                files = {"file": f}
+                job_response = requests.post(
+                    API_URL, headers=headers, data=data, files=files,
+                    timeout=API_TIMEOUT_SECONDS,
+                )
+            job_response.raise_for_status()
+            job_result = job_response.json()
 
-            # Handle API responses safely
-            # The API seems to return 'result' directly in some cases, or an 'error' field
-            if "error" in result:
+            if job_result.get("errorCode") and job_result["errorCode"] != 0:
                 print(
-                    f"[!] API Error for chunk {os.path.basename(chunk_path)}: {result['error']}"
+                    f"[!] Job submission error for chunk {os.path.basename(chunk_path)}: "
+                    f"{job_result.get('errorMsg', 'unknown error')}"
                 )
                 return None
 
-            return result
+            job_id = job_result["data"]["jobId"]
+            print(f"[*] job submitted: {job_id}")
+
+            # Poll for completion
+            poll_start = time.time()
+            while True:
+                if time.time() - poll_start > PADDLE_MAX_POLL_TIME:
+                    print(f"[!] Timed out waiting for job {job_id}")
+                    return None
+                time.sleep(PADDLE_POLL_INTERVAL)
+                poll_response = requests.get(
+                    f"{API_URL}/{job_id}", headers=headers, timeout=API_TIMEOUT_SECONDS,
+                )
+                poll_response.raise_for_status()
+                poll_result = poll_response.json()
+                state = poll_result["data"]["state"]
+
+                if state == "pending":
+                    print("    job pending...")
+                elif state == "running":
+                    try:
+                        progress = poll_result["data"]["extractProgress"]
+                        print(
+                            f"    running: {progress['extractedPages']}/{progress['totalPages']} pages"
+                        )
+                    except KeyError:
+                        print("    running...")
+                elif state == "done":
+                    extracted = poll_result["data"]["extractProgress"]["extractedPages"]
+                    print(f"    done: {extracted} pages extracted")
+                    jsonl_url = poll_result["data"]["resultUrl"]["jsonUrl"]
+                    break
+                elif state == "failed":
+                    error_msg = poll_result["data"].get("errorMsg", "unknown error")
+                    print(f"[!] Job failed: {error_msg}")
+                    return None
+
+            # Download and parse JSONL results
+            jsonl_response = requests.get(jsonl_url, timeout=API_TIMEOUT_SECONDS)
+            jsonl_response.raise_for_status()
+
+            layout_results = []
+            for line in jsonl_response.text.strip().split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    page_result = json.loads(line).get("result", {})
+                except json.JSONDecodeError:
+                    print(f"[!] Skipping malformed JSONL line")
+                    continue
+                for page_res in page_result.get("layoutParsingResults", []):
+                    layout_results.append(page_res)
+
+            print(f"[*] chunk result: {len(layout_results)} pages")
+            return {"result": {"layoutParsingResults": layout_results}}
 
         except (requests.exceptions.RequestException, ConnectionError) as e:
-            wait_time = (
-                2**attempt
-            ) * 5  # Exponential backoff: 5, 10, 20, 40, 80 seconds
+            wait_time = (2 ** attempt) * 5
             print(f"[!] API Request failed (attempt {attempt + 1}/{max_retries}): {e}")
             if attempt < max_retries - 1:
                 print(f"    Retrying in {wait_time}s...")

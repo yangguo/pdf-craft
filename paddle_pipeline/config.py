@@ -21,7 +21,8 @@ except ImportError:
 
 
 # --- Configuration ---
-API_URL = "https://feq472ncm4mfofva.aistudio-app.com/layout-parsing"
+API_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
+MODEL_VERSION = "PaddleOCR-VL-1.6"
 # Environment variable for API token
 API_TOKEN = os.getenv("PADDLE_API_TOKEN", "")
 
@@ -49,9 +50,12 @@ def _env_int(name: str, default: int, minimum: int | None = None) -> int:
 
 CHUNK_SIZE = _env_int("PADDLE_CHUNK_SIZE", 5, minimum=1)
 API_TIMEOUT_SECONDS = _env_int("PADDLE_API_TIMEOUT_SECONDS", 600, minimum=1)
+PADDLE_POLL_INTERVAL = _env_int("PADDLE_POLL_INTERVAL", 5, minimum=1)
+PADDLE_MAX_POLL_TIME = _env_int("PADDLE_MAX_POLL_TIME", 1800, minimum=1)
 MINERU_POLL_INTERVAL = _env_int("MINERU_POLL_INTERVAL", 5, minimum=1)
-MINERU_MAX_POLL_TIME = _env_int("MINERU_MAX_POLL_TIME", 600, minimum=1)
+MINERU_MAX_POLL_TIME = _env_int("MINERU_MAX_POLL_TIME", 1800, minimum=1)
 MINERU_CHUNK_SIZE = _env_int("MINERU_CHUNK_SIZE", 20, minimum=1)
+MINERU_MODEL_VERSION = os.getenv("MINERU_MODEL_VERSION", "vlm")
 DEFAULT_COVER_MAX_EDGE = _env_int("EPUB_COVER_MAX_EDGE", 2000, minimum=1)
 DEFAULT_COVER_JPEG_QUALITY = _env_int("EPUB_COVER_JPEG_QUALITY", 82, minimum=1)
 

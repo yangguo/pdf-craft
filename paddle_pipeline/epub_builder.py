@@ -19,8 +19,14 @@ from .ocr_noise import clean_ocr_noise
 _CN_NUMERALS = set("零一二三四五六七八九十百千")
 
 
-def _build_header_fingerprints(confirmed_headings: List[Dict] | None) -> set:
-    """Build a set of whitespace-stripped chapter titles for page-header detection."""
+def _build_header_fingerprints(confirmed_headings: List[Dict] | None,
+                               book_title: str = "") -> set:
+    """Build a set of whitespace-stripped chapter titles for page-header detection.
+
+    Also extracts individual components (e.g. "第十四章" and "「六四」風雲"
+    from "第十四章 「六四」風雲") so partial-title page headers are matched.
+    Includes the book title so running-page-header copies are stripped.
+    """
     fingerprints = set()
     if confirmed_headings:
         for h in confirmed_headings:
@@ -28,21 +34,44 @@ def _build_header_fingerprints(confirmed_headings: List[Dict] | None) -> set:
             fp = re.sub(r"\s+", "", title)
             if fp:
                 fingerprints.add(fp)
+            # Also fingerprint just the chapter-number prefix and title suffix
+            # so running page headers like "第十四章" or "「六四」風雲" match.
+            m = re.match(
+                r"(第[零一二三四五六七八九十百千0-9]+[章節编編篇卷])\s*(.+)",
+                title,
+            )
+            if m:
+                num_fp = re.sub(r"\s+", "", m.group(1))
+                title_fp = re.sub(r"\s+", "", m.group(2))
+                fingerprints.add(num_fp)
+                fingerprints.add(title_fp)
+    # Add book title so running page headers carrying the title are stripped.
+    if book_title:
+        fp = re.sub(r"\s+", "", book_title)
+        if fp:
+            fingerprints.add(fp)
     return fingerprints
 
 
 def _strip_page_headers(lines: list, fingerprints: set) -> list:
     """Remove OCR page headers / footers and Chinese page numbers from a page.
 
-    Page headers appear as standalone lines at page boundaries and match:
-    - A known chapter-title fingerprint (whitespace removed)
-    - A chapter-like pattern (e.g. '第X章...') without markdown heading markup
+    Page headers appear as standalone lines and match:
+    - A known chapter-title or book-title fingerprint (whitespace removed)
+    - A short chapter-like line (e.g. '第X章 ...' ≤25 chars) without heading markup
     - A Chinese-numeral page number (e.g. '五', '二七')
+    - A short line in book-title brackets 「...」 (≤20 chars)
+
+    Checks all lines, not just top/bottom, because OCR reading order may
+    place running headers anywhere in the output.
     """
     if len(lines) < 2:
         return lines
 
     _chapterish = re.compile(r"第[零一二三四五六七八九十百千0-9]+[章節编編篇卷]")
+    # Short lines that look like Chinese section titles or running headers.
+    # Book-title brackets 「...」 or Western quotes with Chinese content.
+    _titleish = re.compile(r"^[「『\"][^」』\"]{1,20}[」』\"]$")
 
     def _is_page_number(s: str) -> bool:
         s = s.strip()
@@ -59,20 +88,24 @@ def _strip_page_headers(lines: list, fingerprints: set) -> list:
         fp = re.sub(r"\s+", "", s)
         if fp in fingerprints:
             return True
-        if _chapterish.match(s) and not s.startswith("#"):
+        # Short chapter-like line (≤25 chars) — a standalone page header,
+        # not body text like "第三章講述了中英談判的漫長過程..."
+        if _chapterish.match(s) and not s.startswith("#") and len(s) <= 25:
+            return True
+        # Short standalone line in book-title brackets — almost
+        # certainly a running page header, not body text.
+        if _titleish.match(s) and len(s) <= 20:
             return True
         return False
 
     result = list(lines)
     n = len(result)
 
-    # Only check the bottom 3 lines — page headers appear after body text
-    # in the OCR output. Top-of-page headers would also be chapter starts.
-    for idx in range(max(0, n - 3), n):
+    for idx in range(n):
         line = result[idx]
         if not line.strip():
             continue
-        if _is_page_number(line) and idx > 0:
+        if _is_page_number(line):
             result[idx] = ""
         elif _is_header_line(line):
             result[idx] = ""
@@ -146,7 +179,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     full_markdown = ""
 
     # Build chapter title fingerprints for page-header detection
-    _header_fingerprints = _build_header_fingerprints(confirmed_headings)
+    _header_fingerprints = _build_header_fingerprints(confirmed_headings, title)
 
     # Aggregated images to add to the book
     # Map API image path (e.g. 'images/tmp.jpg') to internal EPUB path
@@ -249,8 +282,14 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             # without markdown markup — these must stay standalone for the
             # chapter split detection to find them.
             header_pattern = re.compile(
-                r'^(#{1,6}\s|>|\s*[-*]\s|\d+\.|'
-                r'第[零一二三四五六七八九十百千0-9]+[章節编編篇卷])'
+                r'^(#{1,6}\s|>|\s*[-*]\s|\d+\.)'
+            )
+            # Plain-text chapter headings (第X章) that OCR outputs without
+            # markdown markup.  Only treat as standalone heading when the
+            # line is short enough (≤25 chars) to be a real page/chapter
+            # header rather than body text that happens to mention a chapter.
+            _chapterish_heading = re.compile(
+                r'^第[零一二三四五六七八九十百千0-9]+[章節编編篇卷]'
             )
             # Characters that indicate a line should not be joined with next
             non_join_endings = (':', ';', ',', '-', '：', '；', '，')
@@ -264,7 +303,9 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                     continue
 
                 # Check if this line is a header/list/blockquote
-                is_special = header_pattern.match(stripped)
+                is_special = header_pattern.match(stripped) or (
+                    _chapterish_heading.match(stripped) and len(stripped) <= 25
+                )
 
                 if is_special:
                     if current_para:
@@ -283,9 +324,22 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     elif consecutive_blanks == 1:
-                        # Single blank between text lines — OCR line-wrap noise
-                        # unless the previous line ends with terminal punctuation
+                        # Single blank between text lines — often OCR line-wrap
+                        # noise, but sometimes a real paragraph break.
                         if current_ends.endswith(terminal_chars):
+                            # Previous ends a sentence — real break
+                            reflowed_paragraphs.append(current_para)
+                            current_para = stripped
+                        elif (len(stripped) > 20
+                              and stripped.endswith(terminal_chars)
+                              and not current_ends.endswith('，')):
+                            # Next line is a paragraph that ends with
+                            # terminal punctuation — it is a self-contained
+                            # sentence/paragraph, not a mid-sentence
+                            # continuation.  But if the current line ends
+                            # with a CJK comma, the next line is likely still
+                            # the same sentence (just broken by a page/line
+                            # boundary).
                             reflowed_paragraphs.append(current_para)
                             current_para = stripped
                         else:
@@ -336,7 +390,10 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
 
                 # Check if we should merge (previous doesn't end with terminal, next isn't a header)
                 ends_mid_sentence = full_stripped and not full_stripped.endswith(terminal_chars)
-                next_is_header = header_pattern.match(first_page_line) if first_page_line else False
+                next_is_header = (
+                    header_pattern.match(first_page_line)
+                    or (_chapterish_heading.match(first_page_line) and len(first_page_line) <= 25)
+                ) if first_page_line else False
 
                 # Prepend page marker AFTER first_page_line is captured so merge logic is unaffected
                 # The marker must be on its own line so the later ^\x00PAGE:\d+\x00$ regex matches it;

@@ -19,8 +19,8 @@ from .config import (
 # Natural text re-uses common character transitions; garbled text does not.
 
 _GARBLED_WINDOW_SIZE = 12
-_GARBLED_MIN_SINGLETONS = 10  # singletons out of (window_size - 1) bigrams
-_GARBLED_MIN_CONSECUTIVE = 5  # consecutive flagged windows to form a span
+_GARBLED_MIN_SINGLETONS = 9   # singletons out of (window_size - 1) bigrams
+_GARBLED_MIN_CONSECUTIVE = 2  # consecutive flagged windows to form a span
 
 
 def _build_cjk_bigram_model(cjk_chars: List[str]) -> Dict[str, int]:

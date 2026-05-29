@@ -155,7 +155,18 @@ def main():
                     _write("    ...waiting 5s to respect API rate limits...")
                     time.sleep(5)
 
-                res = parse_func(chunk, api_token)
+                _MAX_RETRIES = 3
+                for attempt in range(1, _MAX_RETRIES + 1):
+                    res = parse_func(chunk, api_token)
+                    if res:
+                        break
+                    if attempt < _MAX_RETRIES:
+                        wait = attempt * 10
+                        _write(
+                            f"    ...chunk {i + 1} attempt {attempt}/{_MAX_RETRIES} "
+                            f"failed ({api_label} parsing error), retrying in {wait}s..."
+                        )
+                        time.sleep(wait)
 
                 if res:
                     # Save checkpoint
@@ -178,7 +189,9 @@ def main():
                             download_image(img_url, local_path)
             else:
                 _write(
-                    f"[!] CRITICAL: Failed to process chunk {i + 1}. Aborting to prevent incomplete book."
+                    f"[!] CRITICAL: Failed to process chunk {i + 1} "
+                    f"after {_MAX_RETRIES} attempts. Aborting to prevent "
+                    f"incomplete book."
                 )
                 _write(
                     "    Please resolve connectivity issues and re-run the script to resume."
