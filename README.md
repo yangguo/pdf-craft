@@ -5,7 +5,7 @@ Convert scanned PDF books to EPUB using PaddleOCR or MinerU cloud APIs — no lo
 ## Installation
 
 ```bash
-pip install pymupdf ebooklib requests python-dotenv markdown
+pip install pymupdf ebooklib requests python-dotenv markdown numpy
 ```
 
 ## Setup
@@ -61,7 +61,7 @@ python pdf2epub_paddle.py book.pdf --title "Title" --strict-ocr-noise
 | `MINERU_API_TOKEN` | — | MinerU v4 API Bearer token |
 | `MINERU_CHUNK_SIZE` | `20` | Pages per chunk (max 200) |
 | `MINERU_POLL_INTERVAL` | `5` | Seconds between batch result polls |
-| `MINERU_MAX_POLL_TIME` | `600` | Max seconds to wait for a batch |
+| `MINERU_MAX_POLL_TIME` | `1800` | Max seconds to wait for a batch |
 | `MINERU_VERIFY_SSL` | `1` | Set to `0` to disable SSL verification |
 
 ### Checkpointing

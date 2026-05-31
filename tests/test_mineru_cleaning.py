@@ -184,6 +184,15 @@ class TestMineruCleaning(unittest.TestCase):
         # "第" is a sentence starter, should NOT merge
         self.assertIn("文字沒有標點\n\n第二節", result)
 
+    def test_preserves_sentence_start_with_common_function_word(self):
+        clean = _load_clean()
+        md = (
+            "前文描述到此仍未收束而且還在延伸\n\n"
+            "在這個背景下，新的段落需要保留。\n"
+        )
+        result = clean(md)
+        self.assertIn("還在延伸\n\n在這個背景下", result)
+
 
 if __name__ == "__main__":
     unittest.main()

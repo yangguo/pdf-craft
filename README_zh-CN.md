@@ -5,7 +5,7 @@
 ## 安装
 
 ```bash
-pip install pymupdf ebooklib requests python-dotenv markdown
+pip install pymupdf ebooklib requests python-dotenv markdown numpy
 ```
 
 ## 配置
@@ -61,7 +61,7 @@ python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 | `MINERU_API_TOKEN` | — | MinerU v4 API Bearer token |
 | `MINERU_CHUNK_SIZE` | `20` | 每块页数（最大 200） |
 | `MINERU_POLL_INTERVAL` | `5` | 结果轮询间隔（秒） |
-| `MINERU_MAX_POLL_TIME` | `600` | 单批次最大等待时间（秒） |
+| `MINERU_MAX_POLL_TIME` | `1800` | 单批次最大等待时间（秒） |
 | `MINERU_VERIFY_SSL` | `1` | 设为 `0` 关闭 SSL 验证 |
 
 ### 断点续传

@@ -1,2 +1,0 @@
-include pdf_craft/data/**/*.jinja
-prune tests

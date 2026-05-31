@@ -62,8 +62,10 @@ def _strip_page_headers(lines: list, fingerprints: set) -> list:
     - A Chinese-numeral page number (e.g. '五', '二七')
     - A short line in book-title brackets 「...」 (≤20 chars)
 
-    Checks all lines, not just top/bottom, because OCR reading order may
-    place running headers anywhere in the output.
+    Fingerprint, chapter-like, and page-number checks apply to all lines
+    because OCR reading order may place running headers anywhere in the
+    output. Generic bracket-title stripping is limited to page edges or
+    lines adjacent to page numbers to avoid deleting body dialogue.
     """
     if len(lines) < 2:
         return lines
@@ -71,7 +73,7 @@ def _strip_page_headers(lines: list, fingerprints: set) -> list:
     _chapterish = re.compile(r"第[零一二三四五六七八九十百千0-9]+[章節编編篇卷]")
     # Short lines that look like Chinese section titles or running headers.
     # Book-title brackets 「...」 or Western quotes with Chinese content.
-    _titleish = re.compile(r"^[「『\"][^」』\"]{1,20}[」』\"]$")
+    _titleish = re.compile(r'^(?:「[^」]{1,20}」|『[^』]{1,20}』|"[^"]{1,20}")$')
 
     def _is_page_number(s: str) -> bool:
         s = s.strip()
@@ -81,7 +83,7 @@ def _strip_page_headers(lines: list, fingerprints: set) -> list:
             return True
         return all(c in _CN_NUMERALS for c in s) and len(s) <= 3
 
-    def _is_header_line(s: str) -> bool:
+    def _is_header_line(s: str, idx: int) -> bool:
         s = s.strip()
         if not s:
             return False
@@ -93,9 +95,16 @@ def _strip_page_headers(lines: list, fingerprints: set) -> list:
         if _chapterish.match(s) and not s.startswith("#") and len(s) <= 25:
             return True
         # Short standalone line in book-title brackets — almost
-        # certainly a running page header, not body text.
+        # certainly a running page header at page edges or near page numbers,
+        # but preserve mid-page quoted body/dialogue lines.
         if _titleish.match(s) and len(s) <= 20:
-            return True
+            near_edge_or_number = (
+                idx == 0
+                or idx == n - 1
+                or (idx > 0 and _is_page_number(lines[idx - 1]))
+                or (idx + 1 < n and _is_page_number(lines[idx + 1]))
+            )
+            return near_edge_or_number
         return False
 
     result = list(lines)
@@ -107,12 +116,36 @@ def _strip_page_headers(lines: list, fingerprints: set) -> list:
             continue
         if _is_page_number(line):
             result[idx] = ""
-        elif _is_header_line(line):
+        elif _is_header_line(line, idx):
             result[idx] = ""
             if idx + 1 < n and _is_page_number(result[idx + 1]):
                 result[idx + 1] = ""
 
     return [l for l in result if l.strip() or l == ""]
+
+
+def _strip_missing_image_references(markdown_text: str,
+                                    missing_image_paths: set[str]) -> str:
+    """Remove Markdown and HTML image references whose assets were not packaged."""
+    for missing in missing_image_paths:
+        escaped = re.escape(missing)
+        markdown_text = re.sub(
+            r"!\[[^\]]*\]\(" + escaped + r"\)",
+            "",
+            markdown_text,
+        )
+        markdown_text = re.sub(
+            r"<img\b[^>]*\bsrc=[\"']" + escaped + r"[\"'][^>]*/?>",
+            "",
+            markdown_text,
+            flags=re.IGNORECASE,
+        )
+    return re.sub(
+        r"<div\b[^>]*>\s*</div>",
+        "",
+        markdown_text,
+        flags=re.IGNORECASE,
+    )
 
 
 def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
@@ -246,12 +279,10 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             # Strip markdown image links whose assets were not packaged, so the
             # generated HTML does not contain broken <img src="images/..."> references.
             if missing_image_paths:
-                for _missing in missing_image_paths:
-                    page_md = re.sub(
-                        r"!\[[^\]]*\]\(" + re.escape(_missing) + r"\)",
-                        "",
-                        page_md,
-                    )
+                page_md = _strip_missing_image_references(
+                    page_md,
+                    missing_image_paths,
+                )
 
             # Reflow lines into continuous paragraphs to fix sentence splitting issues
             # Pages often break sentences mid-flow, and OCR can split paragraphs
@@ -593,5 +624,3 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         strict_ocr_validation=strict_ocr_validation,
     )
     print(f"[*] EPUB saved to {output_file}")
-
-

@@ -141,6 +141,9 @@ celerybeat.pid
 
 # Environments
 .env
+
+# Claude Code local settings (may contain secrets)
+.claude/settings.local.json
 /env
 
 # Spyder project settings
@@ -176,3 +179,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# antigravity cli
+.antigravitycli
+
+# vscode settings
+.vscode/

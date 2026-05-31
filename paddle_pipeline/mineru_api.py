@@ -83,6 +83,27 @@ def _api_headers(token: str) -> Dict[str, str]:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
 
 
+def _download_zip_with_retry(zip_url: str, token: str) -> bytes | None:
+    """Download a completed MinerU result ZIP without resubmitting the batch."""
+    max_retries = 5
+    for attempt in range(max_retries):
+        if attempt > 0:
+            wait = (2 ** (attempt - 1)) * 5
+            print(f"    ...retrying ZIP download in {wait}s...")
+            time.sleep(wait)
+        try:
+            zr = requests.get(
+                zip_url, headers=_api_headers(token), timeout=120, verify=_VERIFY_SSL,
+            )
+            if zr.status_code == 200:
+                return zr.content
+            print(f"[!] ZIP download HTTP {zr.status_code}")
+        except requests.exceptions.RequestException as e:
+            print(f"[!] ZIP download error: {e}")
+
+    return None
+
+
 def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any] | None:
     """Process a PDF chunk through the MinerU v4 API.
 
@@ -104,6 +125,8 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
 
     # Step 1: Get signed upload URL (with retry)
     data = None
+    batch_id = ""
+    upload_url = ""
     for attempt in range(5):
         if attempt > 0:
             wait = (2 ** (attempt - 1)) * 5
@@ -125,9 +148,39 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
                 verify=_VERIFY_SSL,
             )
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    print("[!] Upload URL response was not valid JSON")
+                    if attempt == 4:
+                        return None
+                    continue
                 if data.get("code") == 0:
-                    break
+                    payload = data.get("data")
+                    if not isinstance(payload, dict):
+                        print("[!] Upload URL response missing data object")
+                        if attempt == 4:
+                            return None
+                        continue
+                    candidate_batch_id = payload.get("batch_id")
+                    file_urls = payload.get("file_urls")
+                    candidate_upload_url = (
+                        file_urls[0]
+                        if isinstance(file_urls, list) and file_urls else None
+                    )
+                    if (
+                        isinstance(candidate_batch_id, str)
+                        and candidate_batch_id
+                        and isinstance(candidate_upload_url, str)
+                        and candidate_upload_url
+                    ):
+                        batch_id = candidate_batch_id
+                        upload_url = candidate_upload_url
+                        break
+                    print("[!] Upload URL response missing batch_id/file_urls")
+                    if attempt == 4:
+                        return None
+                    continue
                 print(f"[!] Upload URL request failed: {data.get('msg')}")
                 if attempt == 4:
                     return None
@@ -138,11 +191,8 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
             if attempt == 4:
                 return None
 
-    if not data:
+    if not data or not batch_id or not upload_url:
         return None
-
-    batch_id = data["data"]["batch_id"]
-    upload_url = data["data"]["file_urls"][0]
 
     # Step 2: PUT file (with retry)
     for attempt in range(5):
@@ -193,11 +243,19 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
             if r.status_code != 200:
                 continue
 
-            result = r.json()
+            try:
+                result = r.json()
+            except ValueError:
+                print("[!] Poll response was not valid JSON")
+                continue
             if result.get("code") != 0:
                 continue
 
-            results_list = result.get("data", {}).get("extract_result", [])
+            payload = result.get("data")
+            if not isinstance(payload, dict):
+                print("[!] Poll response missing data object")
+                continue
+            results_list = payload.get("extract_result", [])
             if not results_list:
                 continue
 
@@ -210,15 +268,13 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
                     print("[!] No zip URL in result")
                     return None
 
-                # Step 4: Download and parse ZIP
-                zr = requests.get(
-                    zip_url, headers=_api_headers(token), timeout=120, verify=_VERIFY_SSL,
-                )
-                if zr.status_code != 200:
-                    print(f"[!] ZIP download HTTP {zr.status_code}")
+                # Step 4: Download and parse ZIP. The batch is already
+                # complete, so retry the ZIP read here instead of resubmitting.
+                zip_data = _download_zip_with_retry(zip_url, token)
+                if zip_data is None:
                     return None
 
-                parsed = _parse_zip(zr.content)
+                parsed = _parse_zip(zip_data)
                 if parsed:
                     # Stash the ZIP URL so the checkpoint can re-parse
                     # later when the parsing logic changes.
@@ -390,7 +446,7 @@ def _clean_mineru_markdown(md_text: str) -> str:
     #     the next non-blank line starts with a character that doesn't
     #     look like the beginning of a new sentence.
     _sentence_starters = frozenset(
-        "第這那如但可因爲所而若則又並且或雖然何當從對與以"
+        "第這那如但可因爲所在其此該本而若則又並且或雖然何當從對與以"
         "一二三四五六七八九十"
     )
     _cjk_punct = frozenset("，。！？、：；」「『』（）【】《》…—")
@@ -673,19 +729,14 @@ def reparse_checkpoint(checkpoint: Dict[str, Any],
     if not token:
         return checkpoint
 
-    try:
-        zr = requests.get(
-            zip_url, headers=_api_headers(token), timeout=120, verify=_VERIFY_SSL,
-        )
-        if zr.status_code != 200:
-            print(f"[!] Re-download ZIP HTTP {zr.status_code}, using cached result")
-            return checkpoint
+    zip_data = _download_zip_with_retry(zip_url, token)
+    if zip_data is None:
+        print("[!] Re-download ZIP failed, using cached result")
+        return checkpoint
 
-        reparsed = _parse_zip(zr.content)
-        if reparsed:
-            reparsed["_mineru_zip_url"] = zip_url
-            return reparsed
-    except requests.exceptions.RequestException as e:
-        print(f"[!] Re-download ZIP error: {e}, using cached result")
+    reparsed = _parse_zip(zip_data)
+    if reparsed:
+        reparsed["_mineru_zip_url"] = zip_url
+        return reparsed
 
     return checkpoint

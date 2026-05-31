@@ -15,6 +15,8 @@ from .config import (
     CHUNK_SIZE,
     DEFAULT_COVER_JPEG_QUALITY,
     DEFAULT_COVER_MAX_EDGE,
+    PADDLE_BOTTOM_PADDING_PERCENT,
+    PADDLE_PAGE_MARGIN_PT,
     TOC_PAGE_START_CSS,
 )
 from .epub_href import _resolve_epub_fragment_href
@@ -47,6 +49,8 @@ __all__ = [
     "extract_page_footnotes",
     "format_page_footnotes_html",
     "link_page_footnote_references",
+    "PADDLE_BOTTOM_PADDING_PERCENT",
+    "PADDLE_PAGE_MARGIN_PT",
     "parse_pdf_chunk_mineru",
     "scan_epub_for_ocr_noise",
     "repair_page_order_by_printed_numbers",

@@ -23,6 +23,7 @@ pymupdf = "^1.25.0"
 ebooklib = "^0.18.0"
 python-dotenv = "^1.0.0"
 markdown = "^3.7.0"
+numpy = ">=2.0.0,<3.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pylint = "^3.3.7"

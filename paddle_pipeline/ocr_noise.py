@@ -18,9 +18,9 @@ from .config import (
 # bigrams are almost entirely singletons (appearing nowhere else in the book).
 # Natural text re-uses common character transitions; garbled text does not.
 
-_GARBLED_WINDOW_SIZE = 12
-_GARBLED_MIN_SINGLETONS = 9   # singletons out of (window_size - 1) bigrams
-_GARBLED_MIN_CONSECUTIVE = 2  # consecutive flagged windows to form a span
+_GARBLED_WINDOW_SIZE = 24
+_GARBLED_MIN_SINGLETONS = 22  # singletons out of (window_size - 1) bigrams
+_GARBLED_MIN_CONSECUTIVE = 10  # consecutive flagged windows to form a span
 
 
 def _build_cjk_bigram_model(cjk_chars: List[str]) -> Dict[str, int]:
@@ -234,5 +234,4 @@ def clean_ocr_noise(markdown_text: str) -> str:
 
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
-
 

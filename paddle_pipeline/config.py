@@ -5,19 +5,36 @@ import re
 
 from typing import List, Dict, Any
 
-# Optional third-party dependencies – checked at runtime via check_dependencies()
+# Optional third-party dependencies – checked at runtime via check_dependencies().
+# Keep imports independent so an optional progress-bar dependency cannot mask
+# installed core conversion dependencies.
 try:
     import requests
-    import fitz  # PyMuPDF
-    from ebooklib import epub
-    from dotenv import load_dotenv
-    from tqdm import tqdm
-    load_dotenv()
 except ImportError:
     requests = None  # type: ignore[assignment]
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
     fitz = None  # type: ignore[assignment]
+
+try:
+    from ebooklib import epub
+except ImportError:
     epub = None  # type: ignore[assignment]
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None  # type: ignore[assignment]
+
+try:
+    from tqdm import tqdm
+except ImportError:
     tqdm = None  # type: ignore[assignment]
+
+if load_dotenv is not None:
+    load_dotenv()
 
 
 # --- Configuration ---
@@ -52,6 +69,8 @@ CHUNK_SIZE = _env_int("PADDLE_CHUNK_SIZE", 5, minimum=1)
 API_TIMEOUT_SECONDS = _env_int("PADDLE_API_TIMEOUT_SECONDS", 600, minimum=1)
 PADDLE_POLL_INTERVAL = _env_int("PADDLE_POLL_INTERVAL", 5, minimum=1)
 PADDLE_MAX_POLL_TIME = _env_int("PADDLE_MAX_POLL_TIME", 1800, minimum=1)
+PADDLE_PAGE_MARGIN_PT = _env_int("PADDLE_PAGE_MARGIN_PT", 12, minimum=0)
+PADDLE_BOTTOM_PADDING_PERCENT = _env_int("PADDLE_BOTTOM_PADDING_PERCENT", 5, minimum=0)
 MINERU_POLL_INTERVAL = _env_int("MINERU_POLL_INTERVAL", 5, minimum=1)
 MINERU_MAX_POLL_TIME = _env_int("MINERU_MAX_POLL_TIME", 1800, minimum=1)
 MINERU_CHUNK_SIZE = _env_int("MINERU_CHUNK_SIZE", 20, minimum=1)

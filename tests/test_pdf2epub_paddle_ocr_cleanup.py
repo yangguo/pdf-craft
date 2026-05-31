@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -399,11 +400,10 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
 
-        # window_size=12 (11 bigrams), min_singletons=9, min_consecutive=2
-        # => need ~13+ consecutive CJK chars where most bigrams are singletons.
-        # A sequence of 30 random unique chars guarantees all bigrams are novel.
+        # The detector is intentionally conservative: it should only report
+        # long runs where nearly all bigrams are novel.
         cjk_start = 0x4E00
-        garbled_run = "".join(chr(cjk_start + i) for i in range(30))
+        garbled_run = "".join(chr(cjk_start + i) for i in range(60))
 
         with tempfile.TemporaryDirectory() as td:
             epub_path = Path(td) / "book.epub"
@@ -454,6 +454,36 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertEqual(
             [], garbled_findings,
             f"Normal Chinese should not trigger garbled detection, got: {garbled_findings}",
+        )
+
+    def test_scan_epub_for_ocr_noise_allows_single_one_off_chinese_sentence(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        repeated_context = (
+            "今天天氣很好，我和朋友一起去公園散步。公園裡有很多花草樹木，"
+            "大家坐在長椅上聊天，慢慢說起城市生活和工作安排。"
+        )
+        one_off_sentence = "公元一九八四年中英聯合聲明正式簽署後香港前途逐漸明朗"
+        normal_text = ((repeated_context + "\n") * 20) + one_off_sentence
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    f"<html><body><p>{normal_text}</p></body></html>",
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        garbled_findings = [
+            item for item in findings if "garbled CJK" in item.get("token", "")
+        ]
+        self.assertEqual(
+            [], garbled_findings,
+            f"One normal one-off sentence should not trigger garbled detection, got: {garbled_findings}",
         )
 
     def test_scan_epub_for_ocr_noise_garbled_detection_ignores_short_text(self):
@@ -1268,6 +1298,37 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
             self.assertFalse(output_path.exists())
 
+    def test_strip_missing_image_references_removes_markdown_and_html_images(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod.epub_builder, "_strip_missing_image_references"))
+
+        markdown = (
+            "Before.\n"
+            "![](imgs/missing-a.jpg)\n"
+            '<div style="text-align: center;"><img src="imgs/missing-b.jpg" '
+            'alt="Image" width="99%" /></div>\n'
+            "<img alt=\"Image\" src='imgs/missing-c.jpg' width=\"50%\" />\n"
+            '<img src="imgs/kept.jpg" alt="Keep" />\n'
+            "After."
+        )
+
+        cleaned = mod.epub_builder._strip_missing_image_references(
+            markdown,
+            {
+                "imgs/missing-a.jpg",
+                "imgs/missing-b.jpg",
+                "imgs/missing-c.jpg",
+            },
+        )
+
+        self.assertIn("Before.", cleaned)
+        self.assertIn("After.", cleaned)
+        self.assertIn('src="imgs/kept.jpg"', cleaned)
+        self.assertNotIn("missing-a.jpg", cleaned)
+        self.assertNotIn("missing-b.jpg", cleaned)
+        self.assertNotIn("missing-c.jpg", cleaned)
+        self.assertNotIn('<div style="text-align: center;"></div>', cleaned)
+
     def test_apply_page_image_fallbacks_renders_sparse_family_tree_page(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "apply_page_image_fallbacks"))
@@ -1332,6 +1393,217 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
                 markdown["text"],
             )
             self.assertEqual(b"fake png", (image_dir / rel_path).read_bytes())
+
+    def test_apply_page_image_fallbacks_renders_empty_ocr_page_with_visible_marks(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "apply_page_image_fallbacks"))
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "",
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        class FakePixmap:
+            width = 10
+            height = 10
+            n = 3
+            samples = bytes([255, 255, 255] * 80 + [0, 0, 0] * 20)
+
+            def save(self, path):
+                Path(path).write_bytes(b"rendered manuscript page")
+
+        class FakePage:
+            def get_pixmap(self, matrix=None, clip=None, alpha=False):
+                return FakePixmap()
+
+        class FakeDoc:
+            page_count = 1
+
+            def __getitem__(self, index):
+                if index != 0:
+                    raise IndexError(index)
+                return FakePage()
+
+            def close(self):
+                pass
+
+        fake_fitz = SimpleNamespace(
+            open=lambda _path: FakeDoc(),
+            Matrix=lambda _x, _y: object(),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            image_dir = Path(td) / "images"
+            with mock.patch.object(mod.page_image_fallback, "fitz", fake_fitz):
+                count = mod.apply_page_image_fallbacks(
+                    "source.pdf",
+                    results,
+                    str(image_dir),
+                )
+
+            rel_path = "imgs/page_fallback_0001.png"
+            self.assertEqual(1, count)
+            markdown = results[0]["result"]["layoutParsingResults"][0]["markdown"]
+            self.assertEqual("", markdown["images"][rel_path])
+            self.assertIn(
+                f'<img src="{rel_path}" alt="Page image" width="100%" />',
+                markdown["text"],
+            )
+            self.assertEqual(
+                b"rendered manuscript page",
+                (image_dir / rel_path).read_bytes(),
+            )
+
+    def test_apply_page_image_fallbacks_reuses_single_pdf_open_for_multiple_pages(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "apply_page_image_fallbacks"))
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {"markdown": {"text": "", "images": {}}},
+                        {"markdown": {"text": "", "images": {}}},
+                    ]
+                }
+            }
+        ]
+
+        class FakePixmap:
+            width = 10
+            height = 10
+            n = 3
+            samples = bytes([255, 255, 255] * 80 + [0, 0, 0] * 20)
+
+            def save(self, path):
+                Path(path).write_bytes(b"rendered page")
+
+        class FakePage:
+            rect = SimpleNamespace(width=100, height=120)
+
+            def get_pixmap(self, matrix=None, clip=None, alpha=False):
+                return FakePixmap()
+
+        class FakeDoc:
+            page_count = 2
+
+            def __init__(self):
+                self.close_calls = 0
+
+            def __getitem__(self, index):
+                if index not in (0, 1):
+                    raise IndexError(index)
+                return FakePage()
+
+            def close(self):
+                self.close_calls += 1
+
+        fake_doc = FakeDoc()
+        open_calls = []
+
+        def fake_open(path):
+            open_calls.append(path)
+            return fake_doc
+
+        fake_fitz = SimpleNamespace(
+            open=fake_open,
+            Matrix=lambda _x, _y: object(),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            image_dir = Path(td) / "images"
+            with mock.patch.object(mod.page_image_fallback, "fitz", fake_fitz):
+                count = mod.apply_page_image_fallbacks(
+                    "source.pdf",
+                    results,
+                    str(image_dir),
+                )
+
+            self.assertEqual(2, count)
+            self.assertEqual(["source.pdf"], open_calls)
+            self.assertEqual(1, fake_doc.close_calls)
+            self.assertTrue((image_dir / "imgs/page_fallback_0001.png").exists())
+            self.assertTrue((image_dir / "imgs/page_fallback_0002.png").exists())
+
+    def test_apply_page_image_fallbacks_renders_page_when_image_asset_missing(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "apply_page_image_fallbacks"))
+
+        missing_rel_path = "imgs/missing-photo.jpg"
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": (
+                                    '<div style="text-align: center;">'
+                                    f'<img src="{missing_rel_path}" alt="Image" width="99%" />'
+                                    "</div>"
+                                ),
+                                "images": {missing_rel_path: "https://example.test/image.jpg"},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        class FakePixmap:
+            def save(self, path):
+                Path(path).write_bytes(b"fallback for missing image")
+
+        class FakePage:
+            def get_pixmap(self, matrix=None, clip=None, alpha=False):
+                return FakePixmap()
+
+        class FakeDoc:
+            page_count = 1
+
+            def __getitem__(self, index):
+                if index != 0:
+                    raise IndexError(index)
+                return FakePage()
+
+            def close(self):
+                pass
+
+        fake_fitz = SimpleNamespace(
+            open=lambda _path: FakeDoc(),
+            Matrix=lambda _x, _y: object(),
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            image_dir = Path(td) / "images"
+            with mock.patch.object(mod.page_image_fallback, "fitz", fake_fitz):
+                count = mod.apply_page_image_fallbacks(
+                    "source.pdf",
+                    results,
+                    str(image_dir),
+                )
+
+            rel_path = "imgs/page_fallback_0001.png"
+            self.assertEqual(1, count)
+            markdown = results[0]["result"]["layoutParsingResults"][0]["markdown"]
+            self.assertEqual("", markdown["images"][rel_path])
+            self.assertIn(
+                f'<img src="{rel_path}" alt="Page image" width="100%" />',
+                markdown["text"],
+            )
+            self.assertEqual(
+                b"fallback for missing image",
+                (image_dir / rel_path).read_bytes(),
+            )
 
     def test_repair_page_order_by_printed_numbers_swaps_adjacent_inversion(self):
         mod = _load_script_module()
@@ -1461,6 +1733,8 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         env_overrides = {
             "PADDLE_CHUNK_SIZE": "abc",
             "PADDLE_API_TIMEOUT_SECONDS": "def",
+            "PADDLE_PAGE_MARGIN_PT": "ghi",
+            "PADDLE_BOTTOM_PADDING_PERCENT": "jkl",
             "EPUB_COVER_MAX_EDGE": "ghi",
             "EPUB_COVER_JPEG_QUALITY": "jkl",
         }
@@ -1476,6 +1750,8 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         self.assertEqual(5, mod.CHUNK_SIZE)
         self.assertEqual(600, mod.API_TIMEOUT_SECONDS)
+        self.assertEqual(12, mod.PADDLE_PAGE_MARGIN_PT)
+        self.assertEqual(5, mod.PADDLE_BOTTOM_PADDING_PERCENT)
         self.assertEqual(2000, mod.DEFAULT_COVER_MAX_EDGE)
         self.assertEqual(82, mod.DEFAULT_COVER_JPEG_QUALITY)
 
@@ -1500,3 +1776,30 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertEqual(600, mod.API_TIMEOUT_SECONDS)
         self.assertEqual(2000, mod.DEFAULT_COVER_MAX_EDGE)
         self.assertEqual(82, mod.DEFAULT_COVER_JPEG_QUALITY)
+
+    def test_split_pdf_adds_side_margin_and_bottom_padding_for_edge_ocr(self):
+        mod = _load_script_module()
+        fitz = mod.paddle_api.fitz
+        if fitz is None:
+            self.skipTest("PyMuPDF is not installed")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_pdf = os.path.join(temp_dir, "edge.pdf")
+            doc = fitz.open()
+            doc.new_page(width=100, height=200)
+            doc.save(source_pdf)
+            doc.close()
+
+            chunk_paths = mod.paddle_api.split_pdf(source_pdf, chunk_size=1)
+            try:
+                chunk_doc = fitz.open(chunk_paths[0])
+                mediabox = chunk_doc[0].mediabox
+                chunk_doc.close()
+            finally:
+                if chunk_paths:
+                    shutil.rmtree(os.path.dirname(chunk_paths[0]), ignore_errors=True)
+
+        self.assertAlmostEqual(-12, mediabox.x0)
+        self.assertAlmostEqual(0, mediabox.y0)
+        self.assertAlmostEqual(112, mediabox.x1)
+        self.assertAlmostEqual(210, mediabox.y1)

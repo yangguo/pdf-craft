@@ -104,6 +104,25 @@ class TestStripPageHeaders(unittest.TestCase):
         result = _strip_page_headers(lines, fps)
         self.assertNotIn("「六四風雲」", result)
 
+    def test_preserves_mid_page_quoted_body_line(self):
+        fps = _build_header_fingerprints(None)
+        lines = [
+            "他停了一下，然後回答。",
+            "「我不同意。」",
+            "會議室裡一時安靜下來。",
+        ]
+        result = _strip_page_headers(lines, fps)
+        self.assertIn("「我不同意。」", result)
+
+    def test_preserves_mismatched_quoted_line_at_edge(self):
+        fps = _build_header_fingerprints(None)
+        lines = [
+            "「錯配\"",
+            "正文內容。",
+        ]
+        result = _strip_page_headers(lines, fps)
+        self.assertIn("「錯配\"", result)
+
     def test_preserves_long_chapterish_body_text(self):
         fps = _build_header_fingerprints(None)
         lines = [
