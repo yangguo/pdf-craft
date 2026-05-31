@@ -180,6 +180,12 @@ def main():
                             local_path
                         ):  # Don't re-download if exists
                             download_image(img_url, local_path)
+
+                # Strip base64 data URIs from the checkpoint to prevent
+                # multi-GB files; image files on disk are the source of truth.
+                if args.api == "mineru" and mineru_api.strip_checkpoint_data_uris(res):
+                    with open(json_checkpoint, "w") as f:
+                        json.dump(res, f)
             else:
                 _write(
                     f"[!] CRITICAL: Failed to process chunk {i + 1} "

@@ -20,6 +20,7 @@ from .config import (
     MINERU_API_URL,
     MINERU_API_TOKEN,
     MINERU_CHUNK_SIZE,
+    MINERU_LANGUAGE,
     MINERU_MAX_POLL_TIME,
     MINERU_MODEL_VERSION,
     MINERU_POLL_INTERVAL,
@@ -32,6 +33,24 @@ if not _VERIFY_SSL:
     import warnings as _warnings
     _warnings.filterwarnings("ignore", message="Unverified HTTPS request")
 _API_BASE = re.sub(r"/api/v\d+/.*$", "", MINERU_API_URL)
+
+
+def _add_ocr_guard_bands(page: Any) -> None:
+    """Add small white guard bands for MinerU OCR edge readability."""
+    rect = page.rect
+    # Keep this small to avoid confusing the VLM layout model while still
+    # protecting characters near the book spine and bottom page edge.
+    left_margin = 8
+    new_h = rect.height * 1.05
+    page.set_mediabox(fitz.Rect(-left_margin, 0, rect.width, new_h))
+    page.draw_rect(
+        fitz.Rect(-left_margin, 0, 0, new_h),
+        color=None, fill=(1, 1, 1),
+    )
+    page.draw_rect(
+        fitz.Rect(0, rect.height, rect.width, new_h),
+        color=None, fill=(1, 1, 1),
+    )
 
 
 def split_pdf(file_path: str, chunk_size: int | None = None) -> List[str]:
@@ -54,21 +73,7 @@ def split_pdf(file_path: str, chunk_size: int | None = None) -> List[str]:
         chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
 
         for page in chunk_doc:
-            rect = page.rect
-            # Add a small left margin (book spine side) so OCR can read
-            # characters near the inner edge that would otherwise be clipped.
-            # Keep margin small (8pt) to avoid confusing the VLM layout model.
-            _lm = 8
-            new_h = rect.height * 1.05
-            page.set_mediabox(fitz.Rect(-_lm, 0, rect.width, new_h))
-            page.draw_rect(
-                fitz.Rect(-_lm, 0, 0, new_h),
-                color=None, fill=(1, 1, 1),
-            )
-            page.draw_rect(
-                fitz.Rect(0, rect.height, rect.width, new_h),
-                color=None, fill=(1, 1, 1),
-            )
+            _add_ocr_guard_bands(page)
 
         chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
         chunk_doc.save(chunk_filename)
@@ -141,7 +146,7 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
                     "is_ocr": True,
                     "enable_formula": False,
                     "enable_table": True,
-                    "language": "ch_server",
+                    "language": MINERU_LANGUAGE,
                 },
                 headers=_api_headers(token),
                 timeout=60,
@@ -719,7 +724,13 @@ def reparse_checkpoint(checkpoint: Dict[str, Any],
     ``parse_pdf_chunk``), this re-downloads the ZIP and applies the
     latest version of ``_parse_zip``.  If the URL is no longer valid
     or the field is absent, the checkpoint is returned as-is.
+
+    After a successful reparse the ``_mineru_reparsed`` sentinel is set so
+    that subsequent runs skip re-downloading the ZIP.
     """
+    if checkpoint.get("_mineru_reparsed"):
+        return checkpoint
+
     zip_url = checkpoint.get("_mineru_zip_url")
     if not zip_url:
         return checkpoint
@@ -737,6 +748,27 @@ def reparse_checkpoint(checkpoint: Dict[str, Any],
     reparsed = _parse_zip(zip_data)
     if reparsed:
         reparsed["_mineru_zip_url"] = zip_url
+        reparsed["_mineru_reparsed"] = True
         return reparsed
 
     return checkpoint
+
+
+def strip_checkpoint_data_uris(res: Dict[str, Any]) -> bool:
+    """Replace base64 data URI image values with empty strings in-place.
+
+    Keeps the image keys (so ``_is_sparse_visual_page`` still sees a
+    non-empty dict for pages that have images) while removing the bulky
+    base64 payload that would otherwise bloat checkpoint files into the
+    gigabyte range.
+
+    Returns ``True`` if any URIs were stripped, ``False`` otherwise.
+    """
+    stripped = False
+    for page_res in res.get("result", {}).get("layoutParsingResults", []):
+        images_map = page_res.get("markdown", {}).get("images", {})
+        for rel_path, img_url in list(images_map.items()):
+            if isinstance(img_url, str) and img_url.startswith("data:"):
+                images_map[rel_path] = ""
+                stripped = True
+    return stripped
