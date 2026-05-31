@@ -419,6 +419,61 @@ class TestReparseCheckpointSentinel(unittest.TestCase):
         self.assertTrue(result.get("_mineru_reparsed"),
                         "_mineru_reparsed sentinel not set after successful reparse")
 
+    def test_parse_pdf_chunk_result_includes_reparsed_sentinel(self):
+        """parse_pdf_chunk must stamp _mineru_reparsed=True on the returned
+        checkpoint so that reparse_checkpoint skips the ZIP re-download on
+        the very first resume (not only after reparse has run once)."""
+        import requests as real_requests
+
+        import paddle_pipeline.mineru_api as api
+
+        if api.requests is None:
+            self.skipTest("requests dependency not installed")
+
+        class FakeRequests:
+            exceptions = real_requests.exceptions
+
+            def post(self, *args, **kwargs):
+                return _Response(payload={
+                    "code": 0,
+                    "data": {
+                        "batch_id": "batch-1",
+                        "file_urls": ["https://upload.example.test/chunk.pdf"],
+                    },
+                })
+
+            def put(self, *args, **kwargs):
+                return _Response(status_code=204)
+
+            def get(self, url, *args, **kwargs):
+                if "extract-results/batch/batch-1" in url:
+                    return _Response(payload={
+                        "code": 0,
+                        "data": {
+                            "extract_result": [{
+                                "state": "done",
+                                "full_zip_url": "https://download.example.test/result.zip",
+                            }]
+                        },
+                    })
+                return _Response(content=_result_zip())
+
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
+            chunk.write(b"%PDF-1.4\n")
+            chunk.flush()
+
+            with mock.patch.object(api, "requests", FakeRequests()):
+                with mock.patch.object(api.time, "sleep", return_value=None):
+                    result = api.parse_pdf_chunk(chunk.name, "token")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(
+            result.get("_mineru_reparsed"),
+            "_mineru_reparsed sentinel missing from parse_pdf_chunk result; "
+            "first resume will unnecessarily re-download the ZIP",
+        )
+
 
 class TestStripCheckpointDataUris(unittest.TestCase):
     def test_strip_clears_base64_values_but_preserves_keys(self):

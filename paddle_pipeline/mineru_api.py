@@ -284,6 +284,7 @@ def parse_pdf_chunk(chunk_path: str, token: str | None = None) -> Dict[str, Any]
                     # Stash the ZIP URL so the checkpoint can re-parse
                     # later when the parsing logic changes.
                     parsed["_mineru_zip_url"] = zip_url
+                    parsed["_mineru_reparsed"] = True
                     print(f"[*] MinerU: batch {batch_id} done")
                     return parsed
                 return None

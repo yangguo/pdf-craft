@@ -37,6 +37,17 @@ python pdf2epub_paddle.py book.pdf --title "书名" --no-toc
 
 # 严格模式 — 残留 OCR 噪声时报错
 python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
+
+# 审校扫描 — 找出疑似短段中文 OCR 乱码，不影响构建
+pdf2epub-ocr-review book.epub --limit 50 --min-score 0.68
+
+# MinerU 局部重跑 — 只重跑指定 PDF 页。
+# 默认只把疑似 OCR 乱码片段回填到 checkpoint。
+pdf2epub-mineru-rerun book.pdf --work-dir paddle_epub_work_<hash> --pages 71,75-79,82
+python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc --api mineru
+
+# 只有整页 OCR 都不可用时，才显式整页替换
+pdf2epub-mineru-rerun book.pdf --work-dir paddle_epub_work_<hash> --pages 82 --replace-page
 ```
 
 ### 参数说明
@@ -62,11 +73,13 @@ python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 | `MINERU_CHUNK_SIZE` | `20` | 每块页数（最大 200） |
 | `MINERU_POLL_INTERVAL` | `5` | 结果轮询间隔（秒） |
 | `MINERU_MAX_POLL_TIME` | `1800` | 单批次最大等待时间（秒） |
+| `MINERU_LANGUAGE` | `chinese_cht` | MinerU OCR 语言包；手写体较多时可改为 `ch_server` |
 | `MINERU_VERIFY_SSL` | `1` | 设为 `0` 关闭 SSL 验证 |
 
 ### 断点续传
 
 每个 chunk 的处理进度保存在 `paddle_epub_work_<hash>/` 目录中。中断后重新运行相同命令即可从上次位置继续。
+`pdf2epub-mineru-rerun` 只更新指定页所在的 checkpoint JSON，不会重新上传已经完成的整块。默认只采纳 MinerU 重跑结果中的疑似乱码修复片段，其余正文保持原样；只有需要整页覆盖时才使用 `--replace-page`。
 
 ## 功能
 
@@ -76,6 +89,8 @@ python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
 - **图片嵌入**：保留原 PDF 中的插图、照片和图表
 - **脚注处理**：提取并链接 OCR 检测到的脚注
 - **OCR 噪声清理**：过滤常见的 PaddleOCR 识别噪声（纯数字表格、伪 LaTeX 等）
+- **OCR 审校扫描**：按分数列出疑似短段中文乱码，供人工核对或二次 OCR
+- **MinerU 局部重跑**：只对指定 PDF 页重新 OCR，并回写已有 checkpoint
 - **目录修复**：修正 TOC 目录链接指向正确的章节标题
 
 ## 许可证
