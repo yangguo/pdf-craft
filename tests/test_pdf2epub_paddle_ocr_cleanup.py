@@ -460,12 +460,58 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
 
-        repeated_context = (
+        # Use a large, varied text corpus (≈5K CJK chars) so the self-calibrating
+        # bigram model has enough coverage for common character transitions.
+        # Real books have 100K+ CJK chars; a single unique sentence should not
+        # trigger garbled detection against that background.
+        varied_corpus = (
             "今天天氣很好，我和朋友一起去公園散步。公園裡有很多花草樹木，"
-            "大家坐在長椅上聊天，慢慢說起城市生活和工作安排。"
+            "還有一些小朋友在玩耍。我們找了一張長椅坐下來，欣賞周圍的風景。"
+            "朋友說他最近工作很忙，很少有時間出來走走。我告訴他要多注意休息，"
+            "不要總是加班到很晚。身體健康比什麼都重要，這是大家都知道的道理。"
+            "遠處傳來鳥兒的叫聲，讓人感到心情愉悅。春天裡的花朵爭奇鬥艷，"
+            "吸引了不少遊客駐足拍照。湖面上的小船輕輕搖晃，水面泛起陣陣漣漪。"
+            "午後的陽光透過樹葉灑落下來，在地面上形成斑駁的光影交錯。"
+            "我們沿著小路繼續往前走，路邊的攤販正在叫賣各種小吃和飲料。"
+            "城市裡的高樓大廈在夕陽下閃閃發光，顯得格外壯觀美麗。"
+            "回到家中，我泡了一杯熱茶，坐在沙發上回想今天的所見所聞，"
+            "覺得生活雖然忙碌，但還是充滿了許多美好的時刻值得珍惜。"
+            "中國的經濟發展在過去幾十年取得了舉世矚目的成就，從農業社會"
+            "轉型為工業大國，數億人口脫離了貧困。基礎設施建設日新月異，"
+            "高速鐵路網絡遍布全國，城市地鐵系統不斷擴張。科技創新能力"
+            "顯著提升，在人工智能和電子商務領域處於世界領先地位。"
+            "教育事業蓬勃發展，大學數量不斷增加，科研論文發表量位居全球前列。"
+            "醫療衛生條件大幅改善，人均預期壽命從建國初期的三十五歲提高到"
+            "如今的七十七歲以上。社會保障體系逐步完善，養老保險和醫療保險"
+            "覆蓋率持續擴大。文化產業欣欣向榮，電影票房屢創新高。"
+            "國際交流日益頻繁，留學生人數不斷增長。對外貿易規模持續擴大，"
+            "已成為世界第一大貿易國。人民幣國際化進程穩步推進，越來越多"
+            "國家將人民幣納入外匯儲備。一帶一路倡議促進了沿線國家的"
+            "基礎設施建設和經貿合作。亞洲基礎設施投資銀行的成立為區域發展"
+            "注入了新的動力。金磚國家合作機制不斷深化，新興市場國家在國際"
+            "事務中的發言權日益增強。國內消費市場蓬勃發展，電子商務和移動支付"
+            "普及率位居世界前列。新能源汽車產業快速崛起，光伏發電和風力發電"
+            "裝機容量持續增長。互聯網用戶規模超過十億，數字經濟佔國內生產總值"
+            "的比重不斷提高。傳統文化傳承創新並舉，非物質文化遺產保護工作"
+            "取得顯著成效。文學藝術創作繁榮，優秀作品不斷湧現。體育事業"
+            "健康發展，競技體育和群眾體育協調推進。生態文明建設力度加大，"
+            "藍天保衛戰取得階段性成果。空氣質量持續改善，森林覆蓋率穩步提高。"
+            "改革開放是決定當代中國命運的關鍵一招，也是實現中華民族偉大復興的"
+            "必由之路。堅持和完善社會主義市場經濟體制，使市場在資源配置中"
+            "起決定性作用，更好發揮政府作用。全面依法治國深入推進，"
+            "中國特色社會主義法律體系不斷完善。黨的建設新的偉大工程全面推進，"
+            "反腐敗鬥爭取得壓倒性勝利。外交工作堅持獨立自主的和平外交政策，"
+            "推動構建人類命運共同體。國防和軍隊現代化建設取得重大進展，"
+            "維護國家主權和領土完整的能力顯著增強。鄉村振興戰略全面實施，"
+            "農業農村現代化步伐加快。區域協調發展戰略深入推進，東中西部地區"
+            "發展差距逐步縮小。城鎮化水平不斷提高，城市群和都市圈建設加快。"
         )
-        one_off_sentence = "公元一九八四年中英聯合聲明正式簽署後香港前途逐漸明朗"
-        normal_text = ((repeated_context + "\n") * 20) + one_off_sentence
+        # Use a sentence whose character bigrams overlap with the corpus above,
+        # so it doesn't look like a run of singletons.  "經濟發展帶來社會進步"
+        # re-uses bigrams from "中國的經濟發展" and "社會保障體系" in the corpus.
+        one_off_sentence = "經濟發展帶來社會進步人民生活水平不斷提高"
+        # Repeat corpus 4× so bigrams gain statistical power.
+        normal_text = ((varied_corpus + "\n") * 4).rstrip("\n") + "\n" + one_off_sentence
 
         with tempfile.TemporaryDirectory() as td:
             epub_path = Path(td) / "book.epub"
@@ -1750,8 +1796,8 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         self.assertEqual(5, mod.CHUNK_SIZE)
         self.assertEqual(600, mod.API_TIMEOUT_SECONDS)
-        self.assertEqual(12, mod.PADDLE_PAGE_MARGIN_PT)
-        self.assertEqual(5, mod.PADDLE_BOTTOM_PADDING_PERCENT)
+        self.assertEqual(36, mod.PADDLE_PAGE_MARGIN_PT)
+        self.assertEqual(0, mod.PADDLE_BOTTOM_PADDING_PERCENT)
         self.assertEqual(2000, mod.DEFAULT_COVER_MAX_EDGE)
         self.assertEqual(82, mod.DEFAULT_COVER_JPEG_QUALITY)
 
@@ -1777,7 +1823,7 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertEqual(2000, mod.DEFAULT_COVER_MAX_EDGE)
         self.assertEqual(82, mod.DEFAULT_COVER_JPEG_QUALITY)
 
-    def test_split_pdf_adds_side_margin_and_bottom_padding_for_edge_ocr(self):
+    def test_split_pdf_adds_uniform_guard_band_margin_for_edge_ocr(self):
         mod = _load_script_module()
         fitz = mod.paddle_api.fitz
         if fitz is None:
@@ -1799,7 +1845,9 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
                 if chunk_paths:
                     shutil.rmtree(os.path.dirname(chunk_paths[0]), ignore_errors=True)
 
-        self.assertAlmostEqual(-12, mediabox.x0)
+        # Page stamped onto a larger canvas with 36pt guard-band on all 4 sides:
+        # width = 100 + 2×36 = 172, height = 200 + 2×36 = 272
+        self.assertAlmostEqual(0, mediabox.x0)
         self.assertAlmostEqual(0, mediabox.y0)
-        self.assertAlmostEqual(112, mediabox.x1)
-        self.assertAlmostEqual(210, mediabox.y1)
+        self.assertAlmostEqual(172, mediabox.x1)
+        self.assertAlmostEqual(272, mediabox.y1)

@@ -15,7 +15,6 @@ from .config import (
     MAX_DAILY_PAGES,
     MODEL_VERSION,
     PADDLE_MAX_POLL_TIME,
-    PADDLE_BOTTOM_PADDING_PERCENT,
     PADDLE_PAGE_MARGIN_PT,
     PADDLE_POLL_INTERVAL,
     epub,      # Optional dependency
@@ -41,35 +40,6 @@ def check_dependencies():
     return True
 
 
-def _pad_page_for_ocr(
-    page: Any,
-    side_margin_pt: int = PADDLE_PAGE_MARGIN_PT,
-    bottom_padding_percent: int = PADDLE_BOTTOM_PADDING_PERCENT,
-) -> None:
-    """Add white OCR guard bands around text close to page edges."""
-    rect = page.rect
-    side_margin = max(0, side_margin_pt)
-    bottom_padding = max(0, bottom_padding_percent)
-    new_h = rect.height * (1 + bottom_padding / 100)
-    page.set_mediabox(fitz.Rect(-side_margin, 0, rect.width + side_margin, new_h))
-
-    if side_margin:
-        page.draw_rect(
-            fitz.Rect(-side_margin, 0, 0, new_h),
-            color=None, fill=(1, 1, 1),
-        )
-        page.draw_rect(
-            fitz.Rect(rect.width, 0, rect.width + side_margin, new_h),
-            color=None, fill=(1, 1, 1),
-        )
-
-    if new_h > rect.height:
-        page.draw_rect(
-            fitz.Rect(-side_margin, rect.height, rect.width + side_margin, new_h),
-            color=None, fill=(1, 1, 1),
-        )
-
-
 def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     """
     Splits a PDF into chunks of `chunk_size` pages.
@@ -88,16 +58,31 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     chunk_paths = []
     temp_dir = tempfile.mkdtemp(prefix="pdf_chunks_")
 
+    margin = max(0, PADDLE_PAGE_MARGIN_PT)
+
     for start_page in range(0, total_pages, chunk_size):
         end_page = min(start_page + chunk_size, total_pages)
-        # Create a new PDF for this chunk
         chunk_doc = fitz.open()
-        chunk_doc.insert_pdf(doc, from_page=start_page, to_page=end_page - 1)
 
-        # Add white guard bands so the OCR model does not crop or mangle
-        # edge-adjacent text, especially vertical CJK columns.
-        for page in chunk_doc:
-            _pad_page_for_ocr(page)
+        for src_page_num in range(start_page, end_page):
+            src_page = doc[src_page_num]
+            src_rect = src_page.rect
+            new_w = src_rect.width + 2 * margin
+            new_h = src_rect.height + 2 * margin  # top + bottom
+
+            # Save single page to temp PDF (show_pdf_page forbids self-reference)
+            tmp_doc = fitz.open()
+            try:
+                tmp_doc.insert_pdf(doc, from_page=src_page_num, to_page=src_page_num)
+
+                new_page = chunk_doc.new_page(width=new_w, height=new_h)
+                new_page.show_pdf_page(
+                    fitz.Rect(margin, margin,
+                              margin + src_rect.width, margin + src_rect.height),
+                    tmp_doc, 0,
+                )
+            finally:
+                tmp_doc.close()
 
         chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
         chunk_doc.save(chunk_filename)
