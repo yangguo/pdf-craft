@@ -1,4 +1,5 @@
 import io
+import os
 import tempfile
 import unittest
 import zipfile
@@ -77,13 +78,19 @@ class TestMineruApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
+        fd, chunk_path = tempfile.mkstemp(dir=repo_root)
+        try:
+            os.write(fd, b"%PDF-1.4\n")
+            os.close(fd)
 
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
+        finally:
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
 
         self.assertIsNotNone(result)
         self.assertEqual("chinese_cht", fake_requests.post_payloads[0]["language"])
@@ -142,13 +149,19 @@ class TestMineruApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
+        fd, chunk_path = tempfile.mkstemp(dir=repo_root)
+        try:
+            os.write(fd, b"%PDF-1.4\n")
+            os.close(fd)
 
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
+        finally:
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
 
         self.assertIsNotNone(result)
         self.assertEqual(fake_requests.post_calls, 2)
@@ -209,13 +222,19 @@ class TestMineruApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
+        fd, chunk_path = tempfile.mkstemp(dir=repo_root)
+        try:
+            os.write(fd, b"%PDF-1.4\n")
+            os.close(fd)
 
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
+        finally:
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
 
         self.assertIsNotNone(result)
         self.assertEqual(fake_requests.post_calls, 1)
@@ -279,13 +298,19 @@ class TestMineruApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
+        fd, chunk_path = tempfile.mkstemp(dir=repo_root)
+        try:
+            os.write(fd, b"%PDF-1.4\n")
+            os.close(fd)
 
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
+        finally:
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
 
         self.assertIsNotNone(result)
         self.assertEqual(fake_requests.post_calls, 1)
@@ -351,13 +376,19 @@ class TestMineruApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
+        fd, chunk_path = tempfile.mkstemp(dir=repo_root)
+        try:
+            os.write(fd, b"%PDF-1.4\n")
+            os.close(fd)
 
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
+        finally:
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
 
         self.assertIsNone(result)
         self.assertEqual(fake_requests.post_calls, 1)
@@ -459,13 +490,19 @@ class TestReparseCheckpointSentinel(unittest.TestCase):
                 return _Response(content=_result_zip())
 
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
+        fd, chunk_path = tempfile.mkstemp(dir=repo_root)
+        try:
+            os.write(fd, b"%PDF-1.4\n")
+            os.close(fd)
 
             with mock.patch.object(api, "requests", FakeRequests()):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
+        finally:
+            try:
+                os.unlink(chunk_path)
+            except OSError:
+                pass
 
         self.assertIsNotNone(result)
         self.assertTrue(

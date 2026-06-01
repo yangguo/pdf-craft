@@ -303,10 +303,18 @@ def _replace_checkpoint_page(
     with tempfile.NamedTemporaryFile(
         "w", dir=checkpoint_dir, suffix=".tmp", delete=False, encoding="utf-8"
     ) as tf:
-        json.dump(checkpoint, tf, ensure_ascii=False, indent=2)
-        tf.flush()
-        os.fsync(tf.fileno())
-    os.replace(tf.name, checkpoint_path)
+        tmp_name = tf.name
+        try:
+            json.dump(checkpoint, tf, ensure_ascii=False, indent=2)
+            tf.flush()
+            os.fsync(tf.fileno())
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+    os.replace(tmp_name, checkpoint_path)
 
     text = replacement.get("markdown", {}).get("text", "")
     preview = " ".join(str(text).split())[:120]

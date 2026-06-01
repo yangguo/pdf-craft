@@ -370,7 +370,7 @@ class TestMineruRerun(unittest.TestCase):
         result = _should_patch_hunk(original_span, replacement_span, char_freq, bigram_freq)
         self.assertFalse(result, "Should not patch garbled span with another garbled replacement")
 
-    def test_build_cjk_model_excludes_target_page_when_index_given(self):
+    def test_strip_single_page_running_header_preserves_chapter_headings(self):
         """_strip_single_page_running_header must preserve chapter-pattern
         headings (e.g. '第三章') unconditionally, even when the original OCR
         text was too garbled to contain the heading text for confirmation."""
