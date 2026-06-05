@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repair OCR EPUBs"
+  short_description: "Find and repair garbled or missing OCR text in EPUBs"
+  default_prompt: "Review the generated EPUB for OCR garbling, missing text, TOC breaks, and cross-page or figure-adjacent errors; repair with targeted MinerU reruns when appropriate and verify the final EPUB."

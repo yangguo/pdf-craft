@@ -14,6 +14,7 @@ from .config import (
     CHUNK_SIZE,
     MAX_DAILY_PAGES,
     MODEL_VERSION,
+    PADDLE_BOTTOM_PADDING_PERCENT,
     PADDLE_MAX_POLL_TIME,
     PADDLE_PAGE_MARGIN_PT,
     PADDLE_POLL_INTERVAL,
@@ -59,6 +60,7 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     temp_dir = tempfile.mkdtemp(prefix="pdf_chunks_")
 
     margin = max(0, PADDLE_PAGE_MARGIN_PT)
+    bottom_padding_percent = max(0, PADDLE_BOTTOM_PADDING_PERCENT)
 
     for start_page in range(0, total_pages, chunk_size):
         end_page = min(start_page + chunk_size, total_pages)
@@ -68,7 +70,8 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
             src_page = doc[src_page_num]
             src_rect = src_page.rect
             new_w = src_rect.width + 2 * margin
-            new_h = src_rect.height + 2 * margin  # top + bottom
+            extra_bottom = src_rect.height * (bottom_padding_percent / 100.0)
+            new_h = src_rect.height + 2 * margin + extra_bottom
 
             # Save single page to temp PDF (show_pdf_page forbids self-reference)
             tmp_doc = fitz.open()

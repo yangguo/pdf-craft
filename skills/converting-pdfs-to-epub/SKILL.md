@@ -57,7 +57,7 @@ python3 skills/converting-pdfs-to-epub/scripts/pdf_to_epub_hybrid.py verify book
   --expected-label "Table 2.1"
 ```
 
-If the repository has a better project-specific converter, prefer that. For Paddle/OCR requests or scanned PDFs, inspect `pdf2epub_paddle.py` or the project OCR workflow, but still apply the verification checklist below.
+If the repository has a better project-specific converter, prefer that. For Paddle/OCR requests or scanned PDFs, inspect `pdf2epub_paddle.py` or the project OCR workflow, but still apply the verification checklist below. If the generated EPUB has CJK garbling, missing sentences, broken chapter boundaries, or cross-page/figure-adjacent OCR loss, switch to the `repairing-ocr-epubs` skill.
 
 ## Visual Retention
 
@@ -106,6 +106,7 @@ Confirm:
 | Captions missing after visual cleanup | Keep all extracted page text, then add visual snapshots |
 | Remote image timeout | Download/embed images locally or remove remote references |
 | OCR produces noisy layout | Use PDF text layer when available; reserve OCR for scanned pages |
+| OCR text has CJK garbling or missing spans | Use `repairing-ocr-epubs`: scan, map to PDF pages, run targeted MinerU reruns, then rebuild and verify |
 
 ## Reporting
 
