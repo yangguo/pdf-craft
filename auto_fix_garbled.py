@@ -30,6 +30,10 @@ from paddle_pipeline.config import (
     epub as ebooklib_epub,
 )
 from paddle_pipeline.ocr_review import find_suspicious_cjk_spans_in_epub
+from paddle_pipeline.page_boundary_review import (
+    annotate_candidates_with_epub_continuity,
+    find_page_boundary_candidates,
+)
 from paddle_pipeline import mineru_rerun
 
 
@@ -158,8 +162,34 @@ def _verify_epub_package(epub_path: str) -> Dict[str, Any]:
                 report["errors"].append(f"declared OPF rootfile missing: {opf_path}")
             elif not opf_path:
                 report["errors"].append("content.opf missing")
-            report["has_nav"] = bool({"nav.xhtml", "nav.html"} & basenames)
-            report["has_ncx"] = "toc.ncx" in basenames
+
+            nav_targets: Set[str] = set()
+            ncx_targets: Set[str] = set()
+            if report["has_opf"] and opf_path:
+                try:
+                    opf_xml = archive.read(opf_path)
+                    opf_root = ET.fromstring(opf_xml)
+                    opf_dir = os.path.dirname(opf_path)
+                    for item in opf_root.findall(".//{*}item"):
+                        href = item.attrib.get("href", "").strip()
+                        if not href:
+                            continue
+                        normalized_href = os.path.normpath(
+                            os.path.join(opf_dir, href)
+                        ).replace("\\", "/")
+                        properties = item.attrib.get("properties", "")
+                        if "nav" in properties.split():
+                            nav_targets.add(normalized_href)
+                        if item.attrib.get("media-type") == "application/x-dtbncx+xml":
+                            ncx_targets.add(normalized_href)
+                except (KeyError, ET.ParseError) as exc:
+                    report["errors"].append(f"cannot parse OPF manifest: {exc}")
+
+            report["has_nav"] = bool(
+                {"nav.xhtml", "nav.html"} & basenames
+                or nav_targets & name_set
+            )
+            report["has_ncx"] = bool("toc.ncx" in basenames or ncx_targets & name_set)
             if not report["has_nav"]:
                 report["errors"].append("EPUB nav document missing")
             if not report["has_ncx"]:
@@ -202,6 +232,21 @@ def _write_json_report(path: str | None, report: Dict[str, Any]) -> None:
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(report, fh, ensure_ascii=False, indent=2)
     print(f"[*] Wrote report: {os.path.abspath(path)}")
+
+
+def _print_page_boundary_candidates(candidates: List[Dict[str, Any]]) -> None:
+    """Print a compact list of checkpoint boundary review candidates."""
+    print(f"[*] {len(candidates)} page-boundary candidates")
+    for item in candidates[:20]:
+        reason_text = ",".join(item.get("reasons", []))
+        print(
+            "    pages={previous_page}->{next_page} score={score:.3f} "
+            "reasons={reason_text}".format(reason_text=reason_text, **item)
+        )
+        print(f"      tail: {item.get('tail', '')}")
+        print(f"      head: {item.get('head', '')}")
+    if len(candidates) > 20:
+        print(f"    ... {len(candidates) - 20} more candidates in JSON report")
 
 
 def _map_spans_to_pages(work_dir: str, garbled_spans: Dict[str, List[str]]) -> Set[int]:
@@ -263,6 +308,13 @@ def main(argv: list[str] | None = None) -> None:
                               "then stop before MinerU rerun"))
     parser.add_argument("--json-report", default=None,
                         help="Write scan, mapping, and validation details as JSON")
+    parser.add_argument("--scan-boundaries", action="store_true",
+                        help=("Also scan OCR checkpoints for page-boundary "
+                              "missing-sentence candidates"))
+    parser.add_argument("--boundary-limit", type=int, default=80,
+                        help="Maximum page-boundary candidates to report")
+    parser.add_argument("--boundary-min-score", type=float, default=0.70,
+                        help="Minimum page-boundary suspicion score, 0-1")
     parser.add_argument("--limit", type=int, default=80,
                         help="Maximum suspicious CJK candidates to consider")
     parser.add_argument("--min-score", type=float, default=0.68,
@@ -281,7 +333,9 @@ def main(argv: list[str] | None = None) -> None:
         "scan_only": args.scan_only,
         "dry_run": args.dry_run,
         "garbled": {},
+        "page_boundaries": [],
         "target_pages": [],
+        "warnings": [],
         "verification": None,
     }
 
@@ -320,6 +374,29 @@ def main(argv: list[str] | None = None) -> None:
     for fname, spans in garbled.items():
         print(f"    {os.path.basename(fname):50s} {len(spans)} spans")
 
+    boundary_candidates: List[Dict[str, Any]] = []
+    if args.scan_boundaries:
+        print()
+        print("=" * 60)
+        print("[boundary] Scanning checkpoint page boundaries")
+        print("=" * 60)
+        if not os.path.isdir(work_dir):
+            warning = f"work directory not found for boundary scan: {work_dir}"
+            run_report["warnings"].append(warning)
+            print(f"[warning] {warning}")
+        else:
+            boundary_candidates = find_page_boundary_candidates(
+                work_dir,
+                min_score=args.boundary_min_score,
+                limit=args.boundary_limit,
+            )
+            boundary_candidates = annotate_candidates_with_epub_continuity(
+                boundary_candidates,
+                output_epub,
+            )
+            run_report["page_boundaries"] = boundary_candidates
+            _print_page_boundary_candidates(boundary_candidates)
+
     if args.scan_only or not garbled:
         print()
         print("=" * 60)
@@ -332,7 +409,13 @@ def main(argv: list[str] | None = None) -> None:
         if not verification["ok"]:
             sys.exit(1)
     if not garbled:
-        print("[*] EPUB is clean, nothing to fix.")
+        if boundary_candidates:
+            print(
+                "[!] No garbled spans found, but page-boundary candidates "
+                "need PDF or second-OCR review."
+            )
+        else:
+            print("[*] EPUB is clean, nothing to fix.")
         return
     if args.scan_only:
         return
@@ -360,7 +443,10 @@ def main(argv: list[str] | None = None) -> None:
         print("[*] Dry run requested; stopping before MinerU rerun.")
         verification = _verify_epub_package(output_epub)
         run_report["verification"] = verification
+        _print_epub_verification(verification)
         _write_json_report(args.json_report, run_report)
+        if not verification["ok"]:
+            sys.exit(1)
         return
 
     # --- Step 4: MinerU rerun ---

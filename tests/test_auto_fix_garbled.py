@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from unittest import mock
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -102,6 +103,51 @@ class TestAutoFixGarbledVerification(unittest.TestCase):
         self.assertTrue(report["ok"], report)
         self.assertTrue(report["has_opf"], report)
 
+    def test_verify_epub_package_detects_nav_by_opf_properties(self):
+        from auto_fix_garbled import _verify_epub_package
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "opf-nav.epub"
+            with ZipFile(epub_path, "w") as archive:
+                archive.writestr("mimetype", "application/epub+zip", compress_type=0)
+                archive.writestr(
+                    "META-INF/container.xml",
+                    (
+                        '<?xml version="1.0"?>'
+                        '<container version="1.0" '
+                        'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                        "<rootfiles>"
+                        '<rootfile full-path="OEBPS/book.opf" '
+                        'media-type="application/oebps-package+xml"/>'
+                        "</rootfiles>"
+                        "</container>"
+                    ),
+                )
+                archive.writestr(
+                    "OEBPS/book.opf",
+                    (
+                        '<?xml version="1.0" encoding="utf-8"?>'
+                        '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+                        "<manifest>"
+                        '<item id="nav" href="text/toc-custom.xhtml" '
+                        'media-type="application/xhtml+xml" properties="nav"/>'
+                        '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>'
+                        "</manifest>"
+                        "</package>"
+                    ),
+                )
+                archive.writestr(
+                    "OEBPS/text/toc-custom.xhtml",
+                    "<html><body><nav>TOC</nav></body></html>",
+                )
+                archive.writestr("OEBPS/toc.ncx", "<ncx></ncx>")
+
+            with mock.patch("auto_fix_garbled.ebooklib_epub", None):
+                report = _verify_epub_package(str(epub_path))
+
+        self.assertTrue(report["has_nav"], report)
+        self.assertTrue(report["ok"], report)
+
 
 class TestAutoFixGarbledMainMetadata(unittest.TestCase):
     def test_main_allows_scan_without_metadata_when_epub_exists_and_clean(self):
@@ -132,6 +178,112 @@ class TestAutoFixGarbledMainMetadata(unittest.TestCase):
                 ),
             ):
                 main([str(pdf_path), "--output", str(output_epub)])
+
+    def test_main_scan_only_can_include_page_boundary_candidates_in_report(self):
+        from auto_fix_garbled import main
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pdf_path = root / "book.pdf"
+            output_epub = root / "book.epub"
+            report_path = root / "scan.json"
+            pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            output_epub.write_bytes(b"placeholder")
+            boundary_candidates = [
+                {
+                    "previous_page": 53,
+                    "next_page": 54,
+                    "score": 0.9,
+                    "reasons": ["open_tail_suffix"],
+                    "tail": "即令她想和他長相",
+                    "head": "蔣和許多女子發生性關係",
+                }
+            ]
+            annotated_candidates = [
+                {
+                    **boundary_candidates[0],
+                    "epub_status": "checkpoint_boundary_present",
+                    "epub_boundary_present": True,
+                }
+            ]
+            with (
+                mock.patch("auto_fix_garbled._find_work_dir", return_value=str(root)),
+                mock.patch("auto_fix_garbled._find_garbled_spans", return_value={}),
+                mock.patch(
+                    "auto_fix_garbled.find_page_boundary_candidates",
+                    return_value=boundary_candidates,
+                ),
+                mock.patch(
+                    "auto_fix_garbled.annotate_candidates_with_epub_continuity",
+                    return_value=annotated_candidates,
+                ) as annotate,
+                mock.patch(
+                    "auto_fix_garbled._verify_epub_package",
+                    return_value={
+                        "path": str(output_epub),
+                        "ok": True,
+                        "errors": [],
+                        "warnings": [],
+                        "entry_count": 1,
+                        "mimetype_first": True,
+                        "mimetype_stored": True,
+                        "has_opf": True,
+                        "has_nav": True,
+                        "has_ncx": True,
+                        "ebooklib_items": 1,
+                    },
+                ),
+            ):
+                main([
+                    str(pdf_path),
+                    "--output", str(output_epub),
+                    "--scan-only",
+                    "--scan-boundaries",
+                    "--json-report", str(report_path),
+                ])
+
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+
+        annotate.assert_called_once_with(boundary_candidates, str(output_epub))
+        self.assertEqual(annotated_candidates, report["page_boundaries"])
+
+    def test_main_dry_run_exits_nonzero_when_verification_fails(self):
+        from auto_fix_garbled import main
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pdf_path = root / "book.pdf"
+            output_epub = root / "book.epub"
+            pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+            output_epub.write_bytes(b"placeholder")
+            with (
+                mock.patch("auto_fix_garbled._find_work_dir", return_value=str(root)),
+                mock.patch(
+                    "auto_fix_garbled._find_garbled_spans",
+                    return_value={"chapter_1.xhtml": ["疑似亂碼：甲乙丙丁戊己"]},
+                ),
+                mock.patch("auto_fix_garbled._map_spans_to_pages", return_value={7}),
+                mock.patch(
+                    "auto_fix_garbled._verify_epub_package",
+                    return_value={
+                        "path": str(output_epub),
+                        "ok": False,
+                        "errors": ["EPUB nav document missing"],
+                        "warnings": [],
+                        "entry_count": 1,
+                        "mimetype_first": True,
+                        "mimetype_stored": True,
+                        "has_opf": True,
+                        "has_nav": False,
+                        "has_ncx": True,
+                        "ebooklib_items": 1,
+                    },
+                ),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    main([str(pdf_path), "--output", str(output_epub), "--dry-run"])
+
+        self.assertEqual(1, raised.exception.code)
 
 
 class TestAutoFixGarbledMapping(unittest.TestCase):
