@@ -17,6 +17,99 @@ from .ocr_noise import clean_ocr_noise
 
 # Chinese numerals used in page numbers
 _CN_NUMERALS = set("零一二三四五六七八九十百千")
+_MANUAL_HEADING_BRACKET_RE = re.compile(
+    r"^[\(（〔【\[]\s*"
+    r"(第[零一二三四五六七八九十百千0-9]+[章節节编編篇部卷])"
+    r"\s*[\)）〕】\]]\s*"
+)
+_MANUAL_HEADING_PREFIX_RE = re.compile(
+    r"^(第[零一二三四五六七八九十百千0-9]+[章節节编編篇部卷])\s+"
+)
+
+
+def _normalize_manual_heading_text(text: Any) -> str:
+    """Return a stable key for matching manually confirmed OCR headings."""
+    value = str(text or "").strip()
+    value = re.sub(r"^#{1,6}\s*", "", value)
+    value = re.sub(r"\$\s*\\underline\{(.+?)\}\s*\$", "", value).strip()
+    value = re.sub(r"^\d+\s+", "", value).strip()
+    value = _MANUAL_HEADING_BRACKET_RE.sub(r"\1 ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def _manual_heading_sources(
+    heading: Dict[str, Any],
+    *,
+    include_aliases: bool = True,
+) -> list[str]:
+    """Return the display title plus any OCR/source aliases for a heading."""
+    values: list[str] = [str(heading.get("title", ""))]
+    for key in ("match", "source", "source_title", "ocr", "ocr_title"):
+        raw = heading.get(key)
+        if isinstance(raw, str):
+            values.append(raw)
+        elif isinstance(raw, list):
+            values.extend(str(item) for item in raw)
+    raw_matches = heading.get("matches")
+    if isinstance(raw_matches, list):
+        values.extend(str(item) for item in raw_matches)
+    if include_aliases:
+        raw_aliases = heading.get("aliases")
+        if isinstance(raw_aliases, list):
+            values.extend(str(item) for item in raw_aliases)
+    return values
+
+
+def _build_confirmed_heading_lookup(
+    confirmed_headings: List[Dict] | None,
+) -> dict[tuple[int, str], str]:
+    """Map (page, normalized OCR heading) to the intended display title."""
+    lookup: dict[tuple[int, str], str] = {}
+    if confirmed_headings is None:
+        return lookup
+
+    for heading in confirmed_headings:
+        title = str(heading.get("title", "")).strip()
+        if not title:
+            continue
+        page = int(heading["page"])
+        for source in _manual_heading_sources(heading, include_aliases=False):
+            key = _normalize_manual_heading_text(source)
+            if not key:
+                continue
+            lookup[(page, key)] = title
+            prefix_match = _MANUAL_HEADING_PREFIX_RE.match(key)
+            if prefix_match:
+                lookup[(page, prefix_match.group(1))] = title
+    return lookup
+
+
+def _build_page_start_heading_lookup(
+    confirmed_headings: List[Dict] | None,
+) -> dict[int, str]:
+    """Map pages that should begin a manual TOC entry to display titles."""
+    lookup: dict[int, str] = {}
+    if confirmed_headings is None:
+        return lookup
+    for heading in confirmed_headings:
+        if not heading.get("page_start") and heading.get("at") != "page_start":
+            continue
+        title = str(heading.get("title", "")).strip()
+        if title:
+            lookup[int(heading["page"])] = title
+    return lookup
+
+
+def _lookup_confirmed_heading(
+    lookup: dict[tuple[int, str], str],
+    current_page: int,
+    heading_text: Any,
+) -> str | None:
+    key = _normalize_manual_heading_text(heading_text)
+    if not key:
+        return None
+    return lookup.get((current_page, key)) or lookup.get((current_page - 1, key))
 
 
 def _build_header_fingerprints(confirmed_headings: List[Dict] | None,
@@ -30,21 +123,22 @@ def _build_header_fingerprints(confirmed_headings: List[Dict] | None,
     fingerprints = set()
     if confirmed_headings:
         for h in confirmed_headings:
-            title = h.get("title", "")
-            fp = re.sub(r"\s+", "", title)
-            if fp:
-                fingerprints.add(fp)
-            # Also fingerprint just the chapter-number prefix and title suffix
-            # so running page headers like "第十四章" or "「六四」風雲" match.
-            m = re.match(
-                r"(第[零一二三四五六七八九十百千0-9]+[章節编編篇卷])\s*(.+)",
-                title,
-            )
-            if m:
-                num_fp = re.sub(r"\s+", "", m.group(1))
-                title_fp = re.sub(r"\s+", "", m.group(2))
-                fingerprints.add(num_fp)
-                fingerprints.add(title_fp)
+            for title in _manual_heading_sources(h):
+                fp = re.sub(r"\s+", "", title)
+                if fp:
+                    fingerprints.add(fp)
+                # Also fingerprint just the chapter-number prefix and title suffix
+                # so running page headers like "第十四章" or "「六四」風雲" match.
+                normalized = _normalize_manual_heading_text(title)
+                m = re.match(
+                    r"(第[零一二三四五六七八九十百千0-9]+[章節编編篇卷])\s*(.+)",
+                    normalized,
+                )
+                if m:
+                    num_fp = re.sub(r"\s+", "", m.group(1))
+                    title_fp = re.sub(r"\s+", "", m.group(2))
+                    fingerprints.add(num_fp)
+                    fingerprints.add(title_fp)
     # Add book title so running page headers carrying the title are stripped.
     if book_title:
         fp = re.sub(r"\s+", "", book_title)
@@ -53,7 +147,11 @@ def _build_header_fingerprints(confirmed_headings: List[Dict] | None,
     return fingerprints
 
 
-def _strip_page_headers(lines: list, fingerprints: set) -> list:
+def _strip_page_headers(
+    lines: list,
+    fingerprints: set,
+    preserve_indexes: set[int] | None = None,
+) -> list:
     """Remove OCR page headers / footers and Chinese page numbers from a page.
 
     Page headers appear as standalone lines and match:
@@ -110,7 +208,10 @@ def _strip_page_headers(lines: list, fingerprints: set) -> list:
     result = list(lines)
     n = len(result)
 
+    preserved = preserve_indexes or set()
     for idx in range(n):
+        if idx in preserved:
+            continue
         line = result[idx]
         if not line.strip():
             continue
@@ -213,6 +314,8 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
 
     # Build chapter title fingerprints for page-header detection
     _header_fingerprints = _build_header_fingerprints(confirmed_headings, title)
+    _confirmed_heading_lookup = _build_confirmed_heading_lookup(confirmed_headings)
+    _page_start_heading_lookup = _build_page_start_heading_lookup(confirmed_headings)
 
     # Aggregated images to add to the book
     # Map API image path (e.g. 'images/tmp.jpg') to internal EPUB path
@@ -298,7 +401,19 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
 
             # Remove page headers / footers and Chinese page numbers
             if _header_fingerprints:
-                cleaned_lines = _strip_page_headers(cleaned_lines, _header_fingerprints)
+                preserve_indexes = {
+                    idx for idx, line in enumerate(cleaned_lines)
+                    if _lookup_confirmed_heading(
+                        _confirmed_heading_lookup,
+                        global_page,
+                        line,
+                    )
+                }
+                cleaned_lines = _strip_page_headers(
+                    cleaned_lines,
+                    _header_fingerprints,
+                    preserve_indexes=preserve_indexes,
+                )
 
             # Reflow: join lines that appear to be part of the same paragraph
             reflowed_paragraphs = []
@@ -334,9 +449,16 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                     continue
 
                 # Check if this line is a header/list/blockquote
+                is_manual_heading = bool(
+                    _lookup_confirmed_heading(
+                        _confirmed_heading_lookup,
+                        global_page,
+                        stripped,
+                    )
+                )
                 is_special = header_pattern.match(stripped) or (
                     _chapterish_heading.match(stripped) and len(stripped) <= 25
-                )
+                ) or is_manual_heading
 
                 if is_special:
                     if current_para:
@@ -459,25 +581,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     # Regex for ANY header to format as H1/H2 in HTML but not necessarily split
     any_header_pattern = re.compile(r"^(#{1,2})\s+(.+)$")
 
-    # Build a dict mapping (page, heading_text) → full_title so split-point
-    # detection can use exact lookups like the original, while merged titles
-    # (e.g. '第二十二章 思潮澎湃...') still resolve correctly.
     _page_marker_re = re.compile(r"^\x00PAGE:(\d+)\x00$")
-    _chapter_num_re = re.compile(r"^(第[零一二三四五六七八九十百千0-9]+章)\s+")
-    confirmed_map: Dict[tuple[int, str], str] = {}
-    if confirmed_headings is not None:
-        for h in confirmed_headings:
-            title = h["title"]
-            page = h["page"]
-            confirmed_map[(page, title)] = title
-            # For merged titles like '第二十二章 思潮澎湃...', also register
-            # the bare chapter-number component (e.g. '第二十二章') so that the
-            # H2 number heading triggers the chapter split with the full title.
-            cn_match = _chapter_num_re.match(title)
-            if cn_match:
-                confirmed_map[(page, cn_match.group(1))] = title
-    else:
-        confirmed_map = {}  # use legacy regex fallback
 
     current_page = 0
     last_split_page = -1  # guard against duplicate splits on the same page
@@ -487,12 +591,49 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         _pm = _page_marker_re.match(line)
         if _pm:
             current_page = int(_pm.group(1))
+            page_start_title = _page_start_heading_lookup.get(current_page)
+            if page_start_title and current_page != last_split_page:
+                if current_chapter_content:
+                    display_title = current_chapter_title or "Content"
+                    safe_title = "".join(
+                        c for c in display_title
+                        if c.isalnum() or c in (" ", "_", "-")
+                    ).strip()
+                    if not safe_title:
+                        safe_title = f"chap_{chapter_count}"
+
+                    c = epub.EpubHtml(
+                        title=display_title,
+                        file_name=f"{safe_title}_{chapter_count}.xhtml",
+                        lang=language,
+                    )
+
+                    try:
+                        import markdown
+                        html_content = markdown.markdown(
+                            "\n".join(current_chapter_content)
+                        )
+                    except ImportError:
+                        html_content = (
+                            "<p>" + "</p><p>".join(current_chapter_content) + "</p>"
+                        )
+
+                    c.content = f"<html><head><link rel='stylesheet' href='style/nav.css'/></head><body>{html_content}</body></html>"
+                    c.add_item(nav_css)
+                    book.add_item(c)
+                    chapters.append(c)
+                    chapter_count += 1
+
+                current_chapter_title = page_start_title
+                current_chapter_content = [f"# {page_start_title}"]
+                last_split_page = current_page
             continue
 
         # Check if line is a header (before LaTeX cleanup, to match extracted candidates)
         match = any_header_pattern.match(line)
         is_split_point = False
         heading_text = None
+        lookup_title = None
         if match:
             heading_text = match.group(2).strip()
             # Clean LaTeX artifacts for matching
@@ -500,9 +641,11 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             heading_text = re.sub(r"^\d+\s+", "", heading_text).strip()
             # Determine if this heading is a chapter split point
             if confirmed_headings is not None:
-                lookup_title = confirmed_map.get((current_page, heading_text))
-                if lookup_title is None:
-                    lookup_title = confirmed_map.get((current_page - 1, heading_text))
+                lookup_title = _lookup_confirmed_heading(
+                    _confirmed_heading_lookup,
+                    current_page,
+                    heading_text,
+                )
                 is_split_point = lookup_title is not None
             else:
                 is_split_point = bool(major_header_pattern.match(line))
@@ -512,9 +655,11 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             # the same heading as both # H1 and plain text on the same page).
             stripped = line.strip()
             if stripped and not stripped.isdigit():
-                lookup_title = confirmed_map.get((current_page, stripped))
-                if lookup_title is None:
-                    lookup_title = confirmed_map.get((current_page - 1, stripped))
+                lookup_title = _lookup_confirmed_heading(
+                    _confirmed_heading_lookup,
+                    current_page,
+                    stripped,
+                )
                 if lookup_title is not None:
                     heading_text = stripped
                     is_split_point = True
@@ -526,12 +671,13 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         if is_split_point:
             # Use the full merged title from confirmed_map when available
             new_title = lookup_title or (match.group(2) if match else heading_text)
+            chapter_heading_line = f"# {new_title}"
 
             # If this split point has the same title as the current chapter,
             # it is a page-boundary duplicate (e.g. page header repeating
             # the chapter title).  Merge instead of splitting.
             if current_chapter_title and new_title == current_chapter_title:
-                current_chapter_content.append(line)
+                current_chapter_content.append(chapter_heading_line)
                 last_split_page = current_page
                 continue
 
@@ -568,7 +714,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                 chapter_count += 1
 
             current_chapter_title = new_title
-            current_chapter_content = [line]
+            current_chapter_content = [chapter_heading_line]
             last_split_page = current_page
         else:
             current_chapter_content.append(line)

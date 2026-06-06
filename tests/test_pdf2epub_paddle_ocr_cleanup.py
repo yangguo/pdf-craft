@@ -1344,6 +1344,209 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
             self.assertFalse(output_path.exists())
 
+    def test_create_epub_manual_toc_match_alias_uses_display_title(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "前置正文。\n(第二章) 南京年代\n章節正文開始。",
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                    confirmed_headings=[
+                        {
+                            "page": 1,
+                            "title": "第三章 南京年代",
+                            "match": "(第二章) 南京年代",
+                        }
+                    ],
+                )
+
+        chapters = list(captured["book"].toc)
+        self.assertEqual(["Content", "第三章 南京年代"],
+                         [chapter.title for chapter in chapters])
+        chapter_html = chapters[1].content
+        if isinstance(chapter_html, bytes):
+            chapter_html = chapter_html.decode("utf-8")
+        self.assertIn("第三章 南京年代", chapter_html)
+        self.assertNotIn("(第二章) 南京年代", chapter_html)
+
+    def test_create_epub_manual_toc_consumes_split_title_suffix(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "第八章\n妄想勝利\n正文開始。",
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                    confirmed_headings=[
+                        {"page": 1, "title": "第八章 妄想勝利"}
+                    ],
+                )
+
+        chapter_html = list(captured["book"].toc)[0].content
+        if isinstance(chapter_html, bytes):
+            chapter_html = chapter_html.decode("utf-8")
+        self.assertIn("第八章 妄想勝利", chapter_html)
+        self.assertNotIn("<p>妄想勝利</p>", chapter_html)
+        self.assertIn("正文開始。", chapter_html)
+
+    def test_create_epub_manual_toc_can_split_at_page_start(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "革命\n第一部\n正文開始。",
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                    confirmed_headings=[
+                        {
+                            "page": 1,
+                            "title": "第一部 革命",
+                            "page_start": True,
+                        }
+                    ],
+                )
+
+        chapters = list(captured["book"].toc)
+        self.assertEqual(["第一部 革命"], [chapter.title for chapter in chapters])
+        chapter_html = chapters[0].content
+        if isinstance(chapter_html, bytes):
+            chapter_html = chapter_html.decode("utf-8")
+        self.assertIn("第一部 革命", chapter_html)
+        self.assertIn("正文開始。", chapter_html)
+
+    def test_create_epub_manual_toc_alias_cleans_subtitle_without_resplitting(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "〔第十三章〕\n尼克森及晚年\n正文開始。",
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                    confirmed_headings=[
+                        {
+                            "page": 1,
+                            "title": "第十三章 尼克森和晚年歲月",
+                            "aliases": ["尼克森及晚年"],
+                        }
+                    ],
+                )
+
+        chapter_html = list(captured["book"].toc)[0].content
+        if isinstance(chapter_html, bytes):
+            chapter_html = chapter_html.decode("utf-8")
+        self.assertIn("第十三章 尼克森和晚年歲月", chapter_html)
+        self.assertNotIn("尼克森及晚年", chapter_html)
+        self.assertIn("正文開始。", chapter_html)
+
     def test_strip_missing_image_references_removes_markdown_and_html_images(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod.epub_builder, "_strip_missing_image_references"))

@@ -24,6 +24,17 @@ class TestBuildHeaderFingerprints(unittest.TestCase):
         self.assertIn("第十四章", fps)
         self.assertIn("「六四」風雲", fps)
 
+    def test_includes_manual_heading_aliases(self):
+        headings = [
+            {
+                "title": "第十三章 尼克森和晚年歲月",
+                "page": 1,
+                "aliases": ["尼克森及晚年"],
+            }
+        ]
+        fps = _build_header_fingerprints(headings)
+        self.assertIn("尼克森及晚年", fps)
+
     def test_includes_book_title(self):
         fps = _build_header_fingerprints(None, book_title="許家屯香港回憶錄")
         self.assertIn("許家屯香港回憶錄", fps)
