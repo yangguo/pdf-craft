@@ -99,6 +99,7 @@ def _first_layout_page(result: dict[str, Any]) -> dict[str, Any]:
 
 
 _CHAPTERISH_RE = re.compile(r"第[零一二三四五六七八九十百千0-9]+[章節编編篇卷]")
+_CJK_CHAR_RE = re.compile(r"[㐀-鿿]")
 
 
 def _strip_single_page_running_header(
@@ -198,8 +199,30 @@ def _should_patch_hunk(
     if original_score < 0.68:
         return False
 
-    replacement_score, _ = _score_fragment(replacement_span, char_freq, bigram_freq)
-    return replacement_score < 0.68
+    replacement_score, replacement_reasons = _score_fragment(
+        replacement_span,
+        char_freq,
+        bigram_freq,
+    )
+    if replacement_score >= 0.68:
+        return False
+
+    replacement_chars = _cjk_chars(replacement_span)
+    replacement_bigrams = [
+        replacement_chars[index] + replacement_chars[index + 1]
+        for index in range(len(replacement_chars) - 1)
+    ]
+    unseen_bigram_ratio = (
+        sum(1 for bigram in replacement_bigrams if bigram_freq.get(bigram, 0) == 0)
+        / max(1, len(replacement_bigrams))
+    )
+    if (
+        unseen_bigram_ratio >= 0.85
+        and replacement_reasons.get("rare_char_ratio", 0.0) >= 0.90
+        and replacement_reasons.get("common_char_ratio", 1.0) <= 0.25
+    ):
+        return False
+    return True
 
 
 def _patch_suspicious_ocr_spans(
@@ -238,6 +261,96 @@ def _patch_suspicious_ocr_spans(
     return patched, patched_count
 
 
+def _cjk_index_to_text_index(text: str, cjk_index: int) -> int:
+    if cjk_index <= 0:
+        return 0
+
+    seen = 0
+    for index, char in enumerate(text):
+        if not _CJK_CHAR_RE.match(char):
+            continue
+        if seen == cjk_index:
+            return index
+        seen += 1
+    return len(text)
+
+
+def _find_delayed_page_start_alignment(
+    original_cjk: str,
+    replacement_cjk: str,
+    *,
+    min_prefix_cjk: int = 8,
+    max_original_drop_cjk: int = 12,
+    min_match_cjk: int = 14,
+    match_cjk: int = 28,
+    min_similarity: float = 0.84,
+) -> tuple[int, int, float] | None:
+    """Return (replacement_offset, original_offset, similarity)."""
+    original_head = original_cjk[:160]
+    replacement_head = replacement_cjk[:260]
+    best: tuple[int, int, float] | None = None
+
+    for original_offset in range(0, min(max_original_drop_cjk, len(original_head)) + 1):
+        target_len = min(match_cjk, len(original_head) - original_offset)
+        if target_len < min_match_cjk:
+            continue
+        target = original_head[original_offset:original_offset + target_len]
+        upper = len(replacement_head) - target_len + 1
+        for replacement_offset in range(min_prefix_cjk, max(min_prefix_cjk, upper)):
+            sample = replacement_head[replacement_offset:replacement_offset + target_len]
+            similarity = SequenceMatcher(
+                None, target, sample, autojunk=False,
+            ).ratio()
+            if similarity < min_similarity:
+                continue
+            if best is None or (
+                similarity,
+                replacement_offset,
+                -original_offset,
+            ) > (
+                best[2],
+                best[0],
+                -best[1],
+            ):
+                best = (replacement_offset, original_offset, round(similarity, 3))
+
+    return best
+
+
+def _patch_missing_page_start(
+    original_page: dict[str, Any],
+    replacement_page: dict[str, Any],
+) -> tuple[dict[str, Any], int]:
+    """Insert a MinerU-detected page-start prefix into a checkpoint page."""
+    original_text = original_page.get("markdown", {}).get("text", "")
+    replacement_text = replacement_page.get("markdown", {}).get("text", "")
+    if not isinstance(original_text, str) or not isinstance(replacement_text, str):
+        return original_page, 0
+
+    original_cjk = "".join(_cjk_chars(original_text))
+    replacement_cjk = "".join(_cjk_chars(replacement_text))
+    if len(original_cjk) < 20 or len(replacement_cjk) < 30:
+        return original_page, 0
+
+    alignment = _find_delayed_page_start_alignment(original_cjk, replacement_cjk)
+    if alignment is None:
+        return original_page, 0
+
+    replacement_offset, original_offset, _similarity = alignment
+    replacement_cut = _cjk_index_to_text_index(replacement_text, replacement_offset)
+    original_cut = _cjk_index_to_text_index(original_text, original_offset)
+    prefix = replacement_text[:replacement_cut].rstrip()
+    suffix = original_text[original_cut:].lstrip()
+    if len(_cjk_chars(prefix)) < 8 or not suffix:
+        return original_page, 0
+
+    patched = dict(original_page)
+    markdown = dict(patched.get("markdown", {}))
+    markdown["text"] = prefix + suffix
+    patched["markdown"] = markdown
+    return patched, 1
+
+
 def _replace_checkpoint_page(
     checkpoint_path: str,
     page_index: int,
@@ -246,6 +359,7 @@ def _replace_checkpoint_page(
     rerun_result: dict[str, Any],
     *,
     replace_page: bool = False,
+    patch_page_start: bool = False,
 ) -> MineruRerunSummary:
     with open(checkpoint_path, "r", encoding="utf-8") as f:
         checkpoint = json.load(f)
@@ -271,12 +385,20 @@ def _replace_checkpoint_page(
     if replace_page:
         replacement = rerun_page
         patched_span_count: int | None = None
+        mode = "replace_page"
+    elif patch_page_start:
+        replacement, patched_span_count = _patch_missing_page_start(
+            original_page,
+            rerun_page,
+        )
+        mode = "patch_missing_page_start"
     else:
         replacement, patched_span_count = _patch_suspicious_ocr_spans(
             original_page,
             rerun_page,
             layouts,
         )
+        mode = "patch_suspicious_spans"
     layouts[page_index] = replacement
 
     original_zip_url = checkpoint.pop("_mineru_zip_url", None)
@@ -290,7 +412,7 @@ def _replace_checkpoint_page(
     ]
     entry = {
         "page": page_number,
-        "mode": "replace_page" if replace_page else "patch_suspicious_spans",
+        "mode": mode,
     }
     if patched_span_count is not None:
         entry["patched_spans"] = patched_span_count
@@ -334,6 +456,7 @@ def rerun_mineru_pages(
     token: str | None = None,
     chunk_size: int | None = None,
     replace_page: bool = False,
+    patch_page_start: bool = False,
 ) -> List[MineruRerunSummary]:
     """Re-run MinerU for selected 1-based PDF pages and update checkpoints."""
     if token is None:
@@ -344,6 +467,8 @@ def rerun_mineru_pages(
         chunk_size = MINERU_CHUNK_SIZE
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+    if replace_page and patch_page_start:
+        raise ValueError("replace_page and patch_page_start are mutually exclusive")
 
     if fitz is None:
         raise RuntimeError("PyMuPDF is required for MinerU partial reruns")
@@ -379,6 +504,7 @@ def rerun_mineru_pages(
                         page_number,
                         rerun_result,
                         replace_page=replace_page,
+                        patch_page_start=patch_page_start,
                     )
                 )
         finally:
@@ -399,6 +525,8 @@ def main(argv: list[str] | None = None) -> None:
                         help=f"Original MinerU chunk size (default: {MINERU_CHUNK_SIZE})")
     parser.add_argument("--replace-page", action="store_true",
                         help="Replace the whole checkpoint page instead of only suspicious OCR spans")
+    parser.add_argument("--patch-page-start", action="store_true",
+                        help="Patch missing page-start text from MinerU while preserving the rest of the page")
     args = parser.parse_args(argv)
 
     pages = parse_page_ranges(args.pages)
@@ -408,6 +536,7 @@ def main(argv: list[str] | None = None) -> None:
         pages=pages,
         chunk_size=args.chunk_size,
         replace_page=args.replace_page,
+        patch_page_start=args.patch_page_start,
     )
     for item in summaries:
         print(

@@ -344,6 +344,104 @@ class TestMineruRerun(unittest.TestCase):
             saved["_mineru_partial_reruns"],
         )
 
+    def test_patch_missing_page_start_replaces_partial_overlap(self):
+        from paddle_pipeline.mineru_rerun import _patch_missing_page_start
+
+        original = {
+            "markdown": {
+                "text": (
+                    "之。就像同時代的一些人（包括共產黨在内），"
+                    "他有很長一段時間和祕密的政治、犯罪團體關係密切。"
+                )
+            }
+        }
+        replacement = {
+            "markdown": {
+                "text": (
+                    "行動和祕密警察的鎮壓，令數千人喪失性命。"
+                    "他和其後不民主的強人領導一樣僞善，"
+                    "但他不是個犬儒之人。就像同時代的一些人（包括共產黨在內），"
+                    "他有很長一段時間和祕密的政治犯罪團體關係密切。"
+                )
+            }
+        }
+
+        patched, count = _patch_missing_page_start(original, replacement)
+        text = patched["markdown"]["text"]
+
+        self.assertEqual(1, count)
+        self.assertTrue(text.startswith("行動和祕密警察的鎮壓"))
+        self.assertIn("犬儒之人。就像同時代", text)
+        self.assertNotIn("犬儒之人。之。就像", text)
+
+    def test_rerun_can_patch_missing_page_start(self):
+        from paddle_pipeline import mineru_api
+        from paddle_pipeline.mineru_rerun import rerun_mineru_pages
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            pdf_path = root / "book.pdf"
+            _make_pdf(pdf_path, page_count=2)
+
+            work_dir = root / "work"
+            work_dir.mkdir()
+            checkpoint = work_dir / "chunk_0_2.pdf.json"
+            checkpoint.write_text(
+                json.dumps({
+                    "result": {
+                        "layoutParsingResults": [
+                            {"markdown": {"text": "上一頁以無情的軍事", "images": {}}},
+                            {
+                                "markdown": {
+                                    "text": (
+                                        "之。就像同時代的一些人（包括共產黨在内），"
+                                        "他有很長一段時間和祕密的政治、犯罪團體關係密切。"
+                                    ),
+                                    "images": {},
+                                }
+                            },
+                        ]
+                    }
+                }),
+                encoding="utf-8",
+            )
+            new_page_result = {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": (
+                                    "行動和祕密警察的鎮壓，令數千人喪失性命。"
+                                    "他和其後不民主的強人領導一樣僞善，"
+                                    "但他不是個犬儒之人。就像同時代的一些人（包括共產黨在內），"
+                                    "他有很長一段時間和祕密的政治犯罪團體關係密切。"
+                                ),
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+
+            with mock.patch.object(mineru_api, "parse_pdf_chunk", return_value=new_page_result):
+                rerun_mineru_pages(
+                    str(pdf_path),
+                    str(work_dir),
+                    pages=[2],
+                    token="token",
+                    chunk_size=2,
+                    patch_page_start=True,
+                )
+
+            saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+            patched_text = _layout_texts(saved)[1]
+
+        self.assertTrue(patched_text.startswith("行動和祕密警察的鎮壓"))
+        self.assertIn("犬儒之人。就像同時代", patched_text)
+        self.assertEqual(
+            [{"page": 2, "mode": "patch_missing_page_start", "patched_spans": 1}],
+            saved["_mineru_partial_reruns"],
+        )
 
     def test_should_patch_hunk_rejects_garbled_to_garbled_replacement(self):
         """_should_patch_hunk must return False when the replacement span is
@@ -369,6 +467,26 @@ class TestMineruRerun(unittest.TestCase):
 
         result = _should_patch_hunk(original_span, replacement_span, char_freq, bigram_freq)
         self.assertFalse(result, "Should not patch garbled span with another garbled replacement")
+
+    def test_should_patch_hunk_rejects_replacement_with_unseen_garbled_bigrams(self):
+        """Unseen replacement bigrams must not be treated as safe."""
+        from collections import Counter
+        from paddle_pipeline.mineru_rerun import _should_patch_hunk
+        from paddle_pipeline.ocr_review import _cjk_chars
+
+        base_context = "香港問題是中國近代史上的重要問題中英雙方經過多輪談判" * 50
+        original_span = "誤齶焱巆墀壯耷縹嗶欐垯艿"
+        replacement_span = "鑲燼覦罹褻蓿灃痂蝻蚼鏤殛"
+
+        # Model is built from checkpoint-only text: replacement chars/bigrams are unseen.
+        chars_list = _cjk_chars(base_context + original_span)
+        char_freq = Counter(chars_list)
+        bigram_freq = Counter(
+            chars_list[i] + chars_list[i + 1] for i in range(len(chars_list) - 1)
+        )
+
+        result = _should_patch_hunk(original_span, replacement_span, char_freq, bigram_freq)
+        self.assertFalse(result, "Should reject replacement that introduces unseen garbled bigrams")
 
     def test_strip_single_page_running_header_preserves_chapter_headings(self):
         """_strip_single_page_running_header must preserve chapter-pattern
