@@ -2054,3 +2054,125 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertAlmostEqual(0, mediabox.y0)
         self.assertAlmostEqual(172, mediabox.x1)
         self.assertAlmostEqual(272, mediabox.y1)
+
+
+class TestGarbledCjkDetection(unittest.TestCase):
+    """Unit tests for repeated-character and window-based garbled CJK detection."""
+
+    def test_find_repeated_char_spans_detects_8plus_repeats(self):
+        """Verify that consecutive repeated characters ≥8 times are detected."""
+        mod = _load_fresh_script_module()
+        from paddle_pipeline.ocr_noise import _find_repeated_char_spans
+
+        chars = list("三三三三三三三三")  # 8 chars, should be detected
+        spans = _find_repeated_char_spans(chars)
+
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(spans[0], "三三三三三三三三")
+
+    def test_find_repeated_char_spans_ignores_7_repeats(self):
+        """Verify that consecutive repeated characters <8 times are ignored."""
+        mod = _load_fresh_script_module()
+        from paddle_pipeline.ocr_noise import _find_repeated_char_spans
+
+        chars = list("三三三三三三三")  # 7 chars, should be ignored
+        spans = _find_repeated_char_spans(chars)
+
+        self.assertEqual(len(spans), 0)
+
+    def test_find_repeated_char_spans_handles_empty_list(self):
+        """Verify graceful handling of empty input."""
+        mod = _load_fresh_script_module()
+        from paddle_pipeline.ocr_noise import _find_repeated_char_spans
+
+        spans = _find_repeated_char_spans([])
+
+        self.assertEqual([], spans)
+
+    def test_find_repeated_char_spans_handles_mixed_runs(self):
+        """Verify detection across multiple repeated-character runs."""
+        mod = _load_fresh_script_module()
+        from paddle_pipeline.ocr_noise import _find_repeated_char_spans
+
+        # Two runs: 8 repeats + 10 repeats
+        chars = list("一一一一一一一一二二二二二二二二二二")
+        spans = _find_repeated_char_spans(chars)
+
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(spans[0], "一一一一一一一一")
+        self.assertEqual(spans[1], "二二二二二二二二二二")
+
+    def test_find_garbled_cjk_in_epub_returns_actual_spans(self):
+        """Verify that find_garbled_cjk_in_epub returns actual span text, not summaries."""
+        mod = _load_fresh_script_module()
+
+        # Create a simple EPUB with obvious repeated characters
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "garbled.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                # Long text corpus + a repeated-char hallucination
+                corpus = (
+                    "今天天氣很好，我和朋友一起去公園散步。" * 50
+                )
+                content = f"<html><body><p>{corpus}三三三三三三三三</p></body></html>"
+                zf.writestr("EPUB/chapter.xhtml", content)
+
+            findings = mod.find_garbled_cjk_in_epub(
+                epub_path,
+                mod.EPUB_STRUCTURAL_FILES,
+            )
+
+        # Verify structure: should have "file" and "spans" keys, not "token" or "count"
+        self.assertGreater(len(findings), 0, "Should detect garbled text")
+        finding = findings[0]
+        self.assertIn("file", finding)
+        self.assertIn("spans", finding)
+        self.assertNotIn("token", finding)
+        self.assertNotIn("count", finding)
+
+        # Verify spans are actual text
+        self.assertIsInstance(finding["spans"], list)
+        self.assertGreater(len(finding["spans"]), 0)
+        for span in finding["spans"]:
+            self.assertIsInstance(span, str)
+
+    def test_find_garbled_cjk_in_epub_returns_empty_for_clean_text(self):
+        """Verify no false positives on normal Chinese text."""
+        mod = _load_fresh_script_module()
+
+        # Normal Chinese passage repeated to build bigram model
+        normal = ("今天天氣很好，我和朋友一起去公園散步。" * 50)
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "clean.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    f"<html><body><p>{normal}</p></body></html>",
+                )
+
+            findings = mod.find_garbled_cjk_in_epub(
+                epub_path,
+                mod.EPUB_STRUCTURAL_FILES,
+            )
+
+        self.assertEqual([], findings, "Normal Chinese should not be detected as garbled")
+
+    def test_find_garbled_cjk_in_epub_empty_epub_returns_empty(self):
+        """Verify graceful handling of empty EPUB."""
+        mod = _load_fresh_script_module()
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "empty.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+
+            findings = mod.find_garbled_cjk_in_epub(
+                epub_path,
+                mod.EPUB_STRUCTURAL_FILES,
+            )
+
+        self.assertEqual([], findings)
+

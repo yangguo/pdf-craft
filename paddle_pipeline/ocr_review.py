@@ -103,6 +103,20 @@ def _longest_singleton_run(bigrams: list[str], bigram_freq: Counter[str]) -> int
     return longest
 
 
+def _repetition_ratio(chars: list[str]) -> float:
+    """Return the ratio of characters that are identical to their predecessor.
+
+    A high ratio (≥ 0.80) with ≥ 8 CJK chars signals OCR hallucination —
+    typically the same character repeated dozens or thousands of times
+    (e.g. ``三三三三三三…``), which normal bigram analysis misses because
+    ``三三`` is a perfectly common bigram in a history book.
+    """
+    if len(chars) < 2:
+        return 0.0
+    repeats = sum(1 for i in range(1, len(chars)) if chars[i] == chars[i - 1])
+    return repeats / (len(chars) - 1)
+
+
 def _score_fragment(
     fragment: str,
     char_freq: Counter[str],
@@ -130,6 +144,7 @@ def _score_fragment(
     singleton_run_ratio = (
         _longest_singleton_run(bigrams, bigram_freq) / bigram_count
     )
+    repetition_ratio = _repetition_ratio(chars)
 
     score = (
         0.44 * singleton_ratio
@@ -138,6 +153,27 @@ def _score_fragment(
         + 0.14 * (1.0 - common_char_ratio)
         - 0.25 * anchor_ratio
     )
+    # Short-span singleton-density boost: a compact span (8-25 CJK chars)
+    # with a very high singleton-bigram ratio is a strong garbled signal
+    # even when the characters themselves are common (e.g. OCR hallucination
+    # fragments like 居之者忽音但一通乃一祔一筆八).  The bonus scales
+    # from 0 at 75 % singleton ratio to ≈ 0.30 at 100 %.
+    cjk_len = len(chars)
+    if 8 <= cjk_len <= 25 and singleton_ratio >= 0.75:
+        density_bonus = (singleton_ratio - 0.75) * 1.2
+        score += density_bonus
+    # Repetition boost: a span where ≥ 80 % of characters are identical to
+    # their predecessor is almost certainly OCR noise (e.g. ``三三三三…``).
+    # Normal Chinese never has this many consecutive repeats.  The bonus
+    # scales from 0 at 80 % repetition to 0.50 at 100 %.
+    if cjk_len >= 8 and repetition_ratio >= 0.80:
+        rep_bonus = (repetition_ratio - 0.80) * 2.5
+        score += rep_bonus
+    # Dedicated catch for highly-repetitive common-character spans: even
+    # if ``三`` is common and ``三三`` is a valid bigram, a span of ≥ 20
+    # consecutive same-char repeats is NEVER legitimate Chinese text.
+    if cjk_len >= 20 and repetition_ratio >= 0.95:
+        score += 0.30
     score = max(0.0, min(1.0, score))
     reasons = {
         "singleton_bigram_ratio": round(singleton_ratio, 3),
@@ -145,6 +181,7 @@ def _score_fragment(
         "singleton_run_ratio": round(singleton_run_ratio, 3),
         "common_char_ratio": round(common_char_ratio, 3),
         "anchor_bigram_ratio": round(anchor_ratio, 3),
+        "repetition_ratio": round(repetition_ratio, 3),
     }
     return score, reasons
 
@@ -155,7 +192,7 @@ def find_suspicious_cjk_spans_in_epub(
     structural_files: set[str] | None = None,
     limit: int = 50,
     min_score: float = 0.70,
-    min_cjk: int = 16,
+    min_cjk: int = 10,
     max_cjk: int = 90,
 ) -> List[Dict[str, Any]]:
     """Return ranked suspicious CJK OCR candidates for human review.
@@ -218,7 +255,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--limit", type=int, default=50, help="Maximum candidates")
     parser.add_argument("--min-score", type=float, default=0.70,
                         help="Minimum suspicion score, 0-1")
-    parser.add_argument("--min-cjk", type=int, default=16,
+    parser.add_argument("--min-cjk", type=int, default=10,
                         help="Minimum CJK characters in a candidate")
     parser.add_argument("--json", action="store_true", help="Emit JSON")
     args = parser.parse_args(argv)

@@ -41,11 +41,17 @@ def _scan_text_for_garbled_cjk_spans(
     A sliding window flags positions where nearly all character bigrams are
     singletons (frequency == 1).  Contiguous flagged windows are merged into
     spans and returned when the run is long enough.
+
+    Additionally, detect repeated-character spans (e.g. ``三三三三三三…``)
+    where the same CJK character appears consecutively ≥ 8 times.  These
+    are OCR hallucinations that bigram analysis alone cannot catch because
+    the repeated bigram (e.g. ``三三``) is common in real text.
     """
     chars = re.findall(r"[一-鿿]", plain_text)
     w = _GARBLED_WINDOW_SIZE
     if len(chars) < w:
-        return []
+        # Still check for repeated-character spans even in short text.
+        return _find_repeated_char_spans(chars)
 
     # Flag each window position.
     flagged = []
@@ -75,6 +81,32 @@ def _scan_text_for_garbled_cjk_spans(
         if run_len >= _GARBLED_MIN_CONSECUTIVE:
             spans.append("".join(chars[run_start:]))
 
+    # Also add repeated-character spans (e.g. 三三三三三…).
+    spans.extend(_find_repeated_char_spans(chars))
+    return spans
+
+
+def _find_repeated_char_spans(chars: list[str], min_repeat: int = 8) -> List[str]:
+    """Return spans where the same CJK character repeats consecutively ≥ *min_repeat* times.
+
+    OCR engines sometimes hallucinate a single character hundreds or thousands
+    of times (e.g. ``三三三三三三…``).  These are invisible to bigram analysis
+    because ``(三, 三)`` is a perfectly normal bigram in Chinese history books.
+    """
+    if len(chars) < min_repeat:
+        return []
+
+    spans: List[str] = []
+    i = 0
+    while i < len(chars):
+        run_char = chars[i]
+        run_len = 1
+        while i + run_len < len(chars) and chars[i + run_len] == run_char:
+            run_len += 1
+        if run_len >= min_repeat:
+            spans.append("".join(chars[i : i + run_len]))
+        i += run_len
+
     return spans
 
 
@@ -96,8 +128,8 @@ def find_garbled_cjk_in_epub(
     (appearing nowhere else in the book).  Such spans are likely OCR
     hallucinations.
 
-    Returns a list of finding dicts with keys ``file``, ``token``, and ``count``,
-    suitable for consumption by the OCR-noise validation pipeline.
+    Returns a list of finding dicts with keys ``file`` and ``spans``,
+    where ``spans`` is a list of actual garbled-text excerpts.
     """
     import os
     import zipfile
@@ -130,12 +162,7 @@ def find_garbled_cjk_in_epub(
         if spans:
             findings.append({
                 "file": name,
-                "token": (
-                    f"potential garbled CJK text ({len(spans)} span"
-                    + ("s" if len(spans) > 1 else "")
-                    + ")"
-                ),
-                "count": len(spans),
+                "spans": spans,
             })
 
     return findings

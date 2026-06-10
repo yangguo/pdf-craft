@@ -27,9 +27,11 @@ from zipfile import BadZipFile, ZIP_STORED, ZipFile
 
 from paddle_pipeline.config import (
     CHUNK_SIZE as PADDLE_CHUNK_SIZE,
+    EPUB_STRUCTURAL_FILES,
     epub as ebooklib_epub,
 )
 from paddle_pipeline.ocr_review import find_suspicious_cjk_spans_in_epub
+from paddle_pipeline.ocr_noise import find_garbled_cjk_in_epub
 from paddle_pipeline.page_boundary_review import (
     annotate_candidates_with_epub_continuity,
     find_page_boundary_candidates,
@@ -70,11 +72,21 @@ def _find_garbled_spans(
     epub_path: str,
     *,
     limit: int = 80,
-    min_score: float = 0.68,
-    min_cjk: int = 16,
+    min_score: float = 0.65,
+    min_cjk: int = 12,
 ) -> Dict[str, List[str]]:
-    """Return {epub_filename: [suspicious_cjk_excerpt, ...]}."""
+    """Return {epub_filename: [suspicious_cjk_excerpt, ...]}.
+
+    Combines two complementary scanners:
+      * find_suspicious_cjk_spans_in_epub — scoring-based review tool
+      * find_garbled_cjk_in_epub — self-calibrating window-based scanner
+    The window scanner catches short garbled clusters (10–16 chars) that the
+    scoring tool may dilute when the garbled span is embedded in a long sentence.
+    """
+
     result: Dict[str, List[str]] = {}
+
+    # Primary scanner: scoring-based review
     candidates = find_suspicious_cjk_spans_in_epub(
         epub_path,
         limit=limit,
@@ -83,6 +95,15 @@ def _find_garbled_spans(
     )
     for item in candidates:
         result.setdefault(item["file"], []).append(item["excerpt"])
+
+    # Supplementary: window-based scanner catches short dense clusters
+    window_findings = find_garbled_cjk_in_epub(
+        epub_path,
+        EPUB_STRUCTURAL_FILES,
+    )
+    for finding in window_findings:
+        result.setdefault(finding["file"], []).extend(finding["spans"])
+
     return result
 
 
@@ -317,9 +338,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="Minimum page-boundary suspicion score, 0-1")
     parser.add_argument("--limit", type=int, default=80,
                         help="Maximum suspicious CJK candidates to consider")
-    parser.add_argument("--min-score", type=float, default=0.68,
+    parser.add_argument("--min-score", type=float, default=0.65,
                         help="Minimum suspicious CJK score, 0-1")
-    parser.add_argument("--min-cjk", type=int, default=16,
+    parser.add_argument("--min-cjk", type=int, default=12,
                         help="Minimum CJK characters in a suspicious candidate")
     args = parser.parse_args(argv)
 

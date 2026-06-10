@@ -15,6 +15,7 @@ from .config import (
     CHUNK_SIZE,
     DEFAULT_COVER_JPEG_QUALITY,
     DEFAULT_COVER_MAX_EDGE,
+    EPUB_STRUCTURAL_FILES,
     PADDLE_BOTTOM_PADDING_PERCENT,
     PADDLE_PAGE_MARGIN_PT,
     TOC_PAGE_START_CSS,
@@ -31,7 +32,7 @@ from .footnotes import (
     format_page_footnotes_html,
     link_page_footnote_references,
 )
-from .ocr_noise import clean_ocr_noise
+from .ocr_noise import clean_ocr_noise, find_garbled_cjk_in_epub
 from .page_image_fallback import apply_page_image_fallbacks
 from .page_order_repair import repair_page_order_by_printed_numbers
 from .paddle_api import check_dependencies
@@ -46,7 +47,9 @@ __all__ = [
     "clean_ocr_noise",
     "create_epub",
     "ensure_toc_targets_start_pages",
+    "EPUB_STRUCTURAL_FILES",
     "extract_page_footnotes",
+    "find_garbled_cjk_in_epub",
     "format_page_footnotes_html",
     "link_page_footnote_references",
     "PADDLE_BOTTOM_PADDING_PERCENT",

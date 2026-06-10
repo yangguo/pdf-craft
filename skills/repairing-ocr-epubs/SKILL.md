@@ -9,12 +9,34 @@ description: "Use when reviewing or repairing generated EPUB files with OCR prob
 
 Do not patch prose blindly. Every text change needs evidence from the PDF rendering, an OCR checkpoint, a MinerU rerun, or the existing EPUB context. Prefer targeted MinerU sentence-level patching for PaddleOCR recognition errors; reserve manual EPUB edits for structure, TOC, or cases where OCR evidence is explicit and local.
 
+## Garbled CJK Text Classification
+
+Three tiers of garbled OCR text, in order of detectability:
+
+| Tier | Type | Example | Detected by |
+|------|------|---------|-------------|
+| 1 | Random rare-char clusters | `居之者忽音但一通乃一祔一筆八` | `ocr_review.py` (singleton bigram + density bonus) |
+| 2 | Single-char repetition | `三三三三三三...` (4048 times) | `ocr_noise.py` (`_find_repeated_char_spans`), `ocr_review.py` (`_repetition_ratio`) |
+| 3 | Semantic garble | `誰誰歸白一工任合室什其林人然已將則一語至不遂金方是任見` | `semantic_ocr_review.py` + `--llm` (statistical candidate + LLM filter) |
+
+Tier 3 characters are mostly common, bigrams look statistically plausible, but the sentence is nonsense. The standard detectors score them below threshold because common_char_ratio is high and anchor_bigram_ratio is high.
+
 ## Workflow
 
 1. Baseline scan:
 
 ```bash
+# Standard detection (Tiers 1+2)
 python3 -m paddle_pipeline.ocr_review book.epub --limit 80 --min-score 0.68
+
+# Semantic detection (Tier 3 — statistical windows + optional LLM filter)
+python3 -m paddle_pipeline.semantic_ocr_review book.epub --llm --json semantic_review.json
+
+# Deep semantic detection (statistical + sentence-level chunks + LLM)
+# Use --deep when Tier-3 garble is suspected but not caught by standard scan
+python3 -m paddle_pipeline.semantic_ocr_review book.epub --llm --deep --only-garbled --json deep_review.json
+
+# Full auto-fix scan
 python3 auto_fix_garbled.py book.pdf --output book.epub --scan-only \
   --scan-boundaries --json-report repair_scan.json
 ```
@@ -24,13 +46,54 @@ python3 auto_fix_garbled.py book.pdf --output book.epub --scan-only \
 | Symptom | First action |
 |---|---|
 | Short unreadable CJK spans | Run `auto_fix_garbled.py --dry-run` to map EPUB spans to PDF pages |
+| Semantic garble (common chars, nonsense sentence) | Run `semantic_ocr_review.py --llm`, then search MinerU checkpoints for correct text |
 | Paddle text is bad but page exists in checkpoint | Run targeted MinerU rerun through `auto_fix_garbled.py` |
 | Whole OCR page is unusable | Use `pdf2epub-mineru-rerun ... --replace-page` only for that page |
 | Missing sentence at a page boundary | Run `--scan-boundaries`, then render both adjacent PDF pages and compare checkpoint page starts |
 | Text near images/tables is missing or reordered | Inspect page image and OCR layout blocks; image-first pages can hide text before/after figures |
 | TOC/chapter break is wrong | Inspect `nav.xhtml`, `toc.ncx`, OPF spine, target XHTML anchors, then rebuild from checkpoint with a manual TOC JSON |
 
-3. MinerU repair path:
+3. **Finding correct text via MinerU checkpoints (preferred)**:
+
+The fastest way to get correct text for any garbled passage is to search existing MinerU rebuild checkpoints. If you have run `pdf2epub_paddle.py --api mineru` (even a failed/cancelled run), the `paddle_epub_work_*/chunk_*.json` files contain complete OCR for every PDF page. Search them for context keywords:
+
+```python
+import json, glob
+for path in sorted(glob.glob("paddle_epub_work_*/chunk_*.json")):
+    with open(path) as f: r = json.load(f)
+    for page in r.get("result", {}).get("layoutParsingResults", []):
+        text = page.get("markdown", {}).get("text", "")
+        if "keyword" in text:
+            print(f"Found in {path}!")
+```
+
+This avoids ad-hoc single-page OCR — one search covers the entire book.
+
+4. **Patching an EPUB XHTML file**:
+
+```python
+import zipfile, shutil, tempfile, os
+epub = "book.epub"
+fname = "EPUB/Chapter.xhtml"
+with zipfile.ZipFile(epub) as z: orig = z.read(fname).decode("utf-8")
+new = orig.replace(old_garbled, correct_text)
+
+td = tempfile.mkdtemp()
+with zipfile.ZipFile(epub) as z: z.extractall(td)
+with open(os.path.join(td, fname), "w", encoding="utf-8") as f: f.write(new)
+with zipfile.ZipFile(epub, "w", zipfile.ZIP_DEFLATED) as z:
+    mt = os.path.join(td, "mimetype")
+    if os.path.exists(mt): z.write(mt, "mimetype", compress_type=zipfile.ZIP_STORED)
+    for root, _, files in os.walk(td):
+        for file in files:
+            if file == "mimetype": continue
+            z.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), td).replace(os.sep, "/"))
+shutil.rmtree(td)
+```
+
+**Critical**: Use raw XHTML matching (regex with `\r+\n` for newlines), not plain-text matching.
+
+5. MinerU repair path:
 
 ```bash
 python3 auto_fix_garbled.py book.pdf \
@@ -145,4 +208,28 @@ for path in ["book.epub"]:
 PY
 ```
 
-Confirm candidate count is zero or every remaining candidate has been inspected and accepted as valid text. Report the exact files delivered and the verification evidence.
+Confirm candidate count is zero or every remaining candidate has been inspected and accepted as valid text. Also run semantic scan to catch Tier 3 issues:
+
+```bash
+python3 -m paddle_pipeline.semantic_ocr_review book.epub --limit 30 --min-score 0.60 --json semantic_postfix.json
+```
+
+## NEVER Do
+
+- **Never guess correct text from context** — always use source OCR from MinerU checkpoints or PDF rerun
+- **Never delete PaddleOCR/MinerU checkpoint directories** — they are the primary repair resource (complete source text for every page)
+- **Never rebuild an EPUB from scratch to fix a few garbled passages** — MinerU/Paddle builds produce MORE new garble than they fix
+- **Never apply LLM-suggested replacement text directly** — LLM only flags candidates for review; source OCR provides the confirmed text
+- **Never use `.bak` restore without re-applying all known fixes** — `.bak` files pre-date intermediate repair sessions
+- **Never match EPUB text as plain strings** — raw XHTML has `\r\n` newlines that break exact matching; use regex with `\r+\n`
+
+## Key Repair Patterns (from jiang1/jiang2 experience)
+
+| Pattern | Solution |
+|---|---|
+| "Paddle text + random rare chars" scribble | Singleton bigram density triggers `ocr_review.py` |
+| Single character repeated 100s of times | `_repetition_ratio` ≥ 0.80 fires detection boost |
+| Common chars forming nonsense sentence | Semantic scan → LLM filter → checkpoint search |
+| Fix lost after `.bak` restore | Batch re-apply all known replacements from memory record |
+| XHTML newline mismatch | Match raw `repr()` output, use `\r+\n` in regex |
+| EPUB-to-PDF page non-linear mapping | Search mineru checkpoints instead of guessing pages |

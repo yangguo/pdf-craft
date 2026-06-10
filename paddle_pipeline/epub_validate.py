@@ -61,7 +61,12 @@ def scan_epub_for_ocr_noise(epub_path: str) -> List[Dict[str, Any]]:
     garbled_findings = find_garbled_cjk_in_epub(
         epub_path, EPUB_STRUCTURAL_FILES,
     )
-    findings.extend(garbled_findings)
+    for finding in garbled_findings:
+        findings.append({
+            "file": finding["file"],
+            "token": f"potential garbled CJK text ({len(finding['spans'])} span{'s' if len(finding['spans']) > 1 else ''})",
+            "count": len(finding["spans"]),
+        })
 
     return findings
 
