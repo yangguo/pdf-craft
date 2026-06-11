@@ -47,53 +47,63 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
     Returns a list of paths to the temporary chunk files.
     """
     doc = fitz.open(file_path)
-    total_pages = len(doc)
-    print(f"[*] Total pages: {total_pages}")
+    try:
+        total_pages = len(doc)
+        print(f"[*] Total pages: {total_pages}")
 
-    if total_pages > MAX_DAILY_PAGES:
-        print(
-            f"[!] WARNING: This document ({total_pages} pages) exceeds the daily API limit of {MAX_DAILY_PAGES} pages."
-        )
-        print("    Processing may fail or get blocked if you exceed your quota.")
+        if total_pages > MAX_DAILY_PAGES:
+            print(
+                f"[!] WARNING: This document ({total_pages} pages) exceeds the daily API limit of {MAX_DAILY_PAGES} pages."
+            )
+            print("    Processing may fail or get blocked if you exceed your quota.")
 
-    chunk_paths = []
-    temp_dir = tempfile.mkdtemp(prefix="pdf_chunks_")
+        chunk_paths = []
+        temp_dir = tempfile.mkdtemp(prefix="pdf_chunks_")
 
-    margin = max(0, PADDLE_PAGE_MARGIN_PT)
-    bottom_padding_percent = max(0, PADDLE_BOTTOM_PADDING_PERCENT)
+        margin = max(0, PADDLE_PAGE_MARGIN_PT)
+        bottom_padding_percent = max(0, PADDLE_BOTTOM_PADDING_PERCENT)
 
-    for start_page in range(0, total_pages, chunk_size):
-        end_page = min(start_page + chunk_size, total_pages)
-        chunk_doc = fitz.open()
+        for start_page in range(0, total_pages, chunk_size):
+            end_page = min(start_page + chunk_size, total_pages)
+            chunk_doc = fitz.open()
 
-        for src_page_num in range(start_page, end_page):
-            src_page = doc[src_page_num]
-            src_rect = src_page.rect
-            new_w = src_rect.width + 2 * margin
-            extra_bottom = src_rect.height * (bottom_padding_percent / 100.0)
-            new_h = src_rect.height + 2 * margin + extra_bottom
+            for src_page_num in range(start_page, end_page):
+                src_page = doc[src_page_num]
+                src_rect = src_page.rect
+                new_w = src_rect.width + 2 * margin
+                extra_bottom = src_rect.height * (bottom_padding_percent / 100.0)
+                new_h = src_rect.height + 2 * margin + extra_bottom
 
-            # Save single page to temp PDF (show_pdf_page forbids self-reference)
-            tmp_doc = fitz.open()
-            try:
-                tmp_doc.insert_pdf(doc, from_page=src_page_num, to_page=src_page_num)
+                # Save single page to temp PDF (show_pdf_page forbids self-reference)
+                tmp_doc = fitz.open()
+                try:
+                    tmp_doc.insert_pdf(doc, from_page=src_page_num, to_page=src_page_num)
 
-                new_page = chunk_doc.new_page(width=new_w, height=new_h)
-                new_page.show_pdf_page(
-                    fitz.Rect(margin, margin,
-                              margin + src_rect.width, margin + src_rect.height),
-                    tmp_doc, 0,
-                )
-            finally:
-                tmp_doc.close()
+                    new_page = chunk_doc.new_page(width=new_w, height=new_h)
+                    # PyMuPDF raises on blank source pages (no content stream).
+                    # Keep the blank page canvas with guard bands in that case.
+                    if tmp_doc[0].get_contents():
+                        new_page.show_pdf_page(
+                            fitz.Rect(
+                                margin,
+                                margin,
+                                margin + src_rect.width,
+                                margin + src_rect.height,
+                            ),
+                            tmp_doc,
+                            0,
+                        )
+                finally:
+                    tmp_doc.close()
 
-        chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
-        chunk_doc.save(chunk_filename)
-        chunk_doc.close()
-        chunk_paths.append(chunk_filename)
+            chunk_filename = os.path.join(temp_dir, f"chunk_{start_page}_{end_page}.pdf")
+            chunk_doc.save(chunk_filename)
+            chunk_doc.close()
+            chunk_paths.append(chunk_filename)
 
-    doc.close()
-    return chunk_paths
+        return chunk_paths
+    finally:
+        doc.close()
 
 
 def parse_pdf_chunk(chunk_path: str, token: str) -> Dict[str, Any] | None:

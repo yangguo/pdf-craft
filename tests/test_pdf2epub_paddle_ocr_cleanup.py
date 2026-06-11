@@ -1344,6 +1344,62 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
             self.assertFalse(output_path.exists())
 
+    def test_create_epub_collapses_excessive_newlines_before_markdown_render(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_markdown_input(text, *args, **kwargs):
+            captured["markdown_input"] = text
+            return "<p>normalized</p>"
+
+        def fake_link_page_footnote_references(page_markdown, _page_footnotes, _global_page):
+            # Simulate noisy page-boundary spacing that can accumulate across pages.
+            return page_markdown + "\n\n\n\n", {}
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {"markdown": {"text": "First page sentence.", "images": {}}},
+                        {"markdown": {"text": "Second page sentence.", "images": {}}},
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "link_page_footnote_references",
+                fake_link_page_footnote_references,
+            ), mock.patch.object(
+                mod.epub_builder,
+                "format_page_footnotes_html",
+                return_value="",
+            ), mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ), mock.patch(
+                "markdown.markdown",
+                side_effect=capture_markdown_input,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                )
+
+        self.assertIn("First page sentence.", captured["markdown_input"])
+        self.assertIn("Second page sentence.", captured["markdown_input"])
+        self.assertNotRegex(captured["markdown_input"], r"\n{3,}")
+
     def test_create_epub_manual_toc_match_alias_uses_display_title(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "create_epub"))
@@ -2175,4 +2231,3 @@ class TestGarbledCjkDetection(unittest.TestCase):
             )
 
         self.assertEqual([], findings)
-

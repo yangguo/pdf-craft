@@ -7,7 +7,10 @@ Usage:
     main()
 """
 
-from .main import main
+def main(*args, **kwargs):
+    """Lazy import to avoid loading full CLI dependency graph on package import."""
+    from .main import main as _main
+    return _main(*args, **kwargs)
 
 # Re-export public functions used by tests
 from .config import (

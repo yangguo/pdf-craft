@@ -473,9 +473,15 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                     current_ends = current_para.rstrip()
 
                     if consecutive_blanks >= 2:
-                        # Multiple blank lines — real paragraph break
-                        reflowed_paragraphs.append(current_para)
-                        current_para = stripped
+                        # Multiple blank lines are usually a paragraph break, but
+                        # OCR often inserts whole blank runs at page/column wraps.
+                        # If the previous line is mid-sentence (e.g. "第五" and
+                        # next line starts "軍"), keep it as one paragraph.
+                        if current_ends.endswith(terminal_chars):
+                            reflowed_paragraphs.append(current_para)
+                            current_para = stripped
+                        else:
+                            current_para = current_ends + " " + stripped
                     elif consecutive_blanks == 1:
                         # Single blank between text lines — often OCR line-wrap
                         # noise, but sometimes a real paragraph break.
@@ -502,9 +508,6 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     elif current_ends and current_ends[-1] in non_join_endings:
-                        reflowed_paragraphs.append(current_para)
-                        current_para = stripped
-                    elif len(stripped) < 20 and not stripped.endswith(terminal_chars):
                         reflowed_paragraphs.append(current_para)
                         current_para = stripped
                     else:

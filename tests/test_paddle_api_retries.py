@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
@@ -15,6 +16,15 @@ class _Response:
 
     def json(self):
         return self._payload
+
+
+@contextmanager
+def _temporary_chunk_file(repo_root: Path):
+    """Create a closed temp PDF file so tests work on Windows and Unix."""
+    with tempfile.TemporaryDirectory(dir=repo_root) as temp_dir:
+        chunk_path = Path(temp_dir) / "chunk.pdf"
+        chunk_path.write_bytes(b"%PDF-1.4\n")
+        yield str(chunk_path)
 
 
 class TestPaddleApiRetries(unittest.TestCase):
@@ -55,13 +65,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertEqual(fake_requests.post_calls, 2)
         self.assertEqual(fake_requests.poll_calls, 1)
@@ -104,13 +111,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertEqual(fake_requests.post_calls, 1)
         self.assertEqual(fake_requests.poll_calls, 2)
@@ -141,13 +145,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertIsNone(result)
         self.assertEqual(fake_requests.post_calls, 1)
@@ -178,13 +179,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertIsNone(result)
         self.assertEqual(fake_requests.post_calls, 5)
@@ -235,13 +233,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertEqual(fake_requests.post_calls, 1)
         self.assertEqual(fake_requests.poll_calls, 2)
@@ -302,13 +297,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertEqual(fake_requests.post_calls, 1)
         self.assertEqual(fake_requests.json_download_calls, 2)
@@ -359,13 +351,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertIsNone(result)
         self.assertEqual(fake_requests.post_calls, 1)
@@ -396,13 +385,10 @@ class TestPaddleApiRetries(unittest.TestCase):
 
         fake_requests = FakeRequests()
         repo_root = Path(__file__).resolve().parents[1]
-        with tempfile.NamedTemporaryFile(dir=repo_root) as chunk:
-            chunk.write(b"%PDF-1.4\n")
-            chunk.flush()
-
+        with _temporary_chunk_file(repo_root) as chunk_path:
             with mock.patch.object(api, "requests", fake_requests):
                 with mock.patch.object(api.time, "sleep", return_value=None):
-                    result = api.parse_pdf_chunk(chunk.name, "token")
+                    result = api.parse_pdf_chunk(chunk_path, "token")
 
         self.assertIsNone(result)
         self.assertEqual(fake_requests.post_calls, 1)
