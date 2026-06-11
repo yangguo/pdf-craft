@@ -74,6 +74,7 @@ def _find_garbled_spans(
     limit: int = 80,
     min_score: float = 0.65,
     min_cjk: int = 12,
+    deep: bool = False,
 ) -> Dict[str, List[str]]:
     """Return {epub_filename: [suspicious_cjk_excerpt, ...]}.
 
@@ -103,6 +104,36 @@ def _find_garbled_spans(
     )
     for finding in window_findings:
         result.setdefault(finding["file"], []).extend(finding["spans"])
+
+    # Deep: sentence-level semantic scan catches Tier-3 garble that
+    # statistical detectors miss (common bigrams forming nonsense sentences).
+    if deep:
+        try:
+            from paddle_pipeline.semantic_ocr_review import generate_sentence_candidates
+
+            sentence_candidates = generate_sentence_candidates(
+                epub_path,
+                limit=limit * 4,
+                min_cjk=8,
+            )
+            deep_count = 0
+            for sc in sentence_candidates:
+                excerpt = sc["excerpt"]
+                file_spans = result.setdefault(sc["file"], [])
+                if excerpt not in file_spans:
+                    file_spans.append(excerpt)
+                    deep_count += 1
+            if deep_count:
+                print(
+                    f"[*] --deep: {deep_count} sentence-level candidates added "
+                    f"for manual or LLM review",
+                    file=sys.stderr,
+                )
+        except ImportError:
+            print(
+                "[!] --deep requires semantic_ocr_review module",
+                file=sys.stderr,
+            )
 
     return result
 
@@ -329,6 +360,11 @@ def main(argv: list[str] | None = None) -> None:
                               "then stop before MinerU rerun"))
     parser.add_argument("--json-report", default=None,
                         help="Write scan, mapping, and validation details as JSON")
+    parser.add_argument("--deep", action="store_true",
+                        help=("Also generate sentence-level semantic candidates. "
+                              "These catch Tier-3 garble where every individual "
+                              "bigram is common but the sentence is nonsense. "
+                              "Candidates need manual or LLM review."))
     parser.add_argument("--scan-boundaries", action="store_true",
                         help=("Also scan OCR checkpoints for page-boundary "
                               "missing-sentence candidates"))
@@ -388,6 +424,7 @@ def main(argv: list[str] | None = None) -> None:
         limit=args.limit,
         min_score=args.min_score,
         min_cjk=args.min_cjk,
+        deep=args.deep,
     )
     total = sum(len(s) for s in garbled.values())
     run_report["garbled"] = garbled
