@@ -568,6 +568,11 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
     # Split by H1 or H2, BUT only if it looks like a real Chapter/Part title
     # Regex for headers: ^#+ \s* (Title)
 
+    # Collapse accumulated page-boundary newlines back to paragraph breaks.
+    # Each page appends "\n\n" at assembly time; when pages stack the gap can
+    # grow to 4+ newlines which later leak into XHTML as excessive \r\n runs.
+    full_markdown = re.sub(r"\n{3,}", "\n\n", full_markdown)
+
     md_lines = full_markdown.split("\n")
     current_chapter_title = None  # None means no chapter header seen yet
     current_chapter_content = []
