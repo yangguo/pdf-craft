@@ -212,10 +212,9 @@ def find_suspicious_cjk_spans_in_epub(
         return []
 
     char_freq = Counter(all_chars)
-    bigram_freq = Counter(
-        all_chars[index] + all_chars[index + 1]
-        for index in range(len(all_chars) - 1)
-    )
+    bigram_freq: Counter[str] = Counter()
+    for index in range(len(all_chars) - 1):
+        bigram_freq[all_chars[index] + all_chars[index + 1]] += 1
 
     candidates_by_key: dict[tuple[str, str], Dict[str, Any]] = {}
     for name, text in file_texts:

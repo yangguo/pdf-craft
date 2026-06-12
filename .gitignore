@@ -1,6 +1,14 @@
 .DS_Store
 /*.png
-/*.json
+/*_deep*.json
+/*_latest.json
+/*_final.json
+/*_llm_final.json
+/*_semantic*.json
+/*_scan*.json
+/*_review*.json
+/*_repair*.json
+/report.*.json
 /*.epub
 /*.pdf
 
@@ -8,6 +16,8 @@
 /analysing
 /models-cache
 /tmp
+/tmp_pages/
+/*.epub.bak
 /paddle_epub_work_*/
 
 # Byte-compiled / optimized / DLL files
