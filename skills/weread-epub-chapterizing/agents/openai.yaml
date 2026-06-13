@@ -1,0 +1,4 @@
+interface:
+  display_name: "WeRead EPUB Chapterizing"
+  short_description: "Restructure EPUBs for WeRead AI reading chapters"
+  default_prompt: "Restructure this EPUB so 微信读书 AI朗读 uses front matter, part, and chapter boundaries only, then verify the resulting nav, NCX, OPF spine, and ZIP integrity."

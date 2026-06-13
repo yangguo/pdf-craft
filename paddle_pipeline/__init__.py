@@ -7,10 +7,24 @@ Usage:
     main()
 """
 
+from typing import Any
+
 def main(*args, **kwargs):
     """Lazy import to avoid loading full CLI dependency graph on package import."""
     from .main import main as _main
     return _main(*args, **kwargs)
+
+
+def chapterize_epub_for_weread(*args: Any, **kwargs: Any) -> Any:
+    """Lazy re-export for WeRead chapter restructuring."""
+    from .weread_chapterize import chapterize_epub_for_weread as _chapterize
+    return _chapterize(*args, **kwargs)
+
+
+def verify_weread_chapterized_epub(*args: Any, **kwargs: Any) -> Any:
+    """Lazy re-export for WeRead chapterized EPUB validation."""
+    from .weread_chapterize import verify_weread_chapterized_epub as _verify
+    return _verify(*args, **kwargs)
 
 # Re-export public functions used by tests
 from .config import (
@@ -47,6 +61,7 @@ __all__ = [
     "main",
     "apply_page_image_fallbacks",
     "check_dependencies",
+    "chapterize_epub_for_weread",
     "clean_ocr_noise",
     "create_epub",
     "ensure_toc_targets_start_pages",
@@ -62,4 +77,5 @@ __all__ = [
     "repair_page_order_by_printed_numbers",
     "split_pdf_mineru",
     "validate_epub_no_ocr_noise",
+    "verify_weread_chapterized_epub",
 ]

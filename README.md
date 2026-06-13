@@ -6,6 +6,9 @@ Convert scanned PDF books to EPUB using PaddleOCR or MinerU cloud APIs — no lo
 
 ```bash
 pip install pymupdf ebooklib requests python-dotenv markdown numpy
+
+# Development tools for tests and type checking
+pip install pytest pyright
 ```
 
 ## Setup
@@ -26,6 +29,9 @@ Get a MinerU token from [MinerU](https://mineru.net/) (v4 API).
 # PaddleOCR (default)
 python pdf2epub_paddle.py book.pdf --title "Book Title" --author "Author" --auto-toc
 
+# PaddleOCR plus WeRead AI reading chapter restructuring
+python pdf2epub_paddle.py book.pdf --title "Book Title" --author "Author" --auto-toc --weread-chapterize
+
 # MinerU (faster, 20-page chunks)
 python pdf2epub_paddle.py book.pdf --title "Book Title" --author "Author" --auto-toc --api mineru
 
@@ -37,6 +43,10 @@ python pdf2epub_paddle.py book.pdf --title "Title" --no-toc
 
 # Fail on OCR noise artifacts
 python pdf2epub_paddle.py book.pdf --title "Title" --strict-ocr-noise
+
+# Patch an existing EPUB so WeRead AI reading sees front matter, parts, and chapters
+pdf2epub-weread-chapterize book.epub --backup tmp/book.before_weread_chapterize.epub
+pdf2epub-weread-chapterize book.epub --verify-only
 
 # Review suspicious short CJK OCR spans without failing the build
 pdf2epub-ocr-review book.epub --limit 50 --min-score 0.68
@@ -61,9 +71,24 @@ pdf2epub-mineru-rerun book.pdf --work-dir paddle_epub_work_<hash> --pages 82 --r
 | `--api` | OCR backend: `paddle` (default) or `mineru` |
 | `--auto-toc` | Skip TOC review, use auto-detected chapters |
 | `--no-toc` | No chapter splitting — single-chapter EPUB |
+| `--weread-chapterize` | After EPUB generation, rewrite reading-level documents for WeRead AI reading |
 | `--strict-ocr-noise` | Fail if OCR artifacts remain in output |
 | `--cover-max-edge` | Max cover image edge in pixels (default: 2000) |
 | `--cover-quality` | JPEG cover quality 1–100 (default: 82) |
+
+### WeRead AI Reading Chapterizing
+
+Use `--weread-chapterize` during conversion when 微信读书/WeRead AI朗读 should expose one reading item per front-matter item, part, chapter, and index entry. The post-processor rewrites `nav.xhtml`, `toc.ncx`, the OPF spine, and generated `EPUB/weread_*.xhtml` files so those signals agree. It also keeps a backup next to the output as `<name>.before_weread_chapterize.epub`.
+
+For an EPUB that already exists, run the reusable CLI directly:
+
+```bash
+pdf2epub-weread-chapterize book.epub --backup tmp/book.before_weread_chapterize.epub
+pdf2epub-weread-chapterize book.epub --verify-only
+
+# Module form works without installed console scripts
+python3 -m paddle_pipeline.weread_chapterize book.epub --verify-only
+```
 
 ### MinerU Configuration
 
@@ -92,6 +117,14 @@ Progress is saved per chunk in `paddle_epub_work_<hash>/`. Re-run the same comma
 - **OCR review scan**: Ranks suspicious short CJK spans for manual checking or targeted second OCR
 - **Targeted MinerU reruns**: Re-OCR selected PDF pages and patch their existing checkpoints
 - **TOC retargeting**: Fixes TOC fragment links to point at the correct chapter headings
+- **WeRead AI reading chapterizing**: Flattens EPUB reading boundaries for WeRead AI朗读
+
+## Development
+
+```bash
+python3 -m pytest tests/ -q
+python3 -m pyright paddle_pipeline/
+```
 
 ## License
 

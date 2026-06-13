@@ -3,7 +3,7 @@
 import re
 
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from .config import fitz  # Optional dependency
 
@@ -32,7 +32,7 @@ def _printed_page_numbers(pdf_path: str) -> List[Optional[int]]:
     doc = fitz.open(pdf_path)
     try:
         return [
-            _extract_printed_page_number(doc[index].get_text())
+            _extract_printed_page_number(cast(Any, doc[index]).get_text())
             for index in range(doc.page_count)
         ]
     finally:

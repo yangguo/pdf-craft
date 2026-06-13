@@ -6,6 +6,9 @@
 
 ```bash
 pip install pymupdf ebooklib requests python-dotenv markdown numpy
+
+# 开发、测试和类型检查工具
+pip install pytest pyright
 ```
 
 ## 配置
@@ -26,6 +29,9 @@ MINERU_API_TOKEN=你的token   # --api mineru
 # PaddleOCR（默认）
 python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc
 
+# PaddleOCR，并在生成后整理微信读书 AI 朗读目录
+python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc --weread-chapterize
+
 # MinerU（更快，20页/块）
 python pdf2epub_paddle.py book.pdf --title "书名" --author "作者" --auto-toc --api mineru
 
@@ -37,6 +43,10 @@ python pdf2epub_paddle.py book.pdf --title "书名" --no-toc
 
 # 严格模式 — 残留 OCR 噪声时报错
 python pdf2epub_paddle.py book.pdf --title "书名" --strict-ocr-noise
+
+# 修复已有 EPUB，让微信读书 AI 朗读按前置内容、编、章划分
+pdf2epub-weread-chapterize book.epub --backup tmp/book.before_weread_chapterize.epub
+pdf2epub-weread-chapterize book.epub --verify-only
 
 # 审校扫描 — 找出疑似短段中文 OCR 乱码，不影响构建
 pdf2epub-ocr-review book.epub --limit 50 --min-score 0.68
@@ -61,9 +71,24 @@ pdf2epub-mineru-rerun book.pdf --work-dir paddle_epub_work_<hash> --pages 82 --r
 | `--api` | OCR 后端：`paddle`（默认）或 `mineru` |
 | `--auto-toc` | 跳过目录审查，直接使用自动检测的章节 |
 | `--no-toc` | 不拆分章节 — 整本书作为一个章节 |
+| `--weread-chapterize` | EPUB 生成后重写微信读书 AI 朗读使用的阅读级文档 |
 | `--strict-ocr-noise` | 输出中残留 OCR 噪声时中断报错 |
 | `--cover-max-edge` | 封面图片最大边长像素（默认：2000） |
 | `--cover-quality` | JPEG 封面质量 1–100（默认：82） |
+
+### 微信读书 AI 朗读目录整理
+
+转换时加 `--weread-chapterize`，会在 EPUB 生成后把 `nav.xhtml`、`toc.ncx`、OPF spine 和 `EPUB/weread_*.xhtml` 调整为同一套阅读边界。微信读书 AI 朗读通常会因此按前置内容、`第X編`、`第X章` 和索引显示，而不是把正文小标题或纸书目录行混进目录。处理时会在输出文件旁保留 `<文件名>.before_weread_chapterize.epub` 备份。
+
+如果 EPUB 已经生成，可以单独运行可复用命令：
+
+```bash
+pdf2epub-weread-chapterize book.epub --backup tmp/book.before_weread_chapterize.epub
+pdf2epub-weread-chapterize book.epub --verify-only
+
+# 没安装 console script 时可用模块形式
+python3 -m paddle_pipeline.weread_chapterize book.epub --verify-only
+```
 
 ### MinerU 配置
 
@@ -92,6 +117,14 @@ pdf2epub-mineru-rerun book.pdf --work-dir paddle_epub_work_<hash> --pages 82 --r
 - **OCR 审校扫描**：按分数列出疑似短段中文乱码，供人工核对或二次 OCR
 - **MinerU 局部重跑**：只对指定 PDF 页重新 OCR，并回写已有 checkpoint
 - **目录修复**：修正 TOC 目录链接指向正确的章节标题
+- **微信读书 AI 朗读整理**：把 EPUB 阅读边界扁平化，避免正文小标题混入朗读目录
+
+## 开发
+
+```bash
+python3 -m pytest tests/ -q
+python3 -m pyright paddle_pipeline/
+```
 
 ## 许可证
 

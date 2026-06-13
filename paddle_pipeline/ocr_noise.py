@@ -43,7 +43,7 @@ def _scan_text_for_garbled_cjk_spans(
     spans and returned when the run is long enough.
 
     Additionally, detect repeated-character spans (e.g. ``三三三三三三…``)
-    where the same CJK character appears consecutively ≥ 8 times.  These
+    where the same CJK character appears consecutively ≥ 6 times.  These
     are OCR hallucinations that bigram analysis alone cannot catch because
     the repeated bigram (e.g. ``三三``) is common in real text.
     """
@@ -86,7 +86,7 @@ def _scan_text_for_garbled_cjk_spans(
     return spans
 
 
-def _find_repeated_char_spans(chars: list[str], min_repeat: int = 8) -> List[str]:
+def _find_repeated_char_spans(chars: list[str], min_repeat: int = 6) -> List[str]:
     """Return spans where the same CJK character repeats consecutively ≥ *min_repeat* times.
 
     OCR engines sometimes hallucinate a single character hundreds or thousands
@@ -261,4 +261,3 @@ def clean_ocr_noise(markdown_text: str) -> str:
 
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
-

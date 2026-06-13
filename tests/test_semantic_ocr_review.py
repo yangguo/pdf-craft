@@ -138,6 +138,36 @@ class TestSemanticCandidateGeneration(unittest.TestCase):
             self.assertIn("source", c)
             self.assertEqual(c["source"], "semantic_candidate")
 
+    def test_semantic_candidate_keeps_punctuation_for_llm_review(self):
+        """LLM review should see punctuation that the CJK scorer ignores."""
+        from paddle_pipeline.semantic_ocr_review import generate_semantic_candidates
+
+        title_list = (
+            "譯作極豐，有《蔣經國傳》、《裕仁天皇》、《轉向：從尼克森到柯林頓美中關係揭密》、"
+            "《季辛吉大外交》（合譯）、《大棋盤》、《將門虎子》、《買通白宮》、《李潔明回憶錄》。"
+        )
+        body = (
+            "<html><body>"
+            f"<p>{_NORMAL_CHINESE * 10}</p>"
+            f"<p>{title_list}</p>"
+            "</body></html>"
+        )
+        with tempfile.TemporaryDirectory() as td:
+            epub = Path(td) / "test.epub"
+            _write_epub(epub, body)
+
+            candidates = generate_semantic_candidates(
+                str(epub), limit=50, min_score=0.20, min_cjk=14
+            )
+
+        candidate = next(
+            c for c in candidates
+            if "季辛吉大外交" in c["excerpt"]
+        )
+        self.assertIn("llm_excerpt", candidate)
+        self.assertIn("《季辛吉大外交》（合譯）", candidate["llm_excerpt"])
+        self.assertIn("《大棋盤》", candidate["llm_excerpt"])
+
     def test_empty_epub_returns_empty_list(self):
         """An EPUB with no CJK text should return an empty list."""
         from paddle_pipeline.semantic_ocr_review import generate_semantic_candidates
@@ -264,6 +294,21 @@ class TestLLMReview(unittest.TestCase):
         self.assertEqual(messages[1]["role"], "user")
         self.assertIn(candidate["excerpt"], messages[1]["content"])
         self.assertIn(candidate["context_before"], messages[1]["content"])
+
+    def test_build_llm_prompt_uses_punctuation_preserving_excerpt(self):
+        from paddle_pipeline.semantic_ocr_review import _build_llm_prompt
+
+        candidate = self._make_candidate(
+            excerpt="季辛吉大外交合譯大棋盤將門虎子買通白宮",
+            llm_excerpt="《季辛吉大外交》（合譯）、《大棋盤》、《將門虎子》、《買通白宮》",
+        )
+        messages = _build_llm_prompt(candidate)
+
+        self.assertIn(candidate["llm_excerpt"], messages[1]["content"])
+        self.assertNotIn(
+            "候選片段：\n" + candidate["excerpt"],
+            messages[1]["content"],
+        )
 
     def test_review_successful_response(self):
         """Mock a successful LLM response."""

@@ -3,7 +3,7 @@
 import os
 import re
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 from .config import (
     DEFAULT_COVER_MAX_EDGE,
@@ -26,7 +26,7 @@ def extract_cover_image(
         if len(doc) == 0:
             print("[!] PDF has no pages; skipping cover extraction.")
             return None
-        page = doc.load_page(0)
+        page = cast(Any, doc.load_page(0))
         if max_edge <= 0:
             zoom = 2.0
         else:
@@ -270,7 +270,10 @@ def filter_heading_candidates(candidates: List[Dict]) -> List[Dict]:
     return sorted(candidates, key=lambda h: h["page"])
 
 
-def review_toc_interactive(candidates: List[Dict], all_candidates: List[Dict] = None) -> List[Dict]:
+def review_toc_interactive(
+    candidates: List[Dict],
+    all_candidates: List[Dict] | None = None,
+) -> List[Dict]:
     """Interactive prompt for reviewing and editing the auto-detected TOC."""
     if not candidates:
         print("\n[!] No chapter headings detected. The book will be a single chapter.")
@@ -381,5 +384,4 @@ def download_image(url: str, save_path: str):
     except Exception as e:
         print(f"[!] Failed to download image {url[:80]}: {e}")
     return False
-
 

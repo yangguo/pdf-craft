@@ -6,7 +6,7 @@ import sys
 import tempfile
 import time
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 from .config import (
     API_TIMEOUT_SECONDS,
@@ -79,7 +79,7 @@ def split_pdf(file_path: str, chunk_size: int = CHUNK_SIZE) -> List[str]:
                 try:
                     tmp_doc.insert_pdf(doc, from_page=src_page_num, to_page=src_page_num)
 
-                    new_page = chunk_doc.new_page(width=new_w, height=new_h)
+                    new_page = cast(Any, chunk_doc).new_page(width=new_w, height=new_h)
                     # PyMuPDF raises on blank source pages (no content stream).
                     # Keep the blank page canvas with guard bands in that case.
                     if tmp_doc[0].get_contents():

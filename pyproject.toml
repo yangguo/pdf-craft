@@ -17,6 +17,7 @@ packages = [
 pdf2epub-paddle = "paddle_pipeline.main:main"
 pdf2epub-ocr-review = "paddle_pipeline.ocr_review:main"
 pdf2epub-mineru-rerun = "paddle_pipeline.mineru_rerun:main"
+pdf2epub-weread-chapterize = "paddle_pipeline.weread_chapterize:main"
 
 [tool.poetry.dependencies]
 python = ">=3.11,<3.14"

@@ -25,6 +25,17 @@ _MANUAL_HEADING_BRACKET_RE = re.compile(
 _MANUAL_HEADING_PREFIX_RE = re.compile(
     r"^(第[零一二三四五六七八九十百千0-9]+[章節节编編篇部卷])\s+"
 )
+_ATX_HEADING_RE = re.compile(r"^#{1,6}\s+(.+)$")
+_STRUCTURAL_HEADING_TEXT_RE = re.compile(
+    r"^(?:Chapter|Part|Lecture|Preface|Intro|Appendix|Prologue|Epilogue|"
+    r"Conclusion|Book|Acknowledgements|Contents|Abstract|序|前言|导论|目錄|目录|"
+    r"第[零一二三四五六七八九十百千0-9]+[篇章講讲節节编編部卷]).*"
+)
+_BODY_SENTENCE_ENDINGS = (
+    ".", "!", "?", ":", ";",
+    "。", "！", "？", "：", "；", "）", "】", "〉", "》", "」", "』",
+)
+_CJK_TEXT_RE = re.compile(r"[\u3400-\u9fff]")
 
 
 def _normalize_manual_heading_text(text: Any) -> str:
@@ -110,6 +121,27 @@ def _lookup_confirmed_heading(
     if not key:
         return None
     return lookup.get((current_page, key)) or lookup.get((current_page - 1, key))
+
+
+def _demote_unconfirmed_body_heading(
+    line: str,
+    confirmed_lookup: dict[tuple[int, str], str],
+    current_page: int,
+) -> str:
+    """Strip OCR-added markdown heading markup from body sentence continuations."""
+    match = _ATX_HEADING_RE.match(line.strip())
+    if not match:
+        return line
+
+    heading_text = match.group(1).strip()
+    if _lookup_confirmed_heading(confirmed_lookup, current_page, heading_text):
+        return line
+    if _STRUCTURAL_HEADING_TEXT_RE.match(heading_text):
+        return line
+    cjk_len = len(_CJK_TEXT_RE.findall(heading_text))
+    if heading_text.endswith(_BODY_SENTENCE_ENDINGS) or cjk_len >= 24:
+        return heading_text
+    return line
 
 
 def _build_header_fingerprints(confirmed_headings: List[Dict] | None,
@@ -448,6 +480,13 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                     consecutive_blanks += 1
                     continue
 
+                if confirmed_headings is not None:
+                    stripped = _demote_unconfirmed_body_heading(
+                        stripped,
+                        _confirmed_heading_lookup,
+                        global_page,
+                    )
+
                 # Check if this line is a header/list/blockquote
                 is_manual_heading = bool(
                     _lookup_confirmed_heading(
@@ -767,7 +806,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
         book.add_item(c)
         chapters.append(c)
 
-    book.toc = tuple(chapters)
+    book.toc = list(chapters)
     book.add_item(epub.EpubNcx())
     book.add_item(epub.EpubNav())
     book.spine = ["nav"] + chapters

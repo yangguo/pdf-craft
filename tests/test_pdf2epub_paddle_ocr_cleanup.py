@@ -421,6 +421,57 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
             f"Expected garbled CJK finding, got: {findings}",
         )
 
+    def test_scan_epub_for_ocr_noise_includes_garbled_examples(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        repeated = "也也也也也也"
+        corpus = "今天天氣很好，我和朋友一起去公園散步。" * 50
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    f"<html><body><p>{corpus}{repeated}</p></body></html>",
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        garbled = [
+            item for item in findings if "garbled CJK" in item.get("token", "")
+        ]
+        self.assertTrue(garbled, findings)
+        self.assertTrue(
+            any(repeated in "".join(item.get("examples", [])) for item in garbled),
+            garbled,
+        )
+
+    def test_scan_epub_for_ocr_noise_reports_suspicious_body_heading(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
+
+        with tempfile.TemporaryDirectory() as td:
+            epub_path = Path(td) / "book.epub"
+            with ZipFile(epub_path, "w") as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=ZIP_STORED)
+                zf.writestr(
+                    "EPUB/chapter.xhtml",
+                    (
+                        "<html><body>"
+                        "<h1>蘇聯軍方在當地部署的規模將一使蘇聯政府在所有關鍛刀面者輔而易變北三空月勞</h1>"
+                        "<p>毛澤東在日本投降前後這段期間的行動。</p>"
+                        "</body></html>"
+                    ),
+                )
+
+            findings = mod.scan_epub_for_ocr_noise(epub_path)
+
+        self.assertTrue(
+            any(item["token"] == "suspicious body heading" for item in findings),
+            f"Expected suspicious body heading finding, got: {findings}",
+        )
+
     def test_scan_epub_for_ocr_noise_allows_normal_chinese_prose(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "scan_epub_for_ocr_noise"))
@@ -1603,6 +1654,119 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertNotIn("尼克森及晚年", chapter_html)
         self.assertIn("正文開始。", chapter_html)
 
+    def test_create_epub_manual_toc_demotes_unconfirmed_markdown_heading_continuation(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "第七章\n正文前半，中共",
+                                "images": {},
+                            }
+                        },
+                        {
+                            "markdown": {
+                                "text": "# 只有約七萬名士兵犧牲性命。\n\n後文。",
+                                "images": {},
+                            }
+                        },
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                    confirmed_headings=[
+                        {
+                            "page": 1,
+                            "title": "第七章 測試",
+                            "match": "第七章",
+                        }
+                    ],
+                )
+
+        chapter_html = list(captured["book"].toc)[0].content
+        if isinstance(chapter_html, bytes):
+            chapter_html = chapter_html.decode("utf-8")
+        self.assertNotIn("<h1>只有約七萬名士兵犧牲性命。</h1>", chapter_html)
+        self.assertRegex(chapter_html, r"正文前半，中共\s+只有約七萬名士兵犧牲性命。")
+
+    def test_create_epub_manual_toc_demotes_long_unconfirmed_markdown_heading(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        bad_heading = "蘇聯軍方在當地部署的規模將一使蘇聯政府在所有關鍛刀面者輔而易變北三空月勞"
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": "第七章\n前文。",
+                                "images": {},
+                            }
+                        },
+                        {
+                            "markdown": {
+                                "text": f"# {bad_heading}\n\n後文。",
+                                "images": {},
+                            }
+                        },
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                    confirmed_headings=[
+                        {
+                            "page": 1,
+                            "title": "第七章 測試",
+                            "match": "第七章",
+                        }
+                    ],
+                )
+
+        chapter_html = list(captured["book"].toc)[0].content
+        if isinstance(chapter_html, bytes):
+            chapter_html = chapter_html.decode("utf-8")
+        self.assertNotIn(f"<h1>{bad_heading}</h1>", chapter_html)
+        self.assertIn(bad_heading, chapter_html)
+
     def test_strip_missing_image_references_removes_markdown_and_html_images(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod.epub_builder, "_strip_missing_image_references"))
@@ -2115,23 +2279,23 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 class TestGarbledCjkDetection(unittest.TestCase):
     """Unit tests for repeated-character and window-based garbled CJK detection."""
 
-    def test_find_repeated_char_spans_detects_8plus_repeats(self):
-        """Verify that consecutive repeated characters ≥8 times are detected."""
+    def test_find_repeated_char_spans_detects_6plus_repeats(self):
+        """Verify that consecutive repeated characters ≥6 times are detected."""
         mod = _load_fresh_script_module()
         from paddle_pipeline.ocr_noise import _find_repeated_char_spans
 
-        chars = list("三三三三三三三三")  # 8 chars, should be detected
+        chars = list("三三三三三三")  # 6 chars, should be detected
         spans = _find_repeated_char_spans(chars)
 
         self.assertEqual(len(spans), 1)
-        self.assertEqual(spans[0], "三三三三三三三三")
+        self.assertEqual(spans[0], "三三三三三三")
 
-    def test_find_repeated_char_spans_ignores_7_repeats(self):
-        """Verify that consecutive repeated characters <8 times are ignored."""
+    def test_find_repeated_char_spans_ignores_5_repeats(self):
+        """Verify that consecutive repeated characters <6 times are ignored."""
         mod = _load_fresh_script_module()
         from paddle_pipeline.ocr_noise import _find_repeated_char_spans
 
-        chars = list("三三三三三三三")  # 7 chars, should be ignored
+        chars = list("三三三三三")  # 5 chars, should be ignored
         spans = _find_repeated_char_spans(chars)
 
         self.assertEqual(len(spans), 0)

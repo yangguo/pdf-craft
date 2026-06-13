@@ -32,6 +32,7 @@ from .paddle_api import (
     parse_pdf_chunk,
     split_pdf,
 )
+from .weread_chapterize import chapterize_epub_for_weread
 from . import mineru_api
 
 
@@ -58,6 +59,8 @@ def main():
                         help="Skip interactive TOC review; use auto-detected headings")
     parser.add_argument("--no-toc", action="store_true",
                         help="Skip heading detection; produce single-chapter EPUB")
+    parser.add_argument("--weread-chapterize", action="store_true",
+                        help="Post-process EPUB so WeRead AI reading sees front matter, parts, and chapters as separate reading documents")
     parser.add_argument("--api", choices=["paddle", "mineru"], default="paddle",
                         help="OCR API backend to use (default: paddle)")
     args = parser.parse_args()
@@ -228,6 +231,8 @@ def main():
             metadata = {"title": inferred["title"], "author": args.author}
         else:
             metadata = extract_metadata_interactive(results, default_title)
+        book_title = metadata.get("title") or default_title
+        book_author = metadata.get("author")
 
         # Step 2.75: TOC Review
         if args.no_toc:
@@ -247,10 +252,22 @@ def main():
 
         # Step 3: Generation
         print("[-] Step 3: Generating EPUB...")
-        create_epub(metadata["title"], results, args.output, image_dir,
-                    cover_image_path=cover_path, author=metadata["author"],
+        create_epub(book_title, results, args.output, image_dir,
+                    cover_image_path=cover_path, author=book_author,
                     confirmed_headings=confirmed_headings, language=args.language,
                     strict_ocr_validation=args.strict_ocr_noise)
+
+        if args.weread_chapterize:
+            print("[-] Step 3.5: Restructuring EPUB for WeRead AI reading...")
+            backup_path = os.path.splitext(args.output)[0] + ".before_weread_chapterize.epub"
+            chapterize_result = chapterize_epub_for_weread(
+                args.output,
+                backup_path=backup_path,
+            )
+            print(
+                f"  ({chapterize_result.segment_count} WeRead reading documents; "
+                f"backup: {backup_path})"
+            )
 
     finally:
         # Clean up the temporary split-PDF directory created by split_pdf().

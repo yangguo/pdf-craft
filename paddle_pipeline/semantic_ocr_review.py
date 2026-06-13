@@ -219,6 +219,7 @@ def generate_sentence_candidates(
             file_candidates.append({
                 "file": filename,
                 "excerpt": re.sub(r"\s+", " ", s_clean),
+                "llm_excerpt": re.sub(r"\s+", " ", s_clean),
                 "context_before": context_before,
                 "context_after": context_after,
                 "score": 0.0,
@@ -289,6 +290,9 @@ def generate_semantic_candidates(
                 )
 
                 excerpt = re.sub(r"\s+", " ", frag).strip()
+                llm_excerpt = re.sub(
+                    r"\s+", " ", text[byte_start:byte_end],
+                ).strip()
                 if _looks_like_reference(frag) and not any(
                     ch not in "《》「」（）、，。；：？！" and ch > "鿿"
                     for ch in frag[:12]
@@ -299,6 +303,7 @@ def generate_semantic_candidates(
                 candidate = {
                     "file": filename,
                     "excerpt": excerpt,
+                    "llm_excerpt": llm_excerpt or excerpt,
                     "context_before": context_before,
                     "context_after": context_after,
                     "score": round(score, 3),
@@ -424,7 +429,7 @@ def _build_llm_prompt(candidate: dict[str, Any]) -> list[dict[str, Any]]:
     """Build a chat-completion message list for *candidate*."""
     user_text = _USER_PROMPT_TEMPLATE.format(
         context_before=candidate.get("context_before", ""),
-        excerpt=candidate.get("excerpt", ""),
+        excerpt=candidate.get("llm_excerpt") or candidate.get("excerpt", ""),
         context_after=candidate.get("context_after", ""),
     )
     return [

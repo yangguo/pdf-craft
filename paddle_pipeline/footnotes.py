@@ -154,7 +154,7 @@ def _format_single_footnote_html(
     linked = bool(footnote_ref and footnote_ref.get("linked"))
     attrs = ""
     backlink = ""
-    if linked:
+    if linked and footnote_ref is not None:
         attrs = f' id="{html.escape(str(footnote_ref["note_id"]))}"'
         backlink = (
             f' <a class="footnote-backlink" epub:type="backlink" '
@@ -195,5 +195,4 @@ def format_page_footnotes_html(
         f"{items}\n"
         "</section>"
     )
-
 
