@@ -34,7 +34,7 @@ python3 -m paddle_pipeline.semantic_ocr_review book.epub --llm --json semantic_r
 
 # Deep semantic detection (statistical + sentence-level chunks + LLM)
 # Use --deep when Tier-3 garble is suspected but not caught by standard scan
-python3 -m paddle_pipeline.semantic_ocr_review book.epub --llm --deep --only-garbled --json deep_review.json
+python3 -m paddle_pipeline.semantic_ocr_review book.epub --llm --deep --only-garbled --strict-llm --json deep_review.json
 
 # Full auto-fix scan
 python3 auto_fix_garbled.py book.pdf --output book.epub --scan-only \
@@ -46,7 +46,7 @@ python3 auto_fix_garbled.py book.pdf --output book.epub --scan-only \
 | Symptom | First action |
 |---|---|
 | Short unreadable CJK spans | Run `auto_fix_garbled.py --dry-run` to map EPUB spans to PDF pages |
-| Semantic garble (common chars, nonsense sentence) | Run `semantic_ocr_review.py --llm`, then search MinerU checkpoints for correct text |
+| Semantic garble (common chars, nonsense sentence) | Run `semantic_ocr_review.py --llm --deep --strict-llm`, then search MinerU checkpoints and PDF crops for correct text |
 | Paddle text is bad but page exists in checkpoint | Run targeted MinerU rerun through `auto_fix_garbled.py` |
 | Whole OCR page is unusable | Use `pdf2epub-mineru-rerun ... --replace-page` only for that page |
 | Missing sentence at a page boundary | Run `--scan-boundaries`, then render both adjacent PDF pages and compare checkpoint page starts |
@@ -148,6 +148,19 @@ python3 -m paddle_pipeline.mineru_rerun book.pdf \
 
 This inserts only the MinerU-detected prefix before the existing checkpoint page text. If MinerU also misses the rightmost column, use the rendered PDF image plus Tesseract text as evidence and make a narrow manual checkpoint patch.
 
+## LLM-Positive Semantic Garble Loop
+
+LLM review is a filter, not a source of replacement text. For every LLM-positive candidate:
+
+1. Locate the checkpoint page by searching the candidate span in `paddle_epub_work_*/chunk_*.json`.
+2. Find the matching `prunedResult.parsing_res_list[*].block_bbox`.
+3. Render that PDF page/crop and inspect the printed text; optionally run Tesseract as a second opinion.
+4. Patch the checkpoint, not just the EPUB. Update every copy of the bad text, especially both `markdown.text` and `prunedResult.parsing_res_list[*].block_content`.
+5. Rebuild from checkpoint and search exact bad strings in both checkpoint JSON and the rebuilt EPUB.
+6. Rerun `semantic_ocr_review --llm --deep --only-garbled --strict-llm` until it returns zero LLM-positive candidates, or document any remaining candidate as intentionally accepted with evidence.
+
+Use `--strict-llm` for final verification so network/API failures cannot be mistaken for a clean result. The LLM caller retries transient HTTP/SSL errors, but a strict failure still means the review did not complete.
+
 ## Manual TOC Rebuild
 
 When automatic heading detection promotes body sentences into chapter titles, do not patch only `nav.xhtml`. Rebuild the EPUB from the repaired checkpoint with an explicit TOC:
@@ -192,6 +205,7 @@ After rebuilding, compare `nav.xhtml`, `toc.ncx`, and OPF spine labels against t
 - For cross-page cases, verify both the end of the previous XHTML and the start of the next XHTML.
 - For figure-adjacent text, compare the rendered PDF crop with OCR blocks; do not infer prose from context alone.
 - When direct evidence supports a manual prose patch, update both the EPUB XHTML and the matching `chunk_*.pdf.json` checkpoint so future rebuilds do not reintroduce the defect.
+- In checkpoint patches, replace every duplicate OCR text store: `markdown.text` plus matching `prunedResult` block content. A rebuild may use one while later audits read the other.
 
 ## Required Verification
 

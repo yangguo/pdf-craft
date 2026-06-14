@@ -13,9 +13,22 @@ from .config import (
 from .ocr_noise import clean_ocr_noise
 
 
+def _compact_text(text: str) -> str:
+    return re.sub(r"\s+", "", text or "")
+
+
+def _markdown_text(page_res: Dict[str, Any]) -> str:
+    markdown = page_res.get("markdown", {})
+    if not isinstance(markdown, dict):
+        return ""
+    text = markdown.get("text", "")
+    return text if isinstance(text, str) else ""
+
+
 def extract_page_footnotes(page_res: Dict[str, Any]) -> List[str]:
     """Extract OCR footnote blocks omitted from Paddle's markdown text."""
     footnotes: List[str] = []
+    markdown_compact = _compact_text(_markdown_text(page_res))
     blocks = page_res.get("prunedResult", {}).get("parsing_res_list", [])
     for block in blocks:
         if not isinstance(block, dict):
@@ -27,8 +40,35 @@ def extract_page_footnotes(page_res: Dict[str, Any]) -> List[str]:
             continue
         cleaned = clean_ocr_noise(content)
         if cleaned:
+            if _compact_text(cleaned) in markdown_compact:
+                continue
             footnotes.append(cleaned)
     return _infer_missing_footnote_markers(page_res, footnotes)
+
+
+def _looks_like_caption_prose(footnote: str) -> bool:
+    """Return True when *footnote* is unlikely to be a numbered note.
+
+    Image captions can leak through ``vision_footnote`` without ever being
+    duplicated into the page markdown — the dedup in
+    :func:`extract_page_footnotes` only catches the duplicated case. If we
+    then prepend an inline-marker number to that prose, we manufacture a
+    fake numbered footnote.
+
+    Heuristics: text that opens with a 4-digit year, contains a typical
+    caption parenthetical, or is long without any digit are almost
+    certainly captions, not notes.
+    """
+    text = footnote.strip()
+    if not text:
+        return False
+    if re.match(r"^\d{4}年", text):
+        return True
+    if "（" in text and "提供）" in text:
+        return True
+    if len(text) >= 40 and not re.search(r"\d", text):
+        return True
+    return False
 
 
 def _infer_missing_footnote_markers(
@@ -38,7 +78,7 @@ def _infer_missing_footnote_markers(
     inline_numbers = [
         match.group(1)
         for match in INLINE_FOOTNOTE_MARKER_PATTERN.finditer(
-            page_res.get("markdown", {}).get("text", "")
+            _markdown_text(page_res)
         )
     ]
     if not inline_numbers:
@@ -65,7 +105,11 @@ def _infer_missing_footnote_markers(
     inferred: List[str] = []
     available_index = 0
     for footnote, number in zip(footnotes, parsed_numbers):
-        if number is None and available_index < len(available_numbers):
+        if (
+            number is None
+            and available_index < len(available_numbers)
+            and not _looks_like_caption_prose(footnote)
+        ):
             inferred.append(f"$ ^{{{available_numbers[available_index]}}} $ {footnote}")
             available_index += 1
         else:
@@ -195,4 +239,3 @@ def format_page_footnotes_html(
         f"{items}\n"
         "</section>"
     )
-

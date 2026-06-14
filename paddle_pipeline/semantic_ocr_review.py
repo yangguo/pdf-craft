@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sys
+import time
 import zipfile
 
 from collections import Counter
@@ -495,19 +496,83 @@ def _call_openai_chat(
         return {"error": f"invalid JSON: {raw_text[:200]}"}
 
 
+def _is_retryable_llm_error(error: str) -> bool:
+    """Decide whether an LLM error message looks transient.
+
+    ``HTTP error:`` covers network/DNS/TLS/timeout/5xx — those are worth
+    retrying. ``unexpected response shape`` and ``invalid JSON`` are
+    deterministic failures from the model itself; retrying just multiplies
+    cost without changing the outcome.
+    """
+    if not error:
+        return True  # treat empty/no-response as transient
+    return error.startswith("HTTP error:")
+
+
 def _review_candidate_with_llm(
     candidate: dict[str, Any],
     config: dict[str, str],
     timeout: int = 120,
+    max_attempts: int = 8,
+    *,
+    sleep: Any = time.sleep,
 ) -> dict[str, Any]:
-    """Review one candidate; returns ``{llm_review: …}`` or ``{llm_error: …}``."""
+    """Review one candidate; returns ``{llm_review: …}`` or ``{llm_error: …}``.
+
+    Retries up to *max_attempts* times on transient errors (network, no
+    response, 5xx). Deterministic failures (malformed JSON, unexpected
+    response shape) return immediately without retrying.
+    """
     messages = _build_llm_prompt(candidate)
-    result = _call_openai_chat(messages, config, timeout=timeout)
-    if result is None:
-        return {"llm_error": "no response"}
-    if "error" in result:
-        return {"llm_error": result["error"]}
-    return {"llm_review": result}
+    last_error = "no response"
+    attempts = max(1, max_attempts)
+    for attempt in range(attempts):
+        result = _call_openai_chat(messages, config, timeout=timeout)
+        if result is None:
+            last_error = "no response"
+            error_text = last_error
+        elif "error" in result:
+            last_error = result["error"]
+            error_text = last_error
+        else:
+            return {"llm_review": result}
+
+        if not _is_retryable_llm_error(error_text):
+            # Deterministic failure — don't burn retries on it.
+            return {"llm_error": last_error}
+
+        if attempt < attempts - 1:
+            # Exponential backoff capped at 8 s. Keeps a flaky endpoint
+            # from being hammered while still recovering quickly.
+            sleep(min(2 ** attempt, 8))
+
+    return {"llm_error": last_error}
+
+
+def _slice_candidates(
+    candidates: list[dict[str, Any]],
+    start_index: int,
+) -> list[dict[str, Any]]:
+    """Return candidates starting at zero-based *start_index*."""
+    if start_index <= 0:
+        return candidates
+    return candidates[start_index:]
+
+
+def _write_review_progress(
+    candidates: list[dict[str, Any]],
+    progress_path: str | None,
+) -> None:
+    """Atomically write current LLM review progress when requested."""
+    if not progress_path:
+        return
+    directory = os.path.dirname(progress_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    tmp_path = f"{progress_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as fh:
+        json.dump(candidates, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, progress_path)
 
 
 def review_candidates_with_llm(
@@ -516,6 +581,7 @@ def review_candidates_with_llm(
     *,
     strict: bool = False,
     timeout: int = 120,
+    progress_path: str | None = None,
 ) -> list[dict[str, Any]]:
     """Augment *candidates* in place with LLM review results.
 
@@ -529,6 +595,7 @@ def review_candidates_with_llm(
         )
         result = _review_candidate_with_llm(candidate, config, timeout=timeout)
         candidate.update(result)
+        _write_review_progress(candidates, progress_path)
         if "llm_error" in result and strict:
             raise RuntimeError(
                 f"LLM review failed for candidate {i}: {result['llm_error']}"
@@ -672,6 +739,13 @@ def main(argv: list[str] | None = None) -> None:
         "--limit", type=int, default=100, help="Maximum candidates (default 100)"
     )
     parser.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="Skip this many generated candidates before review/output. "
+             "Use with --limit to resume or run LLM review in slices.",
+    )
+    parser.add_argument(
         "--min-score",
         type=float,
         default=None,
@@ -727,6 +801,8 @@ def main(argv: list[str] | None = None) -> None:
         help="Like --find-source, but also apply found corrections to the EPUB (DANGER: overwrites EPUB)",
     )
     args = parser.parse_args(argv)
+    if args.start_index < 0:
+        parser.error("--start-index must be >= 0")
 
     # Resolve min_score default based on LLM mode
     if args.min_score is None:
@@ -770,6 +846,15 @@ def main(argv: list[str] | None = None) -> None:
         print(f"[*] Combined:           {len(candidates)} candidates after dedup.",
               file=sys.stderr)
 
+    if args.start_index:
+        before_count = len(candidates)
+        candidates = _slice_candidates(candidates, args.start_index)
+        print(
+            f"[*] Start index:        {args.start_index} "
+            f"({len(candidates)} of {before_count} candidates remain).",
+            file=sys.stderr,
+        )
+
     # 2. Optional LLM review ---------------------------------------------------------
     if args.llm:
         config = _openai_config_from_args(args)
@@ -787,7 +872,10 @@ def main(argv: list[str] | None = None) -> None:
             file=sys.stderr,
         )
         review_candidates_with_llm(
-            candidates, config, strict=args.strict_llm
+            candidates,
+            config,
+            strict=args.strict_llm,
+            progress_path=args.json_path,
         )
 
     # 3. Optional source search from MinerU/PaddleOCR checkpoints --------------------

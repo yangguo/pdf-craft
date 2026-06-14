@@ -100,7 +100,7 @@ EPUB_STRUCTURAL_FILES = {
 }
 FOOTNOTE_LABELS = {"footnote", "vision_footnote"}
 FOOTNOTE_MARKER_PATTERN = re.compile(
-    r"^\s*(?:\$\s*\^\{)?(\d{1,3})(?:\}\s*\$)?\s*(.*)$",
+    r"^\s*(?:\$\s*\^\{)?(\d{1,3})(?!\d)(?:\}\s*\$)?\s*(.*)$",
     re.DOTALL,
 )
 INLINE_FOOTNOTE_MARKER_PATTERN = re.compile(r"\$\s*\^\{?(\d{1,3})\}?\s*\$")

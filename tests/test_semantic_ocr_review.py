@@ -362,6 +362,111 @@ class TestLLMReview(unittest.TestCase):
         self.assertIn("llm_error", result)
         self.assertNotIn("llm_review", result)
 
+    def test_review_retries_transient_llm_http_error(self):
+        from paddle_pipeline.semantic_ocr_review import _review_candidate_with_llm
+
+        candidate = self._make_candidate()
+        config = {
+            "api_key": "sk-test",
+            "base_url": "https://api.example.com/v1",
+            "model": "test-model",
+        }
+        success = {
+            "is_garbled": False,
+            "confidence": 0.2,
+            "category": "normal_text",
+            "suspicious_span": "",
+            "reason": "Second attempt succeeded.",
+            "needs_source_ocr": False,
+        }
+
+        with mock.patch(
+            "paddle_pipeline.semantic_ocr_review._call_openai_chat",
+            side_effect=[{"error": "HTTP error: transient EOF"}, success],
+        ) as call_mock:
+            result = _review_candidate_with_llm(
+                candidate, config, sleep=lambda _seconds: None,
+            )
+
+        self.assertEqual(2, call_mock.call_count)
+        self.assertIn("llm_review", result)
+        self.assertEqual(success, result["llm_review"])
+
+    def test_review_does_not_retry_deterministic_invalid_json(self):
+        """Malformed-JSON errors are deterministic — retrying just amplifies cost."""
+        from paddle_pipeline.semantic_ocr_review import _review_candidate_with_llm
+
+        candidate = self._make_candidate()
+        config = {
+            "api_key": "sk-test",
+            "base_url": "https://api.example.com/v1",
+            "model": "test-model",
+        }
+
+        with mock.patch(
+            "paddle_pipeline.semantic_ocr_review._call_openai_chat",
+            return_value={"error": "invalid JSON: {not valid"},
+        ) as call_mock:
+            result = _review_candidate_with_llm(candidate, config)
+
+        self.assertEqual(1, call_mock.call_count)
+        self.assertIn("llm_error", result)
+        self.assertEqual("invalid JSON: {not valid", result["llm_error"])
+
+    def test_review_does_not_retry_unexpected_response_shape(self):
+        """Unexpected-shape errors mean the model is responding with the wrong
+        structure; retrying is unlikely to help and burns the rate limit."""
+        from paddle_pipeline.semantic_ocr_review import _review_candidate_with_llm
+
+        candidate = self._make_candidate()
+        config = {
+            "api_key": "sk-test",
+            "base_url": "https://api.example.com/v1",
+            "model": "test-model",
+        }
+
+        with mock.patch(
+            "paddle_pipeline.semantic_ocr_review._call_openai_chat",
+            return_value={"error": "unexpected response shape: {...}"},
+        ) as call_mock:
+            result = _review_candidate_with_llm(candidate, config)
+
+        self.assertEqual(1, call_mock.call_count)
+        self.assertIn("llm_error", result)
+
+    def test_review_sleeps_between_transient_retries(self):
+        """Retry loop must back off rather than spinning at full speed."""
+        from paddle_pipeline.semantic_ocr_review import _review_candidate_with_llm
+
+        candidate = self._make_candidate()
+        config = {
+            "api_key": "sk-test",
+            "base_url": "https://api.example.com/v1",
+            "model": "test-model",
+        }
+        sleeps: list[float] = []
+
+        def record_sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        with mock.patch(
+            "paddle_pipeline.semantic_ocr_review._call_openai_chat",
+            return_value={"error": "HTTP error: ETIMEDOUT"},
+        ) as call_mock:
+            result = _review_candidate_with_llm(
+                candidate, config, max_attempts=4, sleep=record_sleep,
+            )
+
+        self.assertEqual(4, call_mock.call_count)
+        self.assertIn("llm_error", result)
+        # Three sleeps between the four attempts; values monotonically
+        # non-decreasing and capped — confirms exponential-with-cap shape.
+        self.assertEqual(3, len(sleeps))
+        self.assertEqual(sorted(sleeps), sleeps)
+        for seconds in sleeps:
+            self.assertGreaterEqual(seconds, 1)
+            self.assertLessEqual(seconds, 8)
+
     def test_strict_mode_raises_on_error(self):
         from paddle_pipeline.semantic_ocr_review import review_candidates_with_llm
 
@@ -378,6 +483,48 @@ class TestLLMReview(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 review_candidates_with_llm(candidates, config, strict=True)
+
+    def test_strict_mode_writes_progress_before_raising(self):
+        from paddle_pipeline.semantic_ocr_review import review_candidates_with_llm
+
+        candidates = [self._make_candidate()]
+        config = {
+            "api_key": "sk-test",
+            "base_url": "https://api.example.com/v1",
+            "model": "test-model",
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            progress_path = Path(td) / "progress.json"
+            with mock.patch(
+                "paddle_pipeline.semantic_ocr_review._call_openai_chat",
+                return_value={"error": "timeout"},
+            ):
+                with self.assertRaises(RuntimeError):
+                    review_candidates_with_llm(
+                        candidates,
+                        config,
+                        strict=True,
+                        progress_path=str(progress_path),
+                    )
+
+            data = json.loads(progress_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(1, len(data))
+        self.assertEqual("timeout", data[0]["llm_error"])
+
+    def test_slice_candidates_applies_start_index(self):
+        from paddle_pipeline.semantic_ocr_review import _slice_candidates
+
+        candidates = [
+            {"excerpt": "first"},
+            {"excerpt": "second"},
+            {"excerpt": "third"},
+        ]
+
+        sliced = _slice_candidates(candidates, 1)
+
+        self.assertEqual(["second", "third"], [c["excerpt"] for c in sliced])
 
     def test_review_candidates_with_llm_augments_in_place(self):
         from paddle_pipeline.semantic_ocr_review import review_candidates_with_llm

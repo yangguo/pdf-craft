@@ -20,6 +20,9 @@ from .ocr_review import _cjk_chars
 
 _CHECKPOINT_RE = re.compile(r"^chunk_(\d+)_(\d+)\.pdf\.json$")
 _CJK_RUN_RE = re.compile(r"[㐀-鿿]+")
+_IMAGE_TAG_RE = re.compile(r"(?is)<img\b")
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+_HTML_TAG_RE = re.compile(r"(?is)<[^>]+>")
 _TRAILING_NOTE_RE = re.compile(r"[\s\d０-９¹²³⁴⁵⁶⁷⁸⁹⁰]+$")
 _TERMINAL_PUNCT = set("。！？!?；;")
 _CLOSING_PUNCT = set("」』”’）》】〕〉》")
@@ -57,6 +60,31 @@ def _checkpoint_sort_key(path: str) -> tuple[int, int, str]:
     return (int(match.group(1)), int(match.group(2)), path)
 
 
+def _first_cjk_index(text: str) -> int:
+    match = _CJK_RUN_RE.search(text or "")
+    return match.start() if match else -1
+
+
+def _blank_match(match: re.Match[str]) -> str:
+    return " " * (match.end() - match.start())
+
+
+def _visible_text_without_markup(text: str) -> str:
+    text = _MARKDOWN_IMAGE_RE.sub(_blank_match, text or "")
+    return _HTML_TAG_RE.sub(_blank_match, text)
+
+
+def _page_starts_with_image(text: str) -> bool:
+    """Return True when image markup appears before the first CJK text."""
+    text = text or ""
+    image_starts = [match.start() for match in _IMAGE_TAG_RE.finditer(text)]
+    image_starts.extend(match.start() for match in _MARKDOWN_IMAGE_RE.finditer(text))
+    if not image_starts:
+        return False
+    first_cjk = _first_cjk_index(_visible_text_without_markup(text))
+    return first_cjk < 0 or min(image_starts) < first_cjk
+
+
 def iter_checkpoint_pages(work_dir: str) -> Iterable[dict[str, Any]]:
     """Yield page records from Paddle/MinerU checkpoint JSON files."""
     json_paths = [
@@ -73,14 +101,23 @@ def iter_checkpoint_pages(work_dir: str) -> Iterable[dict[str, Any]]:
             data = json.load(fh)
         layouts = data.get("result", {}).get("layoutParsingResults", [])
         for index, page in enumerate(layouts):
-            text = page.get("markdown", {}).get("text", "")
+            markdown = page.get("markdown", {})
+            if not isinstance(markdown, dict):
+                markdown = {}
+            text = markdown.get("text", "")
             if not isinstance(text, str):
                 text = ""
+            images = markdown.get("images", {})
+            has_images = (
+                isinstance(images, dict) and bool(images)
+            ) or bool(_IMAGE_TAG_RE.search(text) or _MARKDOWN_IMAGE_RE.search(text))
             yield {
                 "page_number": chunk_start + index + 1,
                 "checkpoint_path": json_path,
                 "page_index": index,
                 "text": text,
+                "has_images": has_images,
+                "starts_with_image": _page_starts_with_image(text),
             }
 
 
@@ -98,7 +135,8 @@ def _significant_tail(text: str) -> str:
 
 
 def _text_excerpt(text: str, *, head: bool, length: int = 42) -> str:
-    compact = re.sub(r"\s+", " ", text).strip()
+    text = _visible_text_without_markup(text)
+    compact = re.sub(r"\s+", " ", html.unescape(text)).strip()
     if len(compact) <= length:
         return compact
     if head:
@@ -123,10 +161,39 @@ def _checkpoint_bigram_freq(pages: list[dict[str, Any]]) -> Counter[str]:
     return Counter(chars[index] + chars[index + 1] for index in range(len(chars) - 1))
 
 
+def _page_head_singleton_bigram_ratio(
+    text: str,
+    bigram_freq: Counter[str],
+    *,
+    max_chars: int = 18,
+) -> float:
+    """Return singleton-bigram ratio for the first CJK run on a page.
+
+    Short semantic garbage immediately after an image is a common failure mode
+    on vertical OCR pages: the characters may be common individually, but the
+    local bigrams are unique in the book.
+    """
+    match = _CJK_RUN_RE.search(_visible_text_without_markup(text))
+    if not match:
+        return 0.0
+    chars = list(match.group(0)[:max_chars])
+    if len(chars) < 8:
+        return 0.0
+    bigrams = [chars[index] + chars[index + 1] for index in range(len(chars) - 1)]
+    if not bigrams:
+        return 0.0
+    singletons = sum(1 for bigram in bigrams if bigram_freq.get(bigram, 0) <= 1)
+    return round(singletons / len(bigrams), 3)
+
+
 def _score_boundary(
     previous_text: str,
     next_text: str,
     bigram_freq: Counter[str],
+    *,
+    previous_has_images: bool = False,
+    next_has_images: bool = False,
+    next_starts_with_image: bool = False,
 ) -> tuple[float, list[str]]:
     tail = _significant_tail(previous_text)
     if not tail:
@@ -160,6 +227,26 @@ def _score_boundary(
         score += 0.05
         reasons.append("new_sentence_like_head")
 
+    image_adjacent = previous_has_images or next_has_images
+    if image_adjacent:
+        reasons.append("image_adjacent_boundary")
+        score += 0.05
+
+    if next_starts_with_image:
+        score += 0.15
+        reasons.append("next_page_starts_with_image")
+
+    head_singleton_ratio = _page_head_singleton_bigram_ratio(
+        next_text,
+        bigram_freq,
+    )
+    if next_starts_with_image and head_singleton_ratio >= 0.75:
+        score += 0.25
+        reasons.append("garbled_page_head")
+    elif image_adjacent and head_singleton_ratio >= 0.90:
+        score += 0.15
+        reasons.append("garbled_page_head")
+
     return min(round(score, 3), 1.0), reasons
 
 
@@ -185,7 +272,14 @@ def find_page_boundary_candidates(
     for previous, current in zip(pages, pages[1:]):
         if current["page_number"] != previous["page_number"] + 1:
             continue
-        score, reasons = _score_boundary(previous["text"], current["text"], bigram_freq)
+        score, reasons = _score_boundary(
+            previous["text"],
+            current["text"],
+            bigram_freq,
+            previous_has_images=bool(previous.get("has_images")),
+            next_has_images=bool(current.get("has_images")),
+            next_starts_with_image=bool(current.get("starts_with_image")),
+        )
         if score < min_score:
             continue
         candidates.append(
@@ -200,6 +294,13 @@ def find_page_boundary_candidates(
                 "next_checkpoint": current["checkpoint_path"],
                 "previous_page_index": previous["page_index"],
                 "next_page_index": current["page_index"],
+                "previous_has_images": bool(previous.get("has_images")),
+                "next_has_images": bool(current.get("has_images")),
+                "next_starts_with_image": bool(current.get("starts_with_image")),
+                "head_singleton_bigram_ratio": _page_head_singleton_bigram_ratio(
+                    current["text"],
+                    bigram_freq,
+                ),
             }
         )
 

@@ -173,6 +173,90 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
 
         self.assertEqual(["$ ^{14} $ Ping-ti Ho, 189.", "15 另一条脚注。"], footnotes)
 
+    def test_extract_page_footnotes_skips_caption_already_in_markdown(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "extract_page_footnotes"))
+
+        caption = (
+            "1946年1月，蔣介石在重慶的國民政府大禮堂宴請政治協商會議"
+            "各黨派代表（國民黨黨史館提供）"
+        )
+        page_res = {
+            "markdown": {
+                "text": (
+                    '<div><img src="imgs/photo.jpg" alt="Image" /></div>\n\n'
+                    f"{caption}\n\n"
+                    "宣稱：「中國的民主必須追隨美國的道路。」"
+                )
+            },
+            "prunedResult": {
+                "parsing_res_list": [
+                    {"block_label": "vision_footnote", "block_content": caption},
+                    {"block_label": "footnote", "block_content": "22 真正的腳注。"},
+                ]
+            },
+        }
+
+        footnotes = mod.extract_page_footnotes(page_res)
+
+        self.assertEqual(["22 真正的腳注。"], footnotes)
+
+    def test_extract_page_footnotes_handles_non_dict_markdown(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "extract_page_footnotes"))
+
+        page_res = {
+            "markdown": "unexpected text",
+            "prunedResult": {
+                "parsing_res_list": [
+                    {"block_label": "footnote", "block_content": "22 真正的腳注。"},
+                ]
+            },
+        }
+
+        footnotes = mod.extract_page_footnotes(page_res)
+
+        self.assertEqual(["22 真正的腳注。"], footnotes)
+
+    def test_extract_page_footnotes_does_not_prepend_marker_to_caption_prose(self):
+        """Captions only present in vision_footnote blocks must not get a
+        manufactured marker just because an inline marker exists in the
+        text. The dedup catches the duplicated case; this catches the
+        non-duplicated case where the caption never made it into markdown.
+        """
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "extract_page_footnotes"))
+
+        caption = (
+            "1946年1月，蔣介石在重慶的國民政府大禮堂宴請政治協商會議"
+            "各黨派代表（國民黨黨史館提供）"
+        )
+        page_res = {
+            "markdown": {
+                # Markdown has an inline footnote marker but does NOT
+                # contain the caption text — image rendered as <img> only.
+                "text": (
+                    '<div><img src="imgs/photo.jpg" alt="Image" /></div>\n\n'
+                    "宣稱：「中國的民主必須追隨美國的道路。」 $ ^{9} $"
+                ),
+            },
+            "prunedResult": {
+                "parsing_res_list": [
+                    {"block_label": "vision_footnote", "block_content": caption},
+                ]
+            },
+        }
+
+        footnotes = mod.extract_page_footnotes(page_res)
+
+        # The caption survives as a plain footnote (no manufactured marker).
+        self.assertEqual([caption], footnotes)
+        for footnote in footnotes:
+            self.assertFalse(
+                footnote.startswith("$ ^{9} $"),
+                f"caption was prepended with fake marker: {footnote!r}",
+            )
+
     def test_extract_page_footnotes_infers_unnumbered_note_from_inline_marker(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "extract_page_footnotes"))
@@ -209,6 +293,18 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertIn('data-source-page="42"', html_text)
         self.assertIn("<sup>14</sup> Ping-ti Ho, 189.", html_text)
         self.assertIn("<sup>15</sup> 另一条脚注。", html_text)
+
+    def test_format_page_footnotes_html_does_not_split_four_digit_year(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "format_page_footnotes_html"))
+
+        html_text = mod.format_page_footnotes_html(
+            ["1946年1月，蔣介石在重慶的國民政府大禮堂宴請代表。"],
+            page_number=61,
+        )
+
+        self.assertIn("1946年1月", html_text)
+        self.assertNotIn("<sup>194</sup> 6年", html_text)
 
     def test_link_page_footnote_references_connects_matching_notes(self):
         mod = _load_script_module()
@@ -1451,6 +1547,142 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
         self.assertIn("Second page sentence.", captured["markdown_input"])
         self.assertNotRegex(captured["markdown_input"], r"\n{3,}")
 
+    def test_create_epub_joins_ocr_linewraps_split_inside_cjk_words(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_markdown_input(text, *args, **kwargs):
+            captured["markdown_input"] = text
+            return "<p>normalized</p>"
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": (
+                                    "只要這位國\n\n"
+                                    "民黨領袖能夠讓中國朝向美式民主的道路前進。\n\n"
+                                    "肯楠自美國駐莫斯科大使館發出著\n\n"
+                                    "名的長電報，討論如何對付蘇聯的野心。\n\n"
+                                    "不過重點仍擺在北部\n\n"
+                                    "地區。史達林希望在蘇軍最後一輛坦克跨過蘇中邊界之前。"
+                                ),
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ), mock.patch(
+                "markdown.markdown",
+                side_effect=capture_markdown_input,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                )
+
+        self.assertIn(
+            "只要這位國 民黨領袖能夠讓中國朝向美式民主的道路前進。",
+            captured["markdown_input"],
+        )
+        self.assertIn(
+            "發出著 名的長電報",
+            captured["markdown_input"],
+        )
+        self.assertIn(
+            "北部 地區。史達林希望",
+            captured["markdown_input"],
+        )
+        self.assertNotIn("只要這位國\n\n民黨領袖", captured["markdown_input"])
+        self.assertNotIn("發出著\n\n名的長電報", captured["markdown_input"])
+        self.assertNotIn("北部\n\n地區", captured["markdown_input"])
+
+    def test_create_epub_keeps_long_cjk_paragraph_break_intact(self):
+        """Linewrap join must NOT collapse two real CJK paragraphs.
+
+        The existing reflow already breaks at terminal punctuation when the
+        next line is long enough to look like a self-contained sentence.
+        This regression test guards the case where both sides happen to
+        start/end with CJK ideographs: the new linewrap helper must not
+        steal that boundary by joining everything into one run.
+        """
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_markdown_input(text, *args, **kwargs):
+            captured["markdown_input"] = text
+            return "<p>normalized</p>"
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        # Previous line ends with CJK ideograph (no punctuation), next line
+        # also starts with CJK ideograph but is a long, sentence-shaped
+        # paragraph that ends with terminal punctuation.
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": (
+                                    "蔣介石在重慶宣布全國總動員\n\n"
+                                    "何應欽率部抵達南京，並下令所有部隊"
+                                    "立即向華北推進，蘇軍最後一輛坦克尚未"
+                                    "跨過蘇中邊界之前必須完成接收。"
+                                ),
+                                "images": {},
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ), mock.patch(
+                "markdown.markdown",
+                side_effect=capture_markdown_input,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                )
+
+        # The two paragraphs must remain separate — no space-joined run.
+        self.assertNotIn(
+            "蔣介石在重慶宣布全國總動員 何應欽率部抵達南京",
+            captured["markdown_input"],
+        )
+        # And both pieces of text must still be present.
+        self.assertIn("蔣介石在重慶宣布全國總動員", captured["markdown_input"])
+        self.assertIn("何應欽率部抵達南京", captured["markdown_input"])
+
     def test_create_epub_manual_toc_match_alias_uses_display_title(self):
         mod = _load_script_module()
         self.assertTrue(hasattr(mod, "create_epub"))
@@ -1766,6 +1998,106 @@ class TestPdf2EpubPaddleOcrCleanup(unittest.TestCase):
             chapter_html = chapter_html.decode("utf-8")
         self.assertNotIn(f"<h1>{bad_heading}</h1>", chapter_html)
         self.assertIn(bad_heading, chapter_html)
+
+    def test_create_epub_rewrites_unmapped_markdown_image_to_packaged_asset(self):
+        mod = _load_script_module()
+        self.assertTrue(hasattr(mod, "create_epub"))
+
+        captured = {}
+
+        def capture_markdown_input(text, *args, **kwargs):
+            captured["markdown_input"] = text
+            return "<p>normalized</p>"
+
+        def capture_book(book, _output_file, **_kwargs):
+            captured["book"] = book
+
+        results = [
+            {
+                "result": {
+                    "layoutParsingResults": [
+                        {
+                            "markdown": {
+                                "text": (
+                                    "![](images/d254c8258.jpg)\n\n"
+                                    "蔣介石文膽陳布雷於1948年11月13日自殺身亡"
+                                    "（國民黨黨史館提供）"
+                                ),
+                                "images": {
+                                    "imgs/img_in_image_box_19_191_387_713.jpg": "",
+                                },
+                            }
+                        }
+                    ]
+                }
+            }
+        ]
+
+        with tempfile.TemporaryDirectory() as td:
+            image_path = (
+                Path(td)
+                / "images"
+                / "imgs"
+                / "img_in_image_box_19_191_387_713.jpg"
+            )
+            image_path.parent.mkdir(parents=True)
+            image_path.write_bytes(b"fake jpeg")
+
+            with mock.patch.object(
+                mod.epub_builder,
+                "write_validated_epub",
+                capture_book,
+            ), mock.patch(
+                "markdown.markdown",
+                side_effect=capture_markdown_input,
+            ):
+                mod.create_epub(
+                    "Test Book",
+                    results,
+                    str(Path(td) / "book.epub"),
+                    str(Path(td) / "images"),
+                )
+
+        self.assertIn(
+            "![](imgs/img_in_image_box_19_191_387_713.jpg)",
+            captured["markdown_input"],
+        )
+        self.assertNotIn("images/d254c8258.jpg", captured["markdown_input"])
+
+    def test_rewrite_unmapped_image_references_no_op_for_two_unmapped(self):
+        """The 1-and-1 rewrite must not fire when there are 2 unmapped refs."""
+        mod = _load_script_module()
+        rewrite = mod.epub_builder._rewrite_unmapped_image_references
+
+        markdown = (
+            "![](images/missing-a.jpg)\n\n"
+            "![](images/missing-b.jpg)\n"
+        )
+        packaged = ["imgs/only-one.jpg"]
+
+        # 2 unmapped refs, 1 unused packaged → ambiguous, must no-op.
+        self.assertEqual(markdown, rewrite(markdown, packaged))
+
+    def test_rewrite_unmapped_image_references_no_op_for_two_unused_packaged(self):
+        """The 1-and-1 rewrite must not fire when 2 packaged images are unused."""
+        mod = _load_script_module()
+        rewrite = mod.epub_builder._rewrite_unmapped_image_references
+
+        markdown = "![](images/missing.jpg)\n"
+        packaged = ["imgs/option-a.jpg", "imgs/option-b.jpg"]
+
+        # 1 unmapped ref, 2 unused packaged → ambiguous, must no-op.
+        self.assertEqual(markdown, rewrite(markdown, packaged))
+
+    def test_rewrite_unmapped_image_references_no_op_when_all_match(self):
+        """No rewrite when every ref is already packaged."""
+        mod = _load_script_module()
+        rewrite = mod.epub_builder._rewrite_unmapped_image_references
+
+        markdown = "![](imgs/already.jpg)\n"
+        packaged = ["imgs/already.jpg"]
+
+        self.assertEqual(markdown, rewrite(markdown, packaged))
 
     def test_strip_missing_image_references_removes_markdown_and_html_images(self):
         mod = _load_script_module()

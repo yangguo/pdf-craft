@@ -36,6 +36,11 @@ _BODY_SENTENCE_ENDINGS = (
     "。", "！", "？", "：", "；", "）", "】", "〉", "》", "」", "』",
 )
 _CJK_TEXT_RE = re.compile(r"[\u3400-\u9fff]")
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_HTML_IMAGE_SRC_RE = re.compile(
+    r"<img\b[^>]*\bsrc=[\"']([^\"']+)[\"'][^>]*/?>",
+    re.IGNORECASE,
+)
 
 
 def _normalize_manual_heading_text(text: Any) -> str:
@@ -142,6 +147,33 @@ def _demote_unconfirmed_body_heading(
     if heading_text.endswith(_BODY_SENTENCE_ENDINGS) or cjk_len >= 24:
         return heading_text
     return line
+
+
+def _is_cjk_char(value: str) -> bool:
+    return bool(value and _CJK_TEXT_RE.fullmatch(value))
+
+
+def _looks_like_cjk_linewrap(
+    previous_text: str,
+    next_line: str,
+    *,
+    max_next_chars: int = 30,
+) -> bool:
+    """Return True when an OCR blank separated one CJK word or phrase.
+
+    Only fires for short next lines (≤ ``max_next_chars``). A mid-word OCR
+    split is typically a column-wrap fragment of a few dozen characters at
+    most. A long next line that happens to start with a CJK character is
+    usually a real paragraph that the existing terminal-punctuation check
+    should handle — joining it would collapse a legitimate boundary.
+    """
+    previous_text = previous_text.rstrip()
+    next_line = next_line.lstrip()
+    if not previous_text or not next_line:
+        return False
+    if len(next_line) > max_next_chars:
+        return False
+    return _is_cjk_char(previous_text[-1]) and _is_cjk_char(next_line[0])
 
 
 def _build_header_fingerprints(confirmed_headings: List[Dict] | None,
@@ -281,6 +313,57 @@ def _strip_missing_image_references(markdown_text: str,
     )
 
 
+def _is_local_image_reference(path: str) -> bool:
+    """Return True for EPUB-local image refs, excluding URLs and data URIs."""
+    return not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", path)
+
+
+def _iter_image_references(markdown_text: str) -> list[str]:
+    """Return Markdown and inline-HTML image paths in first-seen order."""
+    refs: list[str] = []
+    seen: set[str] = set()
+    for regex in (_MARKDOWN_IMAGE_RE, _HTML_IMAGE_SRC_RE):
+        for match in regex.finditer(markdown_text):
+            ref = match.group(1)
+            if ref not in seen:
+                seen.add(ref)
+                refs.append(ref)
+    return refs
+
+
+def _rewrite_unmapped_image_references(
+    markdown_text: str,
+    packaged_image_paths: list[str],
+) -> str:
+    """Rewrite a single dangling image ref to a single packaged page image."""
+    local_refs = [
+        ref for ref in _iter_image_references(markdown_text)
+        if _is_local_image_reference(ref)
+    ]
+    packaged_set = set(packaged_image_paths)
+    unmapped_refs = [ref for ref in local_refs if ref not in packaged_set]
+    unused_packaged = [ref for ref in packaged_image_paths if ref not in local_refs]
+
+    if len(unmapped_refs) != 1 or len(unused_packaged) != 1:
+        return markdown_text
+
+    old_ref = unmapped_refs[0]
+    new_ref = unused_packaged[0]
+    escaped_old = re.escape(old_ref)
+
+    markdown_text = re.sub(
+        r"(!\[[^\]]*\]\()" + escaped_old + r"(\))",
+        lambda match: match.group(1) + new_ref + match.group(2),
+        markdown_text,
+    )
+    return re.sub(
+        r"(<img\b[^>]*\bsrc=[\"'])" + escaped_old + r"([\"'][^>]*/?>)",
+        lambda match: match.group(1) + new_ref + match.group(2),
+        markdown_text,
+        flags=re.IGNORECASE,
+    )
+
+
 def create_epub(title: str, results: List[Dict], output_file: str, image_dir: str,
                 cover_image_path: str | None = None, author: str | None = None,
                 confirmed_headings: List[Dict] | None = None,
@@ -373,6 +456,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             # Track which image paths were successfully packaged so we can
             # strip dangling ![...](...) references from the markdown later.
             missing_image_paths: set[str] = set()
+            packaged_image_paths: list[str] = []
 
             for rel_path, img_url in images_map.items():
                 # Define local path where we downloaded the image
@@ -404,6 +488,7 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
 
                     if rel_path not in [item.file_name for item in book.get_items()]:
                         book.add_item(epub_img)
+                    packaged_image_paths.append(rel_path)
                 else:
                     # Download failed or not yet attempted — record so the markdown
                     # reference can be stripped to avoid broken <img> in the EPUB.
@@ -413,6 +498,17 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
             # 3. Concatenate Text with paragraph reflow
             # Strip markdown image links whose assets were not packaged, so the
             # generated HTML does not contain broken <img src="images/..."> references.
+            if packaged_image_paths:
+                page_md = _rewrite_unmapped_image_references(
+                    page_md,
+                    packaged_image_paths,
+                )
+
+            packaged_image_set = set(packaged_image_paths)
+            for ref in _iter_image_references(page_md):
+                if _is_local_image_reference(ref) and ref not in packaged_image_set:
+                    missing_image_paths.add(ref)
+
             if missing_image_paths:
                 page_md = _strip_missing_image_references(
                     page_md,
@@ -524,7 +620,9 @@ def create_epub(title: str, results: List[Dict], output_file: str, image_dir: st
                     elif consecutive_blanks == 1:
                         # Single blank between text lines — often OCR line-wrap
                         # noise, but sometimes a real paragraph break.
-                        if current_ends.endswith(terminal_chars):
+                        if _looks_like_cjk_linewrap(current_ends, stripped):
+                            current_para = current_ends + " " + stripped
+                        elif current_ends.endswith(terminal_chars):
                             # Previous ends a sentence — real break
                             reflowed_paragraphs.append(current_para)
                             current_para = stripped
