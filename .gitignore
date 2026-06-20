@@ -17,6 +17,7 @@
 /models-cache
 /tmp
 /tmp_pages/
+/manual_toc/*.json
 /*.epub.bak
 /paddle_epub_work_*/
 
