@@ -575,6 +575,20 @@ def _write_review_progress(
     os.replace(tmp_path, progress_path)
 
 
+def _filter_llm_garbled_candidates(
+    candidates: list[dict[str, Any]],
+    *,
+    keep_errors: bool = False,
+) -> list[dict[str, Any]]:
+    """Return LLM-positive candidates, optionally retaining LLM failures."""
+    return [
+        c
+        for c in candidates
+        if c.get("llm_review", {}).get("is_garbled", False)
+        or (keep_errors and "llm_error" in c)
+    ]
+
+
 def review_candidates_with_llm(
     candidates: list[dict[str, Any]],
     config: dict[str, str],
@@ -781,6 +795,11 @@ def main(argv: list[str] | None = None) -> None:
         help="Only emit candidates where LLM says is_garbled=true",
     )
     parser.add_argument(
+        "--keep-llm-errors",
+        action="store_true",
+        help="With --only-garbled, also keep candidates whose LLM review failed",
+    )
+    parser.add_argument(
         "--strict-llm",
         action="store_true",
         help="Exit nonzero if any LLM request fails",
@@ -810,11 +829,12 @@ def main(argv: list[str] | None = None) -> None:
 
     # 1. Generate candidates offline -------------------------------------------------
     print(f"[*] Scanning {args.epub} for semantic OCR candidates...", file=sys.stderr)
+    generation_limit = args.start_index + args.limit
 
     # Statistical window candidates
     candidates = generate_semantic_candidates(
         args.epub,
-        limit=args.limit,
+        limit=generation_limit,
         min_score=args.min_score,
         min_cjk=args.min_cjk,
     )
@@ -825,7 +845,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.deep:
         sentence_candidates = generate_sentence_candidates(
             args.epub,
-            limit=args.limit,
+            limit=generation_limit,
             min_cjk=args.min_cjk_sentence,
         )
         print(f"[*] Sentence chunks:    {len(sentence_candidates)} candidates.",
@@ -842,7 +862,7 @@ def main(argv: list[str] | None = None) -> None:
         sent_cands = [c for c in candidates if c["source"] == "sentence_candidate"]
         stat_cands.sort(key=lambda c: (-c["score"], c["file"], c["excerpt"]))
         candidates = stat_cands + sent_cands
-        candidates = candidates[:args.limit]
+        candidates = candidates[:generation_limit]
         print(f"[*] Combined:           {len(candidates)} candidates after dedup.",
               file=sys.stderr)
 
@@ -854,6 +874,7 @@ def main(argv: list[str] | None = None) -> None:
             f"({len(candidates)} of {before_count} candidates remain).",
             file=sys.stderr,
         )
+    candidates = candidates[:args.limit]
 
     # 2. Optional LLM review ---------------------------------------------------------
     if args.llm:
@@ -889,11 +910,10 @@ def main(argv: list[str] | None = None) -> None:
 
     # 4. Output ----------------------------------------------------------------------
     if args.only_garbled and args.llm:
-        candidates = [
-            c
-            for c in candidates
-            if c.get("llm_review", {}).get("is_garbled", False)
-        ]
+        candidates = _filter_llm_garbled_candidates(
+            candidates,
+            keep_errors=args.keep_llm_errors,
+        )
         print(
             f"[*] Filtered to {len(candidates)} LLM-positive candidates.",
             file=sys.stderr,

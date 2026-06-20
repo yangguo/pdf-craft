@@ -69,6 +69,8 @@ for path in sorted(glob.glob("paddle_epub_work_*/chunk_*.json")):
 
 This avoids ad-hoc single-page OCR — one search covers the entire book.
 
+The CLI can automate this search: `--find-source WORK_DIR` annotates each candidate with matching checkpoint text; `--patch-from-source WORK_DIR` also applies found corrections to the EPUB (use with caution — it overwrites the EPUB in place).
+
 4. **Patching an EPUB XHTML file**:
 
 ```python
@@ -159,7 +161,20 @@ LLM review is a filter, not a source of replacement text. For every LLM-positive
 5. Rebuild from checkpoint and search exact bad strings in both checkpoint JSON and the rebuilt EPUB.
 6. Rerun `semantic_ocr_review --llm --deep --only-garbled --strict-llm` until it returns zero LLM-positive candidates, or document any remaining candidate as intentionally accepted with evidence.
 
+For large EPUBs, slice the LLM review into non-overlapping batches with `--start-index` and `--limit` instead of reviewing every candidate in one pass:
+
+```bash
+python3 -m paddle_pipeline.semantic_ocr_review book.epub --llm --deep \
+  --only-garbled --strict-llm --json slice_0.json --limit 50 --start-index 0
+python3 -m paddle_pipeline.semantic_ocr_review book.epub --llm --deep \
+  --only-garbled --strict-llm --json slice_1.json --limit 50 --start-index 50
+```
+
+`--start-index` skips candidates before review, so each slice covers a non-overlapping `[start, start+limit)` window. Use this to resume an interrupted run or parallelize across sessions.
+
 Use `--strict-llm` for final verification so network/API failures cannot be mistaken for a clean result. The LLM caller retries transient HTTP/SSL errors, but a strict failure still means the review did not complete.
+
+For a thorough non-strict repair pass, add `--keep-llm-errors` to retain candidates whose LLM review failed — an LLM refusal or parse error on a passage can itself indicate garbled text worth manual inspection. Do not combine with `--strict-llm`, which exits nonzero before output on any error.
 
 ## Manual TOC Rebuild
 

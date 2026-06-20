@@ -556,6 +556,20 @@ class TestLLMReview(unittest.TestCase):
             self.assertIn("llm_review", c)
             self.assertFalse(c["llm_review"]["is_garbled"])
 
+    def test_filter_llm_garbled_candidates_can_keep_errors(self):
+        from paddle_pipeline.semantic_ocr_review import _filter_llm_garbled_candidates
+
+        garbled = {"llm_review": {"is_garbled": True}}
+        normal = {"llm_review": {"is_garbled": False}}
+        failed = {"llm_error": "invalid JSON: refusal"}
+        candidates = [garbled, normal, failed]
+
+        self.assertEqual([garbled], _filter_llm_garbled_candidates(candidates))
+        self.assertEqual(
+            [garbled, failed],
+            _filter_llm_garbled_candidates(candidates, keep_errors=True),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Sentence-level candidate generation
@@ -732,6 +746,38 @@ class TestCLI(unittest.TestCase):
 
             # At least one candidate should be generated for the garbled text.
             self.assertGreater(len(data), 0)
+
+    def test_start_index_applies_before_limit(self):
+        from paddle_pipeline.semantic_ocr_review import main
+
+        all_candidates = [
+            {"excerpt": f"candidate-{index}", "source": "semantic_candidate"}
+            for index in range(5)
+        ]
+
+        def generate(_epub, *, limit, min_score, min_cjk):
+            del min_score, min_cjk
+            return all_candidates[:limit]
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "report.json"
+            with mock.patch(
+                "paddle_pipeline.semantic_ocr_review.generate_semantic_candidates",
+                side_effect=generate,
+            ):
+                main([
+                    "book.epub",
+                    "--json", str(out),
+                    "--limit", "2",
+                    "--start-index", "2",
+                ])
+
+            data = json.loads(out.read_text(encoding="utf-8"))
+
+        self.assertEqual(
+            ["candidate-2", "candidate-3"],
+            [candidate["excerpt"] for candidate in data],
+        )
 
 
 if __name__ == "__main__":
