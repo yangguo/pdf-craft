@@ -47,6 +47,10 @@ python3 skills/converting-pdfs-to-epub/scripts/pdf_to_epub_hybrid.py inspect boo
 python3 skills/converting-pdfs-to-epub/scripts/pdf_to_epub_hybrid.py convert book.pdf book.epub \
   --title "Book Title" \
   --author "Author Name" \
+  --isbn "978-1-23456-789-0" \
+  --publisher "Example Press" \
+  --published "2026-07-18" \
+  --description "A concise catalog description." \
   --visual-pages 66,72-73,148,210 \
   --section "Front Matter:1-12" \
   --section "1 Introduction:13-42"
@@ -58,6 +62,8 @@ python3 skills/converting-pdfs-to-epub/scripts/pdf_to_epub_hybrid.py verify book
 ```
 
 If the repository has a better project-specific converter, prefer that. For Paddle/OCR requests or scanned PDFs, inspect `pdf2epub_paddle.py` or the project OCR workflow, but still apply the verification checklist below. If the generated EPUB has CJK garbling, missing sentences, broken chapter boundaries, or cross-page/figure-adjacent OCR loss, switch to the `repairing-ocr-epubs` skill.
+
+The hybrid converter automatically calibrates vector-drawing complexity against the document baseline so recurring crop marks and page furniture do not turn every page into a visual snapshot. On CJK-dominant pages it also joins wrapped line blocks into paragraphs using indentation and vertical spacing, while leaving non-CJK block boundaries unchanged. Explicit `--visual-pages` and `--section` values remain the authoritative override when automatic inspection is uncertain.
 
 ## Visual Retention
 
@@ -94,6 +100,7 @@ Confirm:
 - Expected captions are searchable text.
 - All expected visual pages are embedded.
 - EPUB contains no remote `http://` or `https://` image references.
+- The `mimetype` member is first and uncompressed, package XML parses, and every local `href`/`src` resolves to an archive member.
 
 ## Common Failures
 

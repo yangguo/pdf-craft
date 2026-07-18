@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import posixpath
 import re
+import statistics
 import sys
 import unicodedata
 import zipfile
@@ -13,6 +16,8 @@ from dataclasses import dataclass
 from html import escape
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
+from xml.etree import ElementTree
 
 try:
     import fitz
@@ -176,6 +181,49 @@ def join_pdf_lines(lines: list[str]) -> str:
     return re.sub(r"\s+", " ", out).strip()
 
 
+def _join_reflowed_text(left: str, right: str) -> str:
+    if not left:
+        return right
+    if left.endswith("-") and re.search(r"[A-Za-z]-$", left) and re.match(r"^[A-Za-z]", right):
+        return left[:-1] + right
+    if re.search(r"[A-Za-z0-9]$", left) and re.match(r"^[A-Za-z0-9]", right):
+        return left + " " + right
+    return left + right
+
+
+def reflow_text_blocks(blocks: list[tuple]) -> list[str]:
+    raw = [(block, clean_lines(block[4])) for block in blocks]
+    raw = [(block, lines) for block, lines in raw if lines]
+    combined = "".join("".join(lines) for _, lines in raw)
+    compact = re.sub(r"\s+", "", combined)
+    cjk_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", compact))
+    if not compact or cjk_count / len(compact) < 0.2:
+        return [join_pdf_lines(lines) for _, lines in raw]
+
+    prepared = []
+    for block, lines in raw:
+        text = ""
+        for line in lines:
+            text = _join_reflowed_text(text, line)
+        prepared.append((block, text))
+
+    base_x = min(float(block[0]) for block, _ in prepared)
+    paragraphs: list[str] = []
+    current = ""
+    previous_bottom: float | None = None
+    for block, text in prepared:
+        gap = 0.0 if previous_bottom is None else float(block[1]) - previous_bottom
+        indented = float(block[0]) >= base_x + 12
+        if current and (indented or gap > 8):
+            paragraphs.append(current)
+            current = ""
+        current = _join_reflowed_text(current, text)
+        previous_bottom = float(block[3])
+    if current:
+        paragraphs.append(current)
+    return paragraphs
+
+
 def is_header_or_footer(block: tuple, drop_headers: bool, page_height: float = 792.0) -> bool:
     if not drop_headers:
         return False
@@ -200,10 +248,8 @@ def page_text_blocks(page: fitz.Page, page_no: int, drop_headers: bool) -> list[
     for block in blocks:
         if is_header_or_footer(block, drop_headers, page_height):
             continue
-        text = join_pdf_lines(clean_lines(block[4]))
-        if text:
-            text_blocks.append(text)
-    return text_blocks
+        text_blocks.append(block)
+    return reflow_text_blocks(text_blocks)
 
 
 def paragraph_html(text: str, *, first: bool, index_page: bool) -> str:
@@ -240,16 +286,42 @@ def render_cover_jpeg(page: fitz.Page) -> bytes:
 
 def candidate_visual_pages(doc: fitz.Document) -> set[int]:
     pages: set[int] = set()
-    caption_pattern = re.compile(r"\b(?:Figure|Table)\s+\d+(?:\.\d+)?", re.IGNORECASE)
+    drawing_counts = [len(page.get_drawings()) for page in doc]
+    drawing_baseline = statistics.median(drawing_counts) if drawing_counts else 0
+    drawing_threshold = max(5, math.ceil(drawing_baseline * 1.5))
+    caption_pattern = re.compile(
+        r"^[ \t]*(?:(?:Figure|Table)[ \t]*\d+(?:\.\d+)?|(?:圖|表)[ \t]*\d+(?:\.\d+)?)",
+        re.IGNORECASE | re.MULTILINE,
+    )
     for index, page in enumerate(doc, start=1):
         text = normalize_text(page.get_text("text"))
-        if index == 1 and page.get_images(full=True):
+        images = page.get_images(full=True)
+        drawings = page.get_drawings()
+        if index == 1 and (images or drawings) and len(text.strip()) < 40:
             continue
-        if page.get_images(full=True):
+        if images:
             pages.add(index)
-        if len(page.get_drawings()) >= 5:
+        if len(drawings) >= drawing_threshold:
             pages.add(index)
-        if caption_pattern.search(text) and (page.get_drawings() or "Table " in text or "Figure " in text):
+        interior = fitz.Rect(
+            page.rect.width * 0.1,
+            page.rect.height * 0.1,
+            page.rect.width * 0.9,
+            page.rect.height * 0.9,
+        )
+        interior_drawings = sum(
+            1
+            for drawing in drawings
+            if interior.contains(
+                fitz.Point(
+                    (drawing["rect"].x0 + drawing["rect"].x1) / 2,
+                    (drawing["rect"].y0 + drawing["rect"].y1) / 2,
+                )
+            )
+        )
+        if len(text.strip()) < 80 and interior_drawings >= 5:
+            pages.add(index)
+        if caption_pattern.search(text) and (drawings or images):
             pages.add(index)
     return pages
 
@@ -314,10 +386,17 @@ def build_epub(args: argparse.Namespace) -> int:
     print(f"[*] Visual pages: {sorted(visual_pages)}")
 
     book = epub.EpubBook()
-    book.set_identifier(args.identifier or f"{pdf_path.stem}-hybrid-epub")
+    identifier = args.identifier or (f"urn:isbn:{args.isbn}" if args.isbn else f"{pdf_path.stem}-hybrid-epub")
+    book.set_identifier(identifier)
     book.set_title(title)
     book.set_language(args.language)
     book.add_author(author)
+    if args.publisher:
+        book.add_metadata("DC", "publisher", args.publisher)
+    if args.published:
+        book.add_metadata("DC", "date", args.published)
+    if args.description:
+        book.add_metadata("DC", "description", args.description)
     book.set_cover("cover.jpg", render_cover_jpeg(doc[args.cover_page - 1]))
 
     css = epub.EpubItem(uid="book_css", file_name="style/book.css", media_type="text/css", content=CSS.encode("utf-8"))
@@ -401,6 +480,45 @@ def verify_epub(args: argparse.Namespace) -> int:
             if bad:
                 failures.append(f"bad zip member: {bad}")
             names = archive.namelist()
+            infos = archive.infolist()
+            if not infos or infos[0].filename != "mimetype":
+                failures.append("mimetype must be the first ZIP member")
+            try:
+                mimetype_info = archive.getinfo("mimetype")
+                if mimetype_info.compress_type != zipfile.ZIP_STORED:
+                    failures.append("mimetype must be stored without compression")
+                if archive.read("mimetype") != b"application/epub+zip":
+                    failures.append("mimetype content must be application/epub+zip")
+            except KeyError:
+                failures.append("mimetype member is missing")
+
+            name_set = set(names)
+            missing_references: set[str] = set()
+            for name in names:
+                if not name.lower().endswith((".xhtml", ".html", ".opf", ".ncx")):
+                    continue
+                try:
+                    root = ElementTree.fromstring(archive.read(name))
+                except ElementTree.ParseError as exc:
+                    failures.append(f"invalid XML in {name}: {exc}")
+                    continue
+                for element in root.iter():
+                    for attribute, raw_reference in element.attrib.items():
+                        if attribute.rsplit("}", 1)[-1] not in {"href", "src"}:
+                            continue
+                        parsed = urlsplit(raw_reference)
+                        if parsed.scheme or parsed.netloc or not parsed.path:
+                            continue
+                        resolved = posixpath.normpath(
+                            posixpath.join(posixpath.dirname(name), unquote(parsed.path))
+                        )
+                        if resolved not in name_set:
+                            missing_references.add(f"{name} -> {raw_reference}")
+            if missing_references:
+                failures.append(
+                    "missing local references: " + ", ".join(sorted(missing_references))
+                )
+
             images = [n for n in names if n.lower().endswith(IMAGE_EXTENSIONS)]
             visuals = sorted(n for n in images if "visual_p" in n)
             visual_pages = {
@@ -469,6 +587,10 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument("--author")
     convert_parser.add_argument("--language", default="en")
     convert_parser.add_argument("--identifier")
+    convert_parser.add_argument("--isbn", help="ISBN used as the identifier when --identifier is omitted")
+    convert_parser.add_argument("--publisher")
+    convert_parser.add_argument("--published", help="publication date, preferably YYYY-MM-DD")
+    convert_parser.add_argument("--description")
     convert_parser.add_argument("--cover-page", type=int, default=1)
     convert_parser.add_argument("--visual-pages", help="comma-separated page numbers/ranges")
     convert_parser.add_argument("--section", action="append", default=[], help="repeat: 'Title:start-end'")
