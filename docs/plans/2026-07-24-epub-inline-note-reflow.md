@@ -69,3 +69,15 @@
 3. Style direct body paragraphs beginning with `[number]` as superscript markers without merging them.
 4. Add an explicit correction format for PDF-verified displaced prefixes, and fail if any declared correction does not match.
 5. Verify the two corrected sequences against PDF pages 185 and 297.
+
+### Task 6: Repair page-anchor-only splits and clean endnote artifacts
+
+**Files:**
+- Modify: `tests/test_relocate_epub_notes.py`
+- Modify: `skills/converting-pdfs-to-epub/scripts/relocate_epub_notes.py`
+
+1. Join direct body paragraphs separated only by a page anchor when the preceding text has no terminal paragraph punctuation.
+2. Keep the page anchor and its source-page ID inline in the joined paragraph.
+3. Preserve page-boundary paragraphs whose preceding text is already complete.
+4. Remove chapter-end note paragraphs whose entire content is only `[number]`; these are misplaced reference markers, not note text.
+5. Report page-boundary joins and removed orphan marker counts.

@@ -300,6 +300,81 @@ def test_repair_leading_paragraph_marker_as_superscript() -> None:
     assert marker.attrib["class"] == "inline-note-marker"
 
 
+def test_repair_page_boundary_joins_unfinished_paragraph() -> None:
+    relocator = _load_relocator()
+    chapter = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>'
+        '<body><p>璽書上所用皇帝印璽，是</p>'
+        '<span class="page-anchor" id="page-58"/>'
+        "<p>「天子八寶」中的一個，還是另外有專門的印璽。</p>"
+        "</body></html>"
+    ).encode("utf-8")
+
+    rewritten, joined = relocator.repair_page_boundary_paragraphs_in_xhtml(
+        chapter
+    )
+
+    assert joined == 1
+    root = ElementTree.fromstring(rewritten)
+    body = root.find("{http://www.w3.org/1999/xhtml}body")
+    assert body is not None
+    assert len(body) == 1
+    assert "".join(body[0].itertext()) == (
+        "璽書上所用皇帝印璽，是「天子八寶」中的一個，"
+        "還是另外有專門的印璽。"
+    )
+    anchor = body[0].find("{http://www.w3.org/1999/xhtml}span")
+    assert anchor is not None
+    assert anchor.attrib["id"] == "page-58"
+
+
+def test_repair_page_boundary_preserves_finished_paragraphs() -> None:
+    relocator = _load_relocator()
+    chapter = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>T</title></head>'
+        '<body><p>上一段已經結束。</p>'
+        '<span class="page-anchor" id="page-2"/><p>下一段另起。</p>'
+        "</body></html>"
+    ).encode("utf-8")
+
+    rewritten, joined = relocator.repair_page_boundary_paragraphs_in_xhtml(
+        chapter
+    )
+
+    assert joined == 0
+    assert rewritten == chapter
+
+
+def test_remove_orphan_note_markers_keeps_numbered_notes() -> None:
+    relocator = _load_relocator()
+    chapter = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<html xmlns="http://www.w3.org/1999/xhtml" '
+        'xmlns:epub="http://www.idpf.org/2007/ops"><head><title>T</title></head>'
+        '<body><section class="chapter-notes" epub:type="endnotes"><h2>注釋</h2>'
+        '<aside class="footnotes" epub:type="footnotes">'
+        "<p>5. 第五條注釋。</p><p>[10]</p><p>[11]</p><p>[13]</p>"
+        "<p>9. 第九條注釋。</p><p>10. 第十條注釋。</p>"
+        "</aside></section></body></html>"
+    ).encode("utf-8")
+
+    rewritten, removed = relocator.remove_orphan_note_markers_in_xhtml(chapter)
+
+    assert removed == 3
+    root = ElementTree.fromstring(rewritten)
+    texts = [
+        "".join(paragraph.itertext())
+        for paragraph in root.iter("{http://www.w3.org/1999/xhtml}p")
+    ]
+    assert texts == [
+        "5. 第五條注釋。",
+        "9. 第九條注釋。",
+        "10. 第十條注釋。",
+    ]
+
+
 def test_relocate_notes_to_chapter_end_preserves_prose_and_links() -> None:
     relocator = _load_relocator()
 
@@ -446,6 +521,8 @@ def test_relocate_epub_notes_repackages_safely(tmp_path: Path) -> None:
         "inline_markers_repaired": 1,
         "leading_markers_repaired": 0,
         "continuations_joined": 1,
+        "page_boundary_paragraphs_joined": 0,
+        "orphan_note_markers_removed": 0,
         "reading_order_corrections_applied": 0,
     }
     assert output.stat().st_mode & 0o777 == source.stat().st_mode & 0o777

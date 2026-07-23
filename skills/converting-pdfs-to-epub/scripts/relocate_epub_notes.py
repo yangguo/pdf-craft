@@ -50,6 +50,10 @@ ElementTree.register_namespace("epub", EPUB_NS)
 INLINE_NOTE_RE = re.compile(r"^\[(\d+)\]\s*(.*)$", re.DOTALL)
 NUMBERED_NOTE_FRAGMENT_RE = re.compile(r"^\d{1,3}\.\s")
 SENTENCE_ENDINGS = frozenset("。！？!?；;")
+PARAGRAPH_ENDINGS = SENTENCE_ENDINGS | frozenset(
+    ".：:」』）】》〉”’\"…]］"
+)
+ORPHAN_NOTE_MARKER_RE = re.compile(r"^\[\d+\]$")
 
 
 def _is_footnotes_aside(element: ElementTree.Element) -> bool:
@@ -238,6 +242,46 @@ def repair_leading_paragraph_markers_in_xhtml(
     return _serialize_xhtml(root), repaired
 
 
+def repair_page_boundary_paragraphs_in_xhtml(
+    content: bytes,
+) -> tuple[bytes, int]:
+    """Join direct body paragraphs split only by a PDF page anchor."""
+    root = ElementTree.fromstring(content)
+    body = root.find(f"{XHTML}body")
+    if body is None:
+        return content, 0
+
+    joined = 0
+    for anchor in list(body):
+        if not _is_page_anchor(anchor):
+            continue
+        children = list(body)
+        index = children.index(anchor)
+        if (
+            index == 0
+            or index + 1 >= len(children)
+            or children[index - 1].tag != f"{XHTML}p"
+            or children[index + 1].tag != f"{XHTML}p"
+        ):
+            continue
+        previous = children[index - 1]
+        continuation = children[index + 1]
+        previous_text = "".join(previous.itertext()).strip()
+        if not previous_text or previous_text[-1] in PARAGRAPH_ENDINGS:
+            continue
+
+        body.remove(anchor)
+        anchor.tail = None
+        previous.append(anchor)
+        _append_contents(previous, continuation)
+        body.remove(continuation)
+        joined += 1
+
+    if not joined:
+        return content, 0
+    return _serialize_xhtml(root), joined
+
+
 def relocate_notes_in_xhtml(content: bytes) -> tuple[bytes, int]:
     """Collect direct chapter footnote asides into one endnotes section."""
     root = ElementTree.fromstring(content)
@@ -261,6 +305,39 @@ def relocate_notes_in_xhtml(content: bytes) -> tuple[bytes, int]:
         endnotes.append(note)
     body.append(endnotes)
     return _serialize_xhtml(root), len(notes)
+
+
+def remove_orphan_note_markers_in_xhtml(
+    content: bytes,
+) -> tuple[bytes, int]:
+    """Drop duplicate marker-only lines from collected chapter endnotes."""
+    root = ElementTree.fromstring(content)
+    body = root.find(f"{XHTML}body")
+    if body is None:
+        return content, 0
+
+    removed = 0
+    for section in list(body):
+        if (
+            section.tag != f"{XHTML}section"
+            or "chapter-notes"
+            not in section.attrib.get("class", "").split()
+        ):
+            continue
+        for aside in section.findall(f"{XHTML}aside"):
+            for paragraph in list(aside):
+                if (
+                    paragraph.tag == f"{XHTML}p"
+                    and ORPHAN_NOTE_MARKER_RE.fullmatch(
+                        "".join(paragraph.itertext()).strip()
+                    )
+                ):
+                    aside.remove(paragraph)
+                    removed += 1
+
+    if not removed:
+        return content, 0
+    return _serialize_xhtml(root), removed
 
 
 def relocate_interposed_note_fragments_in_xhtml(
@@ -449,6 +526,8 @@ def relocate_epub_notes(
     inline_markers_repaired = 0
     leading_markers_repaired = 0
     continuations_joined = 0
+    page_boundary_paragraphs_joined = 0
+    orphan_note_markers_removed = 0
     reading_order_corrections_applied = 0
     expected_corrections = sum(
         len(corrections)
@@ -478,6 +557,12 @@ def relocate_epub_notes(
             rewritten, leading_repaired = (
                 repair_leading_paragraph_markers_in_xhtml(rewritten)
             )
+            rewritten, page_paragraphs_joined = (
+                repair_page_boundary_paragraphs_in_xhtml(rewritten)
+            )
+            rewritten, orphan_markers_removed = (
+                remove_orphan_note_markers_in_xhtml(rewritten)
+            )
             rewritten, corrections_applied = reorder_displaced_prefixes_in_xhtml(
                 rewritten,
                 (reading_order_corrections or {}).get(info.filename, []),
@@ -487,6 +572,8 @@ def relocate_epub_notes(
                 or fragments_moved
                 or repaired
                 or leading_repaired
+                or page_paragraphs_joined
+                or orphan_markers_removed
                 or corrections_applied
             ):
                 rewritten_members[info.filename] = rewritten
@@ -496,6 +583,8 @@ def relocate_epub_notes(
             inline_markers_repaired += repaired
             leading_markers_repaired += leading_repaired
             continuations_joined += joined
+            page_boundary_paragraphs_joined += page_paragraphs_joined
+            orphan_note_markers_removed += orphan_markers_removed
             reading_order_corrections_applied += corrections_applied
 
         if reading_order_corrections_applied != expected_corrections:
@@ -554,6 +643,10 @@ def relocate_epub_notes(
         "inline_markers_repaired": inline_markers_repaired,
         "leading_markers_repaired": leading_markers_repaired,
         "continuations_joined": continuations_joined,
+        "page_boundary_paragraphs_joined": (
+            page_boundary_paragraphs_joined
+        ),
+        "orphan_note_markers_removed": orphan_note_markers_removed,
         "reading_order_corrections_applied": (
             reading_order_corrections_applied
         ),
