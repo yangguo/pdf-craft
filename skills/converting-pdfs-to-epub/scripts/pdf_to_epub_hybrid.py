@@ -90,6 +90,22 @@ figure.visual-snapshot figcaption {
   margin-top: 0.35em;
   text-indent: 0;
 }
+section.endnotes {
+  margin-top: 2.5em;
+  border-top: 1px solid #999;
+  page-break-before: always;
+}
+section.endnotes h2 {
+  font-size: 1.2em;
+  margin: 1.2em 0 0.8em;
+}
+section.endnotes ol {
+  padding-left: 1.6em;
+}
+section.endnotes li {
+  margin: 0 0 0.65em;
+  text-indent: 0;
+}
 """
 
 
@@ -100,8 +116,27 @@ class Section:
     end: int
 
 
+@dataclass(frozen=True)
+class CaptionedVisual:
+    """A figure or table region paired with its immediately following title."""
+
+    rect: fitz.Rect
+    caption_rect: fitz.Rect
+    label: str
+    caption: str
+
+
+@dataclass
+class VisualAsset:
+    item: epub.EpubImage
+    caption: str | None = None
+    caption_rect: fitz.Rect | None = None
+    source_rect: fitz.Rect | None = None
+
+
 def normalize_text(text: str) -> str:
     text = text.replace("\u00ad", "")
+    text = "".join(character for character in text if character >= " " or character in "\n\t")
     for source, target in LIGATURES.items():
         text = text.replace(source, target)
     return unicodedata.normalize("NFC", text)
@@ -205,20 +240,35 @@ def reflow_text_blocks(blocks: list[tuple]) -> list[str]:
         text = ""
         for line in lines:
             text = _join_reflowed_text(text, line)
-        prepared.append((block, text))
+        first_line = block[4].splitlines()[0] if block[4].splitlines() else ""
+        explicit_indent = len(first_line) - len(first_line.lstrip(" \t\u3000\u2002\u2003")) >= 2
+        prepared.append((block, text, explicit_indent))
 
-    base_x = min(float(block[0]) for block, _ in prepared)
+    base_x = min(float(block[0]) for block, _, _ in prepared)
     paragraphs: list[str] = []
     current = ""
     previous_bottom: float | None = None
-    for block, text in prepared:
+    previous_x: float | None = None
+    for block, text, explicit_indent in prepared:
         gap = 0.0 if previous_bottom is None else float(block[1]) - previous_bottom
-        indented = float(block[0]) >= base_x + 12
+        x = float(block[0])
+        # Some PDFs expose every line in an inset paragraph as its own text
+        # block. Treat only the transition into an inset line as indentation;
+        # otherwise each following line would become a separate paragraph.
+        geometric_indent = (
+            x >= base_x + 12
+            and previous_x is not None
+            and previous_x < base_x + 12
+            and previous_bottom is not None
+            and float(block[1]) >= previous_bottom
+        )
+        indented = explicit_indent or geometric_indent
         if current and (indented or gap > 8):
             paragraphs.append(current)
             current = ""
         current = _join_reflowed_text(current, text)
         previous_bottom = float(block[3])
+        previous_x = x
     if current:
         paragraphs.append(current)
     return paragraphs
@@ -232,24 +282,146 @@ def is_header_or_footer(block: tuple, drop_headers: bool, page_height: float = 7
     if not compact:
         return True
     header_threshold = page_height * 0.065
-    footer_threshold = page_height * 0.732
+    footer_threshold = page_height * 0.9
     return y0 < header_threshold or y0 > footer_threshold
 
 
-def page_text_blocks(page: fitz.Page, page_no: int, drop_headers: bool) -> list[str]:
-    blocks = [b for b in page.get_text("blocks") if len(b) < 7 or b[6] == 0]
-    if page_no >= 300:
-        blocks = sorted(blocks, key=lambda b: (0 if b[0] < 200 else 1, b[1], b[0]))
-    else:
-        blocks = sorted(blocks, key=lambda b: (round(b[1], 1), round(b[0], 1)))
+def is_layout_marker_span(span: dict) -> bool:
+    """Ignore InDesign emphasis dots misencoded as the digit ``4``."""
 
-    text_blocks = []
+    font = str(span.get("font", "")).casefold()
+    return "kenten" in font and bool(re.fullmatch(r"4+", span.get("text", "").strip()))
+
+
+def _page_text_records(
+    page: fitz.Page,
+    page_no: int,
+    drop_headers: bool,
+    *,
+    excluded_rects: list[fitz.Rect] | None = None,
+    column_split: float | None = None,
+) -> list[tuple[tuple, float]]:
+    records = []
+    for index, source_block in enumerate(page.get_text("dict")["blocks"]):
+        if source_block["type"] != 0:
+            continue
+        spans = [
+            span
+            for line in source_block["lines"]
+            for span in line["spans"]
+            if span["text"].strip() and not is_layout_marker_span(span)
+        ]
+        if not spans:
+            continue
+        text = "\n".join(
+            "".join(
+                span["text"]
+                for span in line["spans"]
+                if not is_layout_marker_span(span)
+            )
+            for line in source_block["lines"]
+        )
+        block = (*source_block["bbox"], text, index, 0)
+        records.append((block, statistics.median(span["size"] for span in spans)))
+
+    if column_split is not None:
+        records = sorted(records, key=lambda record: (record[0][0] >= column_split, record[0][1], record[0][0]))
+    else:
+        records = sorted(records, key=lambda record: (round(record[0][1], 1), round(record[0][0], 1)))
+
+    text_records = []
     page_height = page.rect.height
-    for block in blocks:
+    for block, font_size in records:
         if is_header_or_footer(block, drop_headers, page_height):
             continue
-        text_blocks.append(block)
-    return reflow_text_blocks(text_blocks)
+        rect = fitz.Rect(block[:4])
+        if excluded_rects and any(rect.intersects(excluded) for excluded in excluded_rects):
+            continue
+        text_records.append((block, font_size))
+    return text_records
+
+
+def is_readable_footnote(text: str) -> bool:
+    """Reject hidden OCR/layout debris that masquerades as a small footnote."""
+
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    # Digits are legitimate prose/citations. Known misencoded emphasis glyphs
+    # are removed by font in _page_text_records, never by numeric pattern.
+    corrupted = compact.count("\ufffd")
+    return corrupted / len(compact) < 0.08
+
+
+def page_body_and_footnotes(
+    page: fitz.Page,
+    page_no: int,
+    drop_headers: bool,
+    *,
+    excluded_rects: list[fitz.Rect] | None = None,
+    column_split: float | None = None,
+) -> tuple[list[str], list[str]]:
+    """Return reflowed body text and smaller, bottom-of-page source notes."""
+
+    records = _page_text_records(
+        page, page_no, drop_headers, excluded_rects=excluded_rects, column_split=column_split
+    )
+    page_height = page.rect.height
+    body_sizes = [
+        font_size
+        for block, font_size in records
+        if page_height * 0.1 <= block[1] < page_height * 0.72 and len(block[4].strip()) >= 20
+    ]
+    if not body_sizes:
+        body_sizes = [
+            font_size
+            for block, font_size in records
+            if page_height * 0.1 <= block[1] < page_height * 0.72
+        ]
+    body_size = statistics.median(body_sizes) if body_sizes else None
+    note_records = []
+    body_records = []
+    for block, font_size in records:
+        is_footnote = (
+            body_size is not None
+            and page_height * 0.72 <= block[1] < page_height * 0.9
+            and font_size <= body_size - 1.0
+        )
+        if is_footnote:
+            if is_readable_footnote(block[4]):
+                note_records.append(block)
+        else:
+            body_records.append(block)
+    return reflow_text_blocks(body_records), reflow_text_blocks(note_records)
+
+
+def page_text_blocks(
+    page: fitz.Page,
+    page_no: int,
+    drop_headers: bool,
+    *,
+    excluded_rects: list[fitz.Rect] | None = None,
+    column_split: float | None = None,
+) -> list[str]:
+    body, _ = page_body_and_footnotes(
+        page,
+        page_no,
+        drop_headers,
+        excluded_rects=excluded_rects,
+        column_split=column_split,
+    )
+    return body
+
+
+def remove_duplicate_section_heading(
+    blocks: list[str], title: str, *, is_section_start: bool
+) -> list[str]:
+    if not is_section_start or not blocks:
+        return blocks
+    compact = lambda value: re.sub(r"\s+", "", normalize_text(value)).casefold()
+    if compact(blocks[0]) == compact(title):
+        return blocks[1:]
+    return blocks
 
 
 def paragraph_html(text: str, *, first: bool, index_page: bool) -> str:
@@ -262,13 +434,188 @@ def paragraph_html(text: str, *, first: bool, index_page: bool) -> str:
     return f"<p{cls}>{escape(text)}</p>"
 
 
-def render_page_jpeg(page: fitz.Page, *, zoom: float, quality: int) -> bytes:
-    rect = page.rect
-    clip_x0 = max(rect.x0, 30)
-    clip_y0 = max(rect.y0, 24)
-    clip_x1 = max(rect.x0 + 1, rect.x1 - 30)
-    clip_y1 = max(rect.y0 + 1, rect.y1 - 24)
-    clip = fitz.Rect(clip_x0, clip_y0, clip_x1, clip_y1)
+def _substantive_image_regions(page: fitz.Page, *, min_side: float = 30.0) -> list[fitz.Rect]:
+    """Return image placements large enough to be actual page content.
+
+    This intentionally ignores the tiny repeated raster marks used by the
+    source PDF for registration/crop furniture.  Those marks were the reason
+    a page containing normal prose could previously be mistaken for a visual
+    page.
+    """
+
+    regions = []
+    for info in page.get_image_info(xrefs=True):
+        rect = fitz.Rect(info["bbox"])
+        if rect.width >= min_side and rect.height >= min_side:
+            regions.append(rect)
+    return regions
+
+
+def _vector_content_regions(page: fitz.Page) -> list[fitz.Rect]:
+    """Find interior vector content while excluding page furniture."""
+
+    page_rect = page.rect
+    safe_rect = fitz.Rect(
+        page_rect.x0 + 12,
+        page_rect.y0 + 12,
+        page_rect.x1 - 12,
+        page_rect.y1 - 12,
+    )
+    area_regions = []
+    line_regions = []
+    for drawing in page.get_drawings():
+        rect = fitz.Rect(drawing["rect"])
+        if not rect.is_valid or not safe_rect.contains(rect.tl) or not safe_rect.contains(rect.br):
+            continue
+        if rect.width > 2 and rect.height > 2:
+            area_regions.append(rect)
+        elif max(rect.width, rect.height) >= 20:
+            # PyMuPDF represents a stroked line with zero thickness; give it
+            # a tiny extent so rectangle union includes all table rules.
+            if rect.height <= 2:
+                rect = fitz.Rect(rect.x0, rect.y0 - 1, rect.x1, rect.y1 + 1)
+            elif rect.width <= 2:
+                rect = fitz.Rect(rect.x0 - 1, rect.y0, rect.x1 + 1, rect.y1)
+            line_regions.append(rect)
+
+    # A single line is normally an underline or a rule, not a figure.  A
+    # group of interior lines is useful for vector-only tables in this PDF.
+    if area_regions:
+        return area_regions + line_regions
+    if len(line_regions) >= 3:
+        return line_regions
+    return []
+
+
+def _nearby_caption_regions(page: fitz.Page, crop: fitz.Rect) -> list[fitz.Rect]:
+    """Include a nearby figure/table title for vector-only content."""
+
+    caption_pattern = re.compile(r"^(?:图|圖|表|Figure|Table)\s*[0-9０-９]", re.IGNORECASE)
+    captions = []
+    for block in page.get_text("blocks"):
+        if len(block) < 7 or block[6] != 0:
+            continue
+        text = normalize_text(block[4]).strip()
+        rect = fitz.Rect(block[:4])
+        if not caption_pattern.match(text):
+            continue
+        horizontal_overlap = min(crop.x1, rect.x1) - max(crop.x0, rect.x0)
+        vertical_gap = crop.y0 - rect.y1
+        if horizontal_overlap > 0 and 0 <= vertical_gap <= 16:
+            captions.append(rect)
+    return captions
+
+
+CAPTION_PATTERN = re.compile(
+    r"^\s*(?P<kind>图|圖|表|Figure|Table)\s*(?P<chapter>\d+)\s*[-－—]\s*(?P<index>\d+)",
+    re.IGNORECASE,
+)
+
+
+def captioned_visual_regions(
+    page: fitz.Page,
+    *,
+    max_caption_gap: float = 32.0,
+) -> list[CaptionedVisual]:
+    """Pair each real figure/table title with the visual directly above it.
+
+    References in body prose (for example, ``图7-1 和图7-2 显示``) are
+    deliberately excluded: a real title must begin its text block and have a
+    nearby visual region immediately above it.
+    """
+
+    regions = _substantive_image_regions(page) or _vector_content_regions(page)
+    if not regions:
+        return []
+
+    captions: list[tuple[fitz.Rect, str, str]] = []
+    for block in page.get_text("blocks"):
+        if len(block) >= 7 and block[6] != 0:
+            continue
+        text = " ".join(clean_lines(block[4]))
+        match = CAPTION_PATTERN.match(text)
+        if not match:
+            continue
+        marker = match.group("kind")
+        label = f"{marker} {match.group('chapter')}-{match.group('index')}"
+        captions.append((fitz.Rect(block[:4]), label, text))
+
+    paired: list[CaptionedVisual] = []
+    used_regions: set[int] = set()
+    for caption_rect, label, caption in sorted(captions, key=lambda item: item[0].y0):
+        candidates = []
+        for index, region in enumerate(regions):
+            if index in used_regions or region.y1 > caption_rect.y0:
+                continue
+            gap = caption_rect.y0 - region.y1
+            overlap = min(region.x1, caption_rect.x1) - max(region.x0, caption_rect.x0)
+            if gap <= max_caption_gap and overlap > 0:
+                candidates.append((gap, -overlap, index, region))
+        if not candidates:
+            continue
+        _, _, index, region = min(candidates)
+        used_regions.add(index)
+        paired.append(CaptionedVisual(region, caption_rect, label, caption))
+    return paired
+
+
+def visual_crop_rect(page: fitz.Page, *, margin: float = 8.0) -> fitz.Rect | None:
+    # When an actual image exists, do not union it with unrelated vector
+    # furniture.  The surrounding prose remains selectable text in XHTML.
+    regions = _substantive_image_regions(page)
+    if not regions:
+        regions = _vector_content_regions(page)
+    if not regions:
+        return None
+
+    crop = fitz.Rect(regions[0])
+    for region in regions[1:]:
+        crop |= region
+    if not _substantive_image_regions(page):
+        for caption in _nearby_caption_regions(page, crop):
+            crop |= caption
+    page_rect = page.rect
+    return fitz.Rect(
+        max(page_rect.x0, crop.x0 - margin),
+        max(page_rect.y0, crop.y0 - margin),
+        min(page_rect.x1, crop.x1 + margin),
+        min(page_rect.y1, crop.y1 + margin),
+    )
+
+
+def render_page_jpeg(
+    page: fitz.Page,
+    *,
+    zoom: float,
+    quality: int,
+    crop_visual: bool = False,
+) -> bytes:
+    if crop_visual:
+        clip = visual_crop_rect(page) or page.rect
+    else:
+        rect = page.rect
+        clip_x0 = max(rect.x0, 30)
+        clip_y0 = max(rect.y0, 24)
+        clip_x1 = max(rect.x0 + 1, rect.x1 - 30)
+        clip_y1 = max(rect.y0 + 1, rect.y1 - 24)
+        clip = fitz.Rect(clip_x0, clip_y0, clip_x1, clip_y1)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+    image = Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
+    buf = BytesIO()
+    image.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def render_visual_jpeg(page: fitz.Page, rect: fitz.Rect, *, zoom: float, quality: int) -> bytes:
+    """Render one already-identified visual region without surrounding prose."""
+
+    page_rect = page.rect
+    clip = fitz.Rect(
+        max(page_rect.x0, rect.x0 - 8),
+        max(page_rect.y0, rect.y0 - 8),
+        min(page_rect.x1, rect.x1 + 8),
+        min(page_rect.y1, rect.y1 + 8),
+    )
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
     image = Image.open(BytesIO(pix.tobytes("png"))).convert("RGB")
     buf = BytesIO()
@@ -284,13 +631,13 @@ def render_cover_jpeg(page: fitz.Page) -> bytes:
     return buf.getvalue()
 
 
-def candidate_visual_pages(doc: fitz.Document) -> set[int]:
+def candidate_visual_pages(doc: fitz.Document, *, skip_page_rasters: bool = False) -> set[int]:
     pages: set[int] = set()
     drawing_counts = [len(page.get_drawings()) for page in doc]
     drawing_baseline = statistics.median(drawing_counts) if drawing_counts else 0
     drawing_threshold = max(5, math.ceil(drawing_baseline * 1.5))
     caption_pattern = re.compile(
-        r"^[ \t]*(?:(?:Figure|Table)[ \t]*\d+(?:\.\d+)?|(?:圖|表)[ \t]*\d+(?:\.\d+)?)",
+        r"^[ \t]*(?:(?:Figure|Table)[ \t]*\d+(?:\.\d+)?|(?:图|圖|表)[ \t]*\d+(?:\.\d+)?)",
         re.IGNORECASE | re.MULTILINE,
     )
     for index, page in enumerate(doc, start=1):
@@ -299,8 +646,17 @@ def candidate_visual_pages(doc: fitz.Document) -> set[int]:
         drawings = page.get_drawings()
         if index == 1 and (images or drawings) and len(text.strip()) < 40:
             continue
-        if images:
-            pages.add(index)
+        image_regions = _substantive_image_regions(page)
+        if image_regions:
+            image_bounds = fitz.Rect(image_regions[0])
+            for region in image_regions[1:]:
+                image_bounds |= region
+            image_coverage = image_bounds.get_area() / max(page.rect.get_area(), 1)
+            has_caption = bool(caption_pattern.search(text))
+            # Area alone cannot distinguish a scan from full-page artwork.
+            # Suppress page rasters only when the caller reviewed the source.
+            if not skip_page_rasters or image_coverage < 0.45 or has_caption or len(image_regions) > 1:
+                pages.add(index)
         if len(drawings) >= drawing_threshold:
             pages.add(index)
         interior = fitz.Rect(
@@ -319,7 +675,13 @@ def candidate_visual_pages(doc: fitz.Document) -> set[int]:
                 )
             )
         )
-        if len(text.strip()) < 80 and interior_drawings >= 5:
+        vector_regions = _vector_content_regions(page)
+        vector_area = sum(region.get_area() for region in vector_regions)
+        if (
+            len(text.strip()) < 80
+            and interior_drawings >= 5
+            and (len(vector_regions) >= 3 or vector_area >= 400)
+        ):
             pages.add(index)
         if caption_pattern.search(text) and (drawings or images):
             pages.add(index)
@@ -379,7 +741,7 @@ def build_epub(args: argparse.Namespace) -> int:
     title = args.title or normalize_text(doc.metadata.get("title") or "") or pdf_path.stem
     author = args.author or normalize_text(doc.metadata.get("author") or "") or "Unknown"
     sections = parse_sections(args.section, doc.page_count) if args.section else default_sections(doc)
-    visual_pages = parse_page_ranges(args.visual_pages) if args.visual_pages else candidate_visual_pages(doc)
+    visual_pages = parse_page_ranges(args.visual_pages) if args.visual_pages else candidate_visual_pages(doc, skip_page_rasters=args.skip_page_rasters)
     visual_pages = {page for page in visual_pages if 1 <= page <= doc.page_count}
 
     print(f"[*] Building EPUB from {doc.page_count} PDF pages")
@@ -402,13 +764,47 @@ def build_epub(args: argparse.Namespace) -> int:
     css = epub.EpubItem(uid="book_css", file_name="style/book.css", media_type="text/css", content=CSS.encode("utf-8"))
     book.add_item(css)
 
-    visual_items = {}
+    visual_items: dict[int, list[VisualAsset]] = {}
     for page_no in sorted(visual_pages):
-        data = render_page_jpeg(doc[page_no - 1], zoom=args.zoom, quality=args.jpeg_quality)
+        page = doc[page_no - 1]
+        captioned_visuals = captioned_visual_regions(page)
+        if captioned_visuals:
+            assets = []
+            for visual_index, visual in enumerate(captioned_visuals, 1):
+                data = render_visual_jpeg(
+                    page,
+                    visual.rect,
+                    zoom=args.zoom,
+                    quality=args.jpeg_quality,
+                )
+                name = f"images/visual_p{page_no:04d}_f{visual_index:02d}.jpg"
+                item = epub.EpubImage(
+                    uid=f"visual_p{page_no:04d}_f{visual_index:02d}",
+                    file_name=name,
+                    media_type="image/jpeg",
+                    content=data,
+                )
+                book.add_item(item)
+                assets.append(VisualAsset(item, visual.caption, visual.caption_rect, visual.rect))
+                im = Image.open(BytesIO(data))
+                print(f"    {visual.label}: {len(data)} bytes {im.size}")
+            visual_items[page_no] = assets
+            continue
+
+        fallback_crop = visual_crop_rect(page)
+        if page_no != args.cover_page and fallback_crop is None:
+            print(f"    visual page {page_no}: skipped (no visual region detected)")
+            continue
+        data = render_page_jpeg(
+            page,
+            zoom=args.zoom,
+            quality=args.jpeg_quality,
+            crop_visual=True,
+        )
         name = f"images/visual_p{page_no:04d}.jpg"
         item = epub.EpubImage(uid=f"visual_p{page_no:04d}", file_name=name, media_type="image/jpeg", content=data)
         book.add_item(item)
-        visual_items[page_no] = item
+        visual_items[page_no] = [VisualAsset(item, source_rect=fallback_crop)]
         im = Image.open(BytesIO(data))
         print(f"    visual page {page_no}: {len(data)} bytes {im.size}")
 
@@ -425,8 +821,28 @@ def build_epub(args: argparse.Namespace) -> int:
             "</head><body>",
             f"<h1>{escape(section.title)}</h1>",
         ]
+        chapter_footnotes: list[str] = []
         for page_no in range(section.start, section.end + 1):
-            blocks = page_text_blocks(doc[page_no - 1], page_no, args.drop_headers)
+            page_assets = visual_items.get(page_no, [])
+            excluded_rects = [
+                rect
+                for asset in page_assets
+                for rect in (asset.source_rect, asset.caption_rect)
+                if rect is not None
+            ]
+            blocks, footnotes = page_body_and_footnotes(
+                doc[page_no - 1],
+                page_no,
+                args.drop_headers,
+                excluded_rects=excluded_rects,
+                column_split=args.column_split,
+            )
+            chapter_footnotes.extend(footnotes)
+            blocks = remove_duplicate_section_heading(
+                blocks,
+                section.title,
+                is_section_start=(page_no == section.start),
+            )
             if not blocks and page_no not in visual_items:
                 continue
             parts.append(f'<section class="pdf-page" id="p{page_no:04d}">')
@@ -438,16 +854,20 @@ def build_epub(args: argparse.Namespace) -> int:
                         index_page=("index" in section.title.lower()),
                     )
                 )
-            if page_no in visual_items:
-                src = visual_items[page_no].file_name
-                caption = f"PDF page {page_no} figure/table visual snapshot"
+            for asset in page_assets:
+                src = asset.item.file_name
+                alt_text = asset.caption or f"Visual content from source page {page_no}"
+                figcaption = f"<figcaption>{escape(asset.caption)}</figcaption>" if asset.caption else ""
                 parts.append(
                     '<figure class="visual-snapshot">'
-                    f'<img src="{escape(src)}" alt="{escape(caption)}"/>'
-                    f"<figcaption>{escape(caption)}</figcaption>"
-                    "</figure>"
+                    f'<img src="{escape(src)}" alt="{escape(alt_text)}"/>'
+                    f"{figcaption}</figure>"
                 )
             parts.append("</section>")
+        if chapter_footnotes:
+            parts.append('<section class="endnotes"><h2>注释</h2><ol>')
+            parts.extend(f"<li>{escape(note)}</li>" for note in chapter_footnotes)
+            parts.append("</ol></section>")
         parts.append("</body></html>")
 
         chapter = epub.EpubHtml(
@@ -524,7 +944,7 @@ def verify_epub(args: argparse.Namespace) -> int:
             visual_pages = {
                 int(match.group(1))
                 for name in visuals
-                if (match := re.search(r"visual_p(\d+)\.(?:jpg|jpeg|png|webp)$", name, re.IGNORECASE))
+                if (match := re.search(r"visual_p(\d+)(?:_f\d+)?\.(?:jpg|jpeg|png|webp)$", name, re.IGNORECASE))
             }
             html = "\n".join(
                 archive.read(n).decode("utf-8", "ignore")
@@ -593,6 +1013,8 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument("--description")
     convert_parser.add_argument("--cover-page", type=int, default=1)
     convert_parser.add_argument("--visual-pages", help="comma-separated page numbers/ranges")
+    convert_parser.add_argument("--skip-page-rasters", action="store_true", help="exclude uncaptioned large raster pages after manual scan/artwork review")
+    convert_parser.add_argument("--column-split", type=float, help="read left column then right column, split at this PDF x coordinate in points")
     convert_parser.add_argument("--section", action="append", default=[], help="repeat: 'Title:start-end'")
     convert_parser.add_argument("--zoom", type=float, default=1.75)
     convert_parser.add_argument("--jpeg-quality", type=int, default=83)
