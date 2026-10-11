@@ -635,3 +635,126 @@ def test_reflow_continuous_inset_lines_stay_in_one_paragraph() -> None:
         (78, 148, 350, 160, "引文第三行。", 3, 0),
     ]
     assert hybrid.reflow_text_blocks(blocks) == ["前一段。", "引文第一行，引文第二行，引文第三行。"]
+
+
+def test_flow_page_sections_preserves_inline_text_links_and_page_anchors() -> None:
+    from xml.etree import ElementTree as ET
+    ns = 'http://www.w3.org/1999/xhtml'
+    root = ET.fromstring(f'''<html xmlns="{ns}"><body><h1>Chapter</h1>
+    <section class="pdf-page" id="p0001"><p>開頭<em>文字</em>未完</p></section>
+    <section class="pdf-page" id="p0002"><p id="source-note">續文<a href="#note">注</a>結尾。</p><p>新段。</p></section>
+    </body></html>''')
+    hybrid.flow_page_sections(root, continuation_pages={2})
+    body = root.find(f'{{{ns}}}body')
+    assert body is not None
+    paragraphs = body.findall(f'{{{ns}}}p')
+    assert [''.join(p.itertext()) for p in paragraphs] == ['開頭文字未完續文注結尾。', '新段。']
+    assert paragraphs[0].find(f'{{{ns}}}em').text == '文字'
+    assert paragraphs[0].find(f'{{{ns}}}a').get('href') == '#note'
+    assert {e.get('id') for e in body.iter() if e.get('id')} == {'p0001', 'p0002', 'source-note'}
+    assert not body.findall(f'{{{ns}}}section')
+
+
+def test_flow_page_sections_respects_figures_and_unmarked_boundaries() -> None:
+    from xml.etree import ElementTree as ET
+    ns = 'http://www.w3.org/1999/xhtml'
+    root = ET.fromstring(f'''<html xmlns="{ns}"><body>
+    <section class="pdf-page" id="p0001"><p>未完</p><figure><img src="local.jpg"/></figure></section>
+    <section class="pdf-page" id="p0002"><p>圖片後文字</p></section>
+    <section class="pdf-page" id="p0003"><p>新段落</p></section>
+    <section class="endnotes"><ol><li>注釋</li></ol></section>
+    </body></html>''')
+    hybrid.flow_page_sections(root, continuation_pages={2})
+    body = root.find(f'{{{ns}}}body')
+    assert [''.join(p.itertext()) for p in body.findall(f'{{{ns}}}p')] == ['未完', '圖片後文字', '新段落']
+    assert body.find(f'{{{ns}}}figure') is not None
+    assert body.find(f'{{{ns}}}section').get('class') == 'endnotes'
+
+
+def test_page_continuation_requires_cjk_geometry_and_no_new_indent() -> None:
+    document = fitz.open()
+    left = document.new_page()
+    left.insert_text((72, 100), '中文正文前行，中文正文前行，中文正文前行，', fontname='china-t')
+    left.insert_text((72, 720), '中文正文未完，中文正文未完，中文正文未完，', fontname='china-t')
+    right = document.new_page()
+    # Refresh pages after adding a page (PyMuPDF invalidates previous handles).
+    left = document[0]
+    right.insert_text((72, 90), '接續中文內容。', fontname='china-t')
+    assert hybrid.page_continues_paragraph(left, right, drop_headers=True)
+    indented = document.new_page()
+    indented.insert_text((94, 90), '新段落中文內容。', fontname='china-t')
+    indented.insert_text((72, 120), '後續中文內容。', fontname='china-t')
+    assert not hybrid.page_continues_paragraph(document[0], indented, drop_headers=True)
+    top_only = document.new_page()
+    top_only.insert_text((72, 100), '未到頁尾的短段，', fontname='china-t')
+    assert not hybrid.page_continues_paragraph(top_only, document[1], drop_headers=True)
+    document.close()
+
+
+def test_convert_flow_default_and_pages_layout_keep_source_ids(tmp_path: Path) -> None:
+    from xml.etree import ElementTree as ET
+    document = fitz.open()
+    for text in ['First paragraph.', 'Second paragraph.']:
+        document.new_page().insert_text((72, 100), text)
+    pdf = tmp_path / 'flow.pdf'
+    document.save(pdf)
+    document.close()
+    for layout in ['flow', 'pages']:
+        out = tmp_path / f'{layout}.epub'
+        assert hybrid.main(['convert', str(pdf), str(out), '--layout', layout, '--translator', 'Test Translator']) == 0
+        with zipfile.ZipFile(out) as archive:
+            name = next(n for n in archive.namelist() if n.endswith('.xhtml') and '01_' in n)
+            root = ET.fromstring(archive.read(name))
+            assert {'p0001', 'p0002'} <= {e.get('id') for e in root.iter()}
+            sections = [e for e in root.iter() if e.get('class') == 'pdf-page']
+            assert bool(sections) == (layout == 'pages')
+            css = archive.read('EPUB/style/book.css').decode()
+            assert ('page-break-after: always' in css) == (layout == 'pages')
+            opf = ET.fromstring(archive.read('EPUB/content.opf'))
+            contributors = opf.findall('.//{http://purl.org/dc/elements/1.1/}contributor')
+            assert [c.text for c in contributors] == ['Test Translator']
+            roles = [e for e in opf.iter() if e.get('property') == 'role']
+            assert any(e.text == 'trl' and e.get('refines') == '#' + contributors[0].get('id') for e in roles)
+
+
+def test_default_sections_preserves_front_matter_and_deduplicates_starts() -> None:
+    document = fitz.open()
+    for _ in range(5):
+        document.new_page()
+    document.set_toc([[1, 'Chapter One', 3], [1, 'Same start', 3], [1, 'Chapter Two', 5]])
+    sections = hybrid.default_sections(document)
+    assert [(s.title, s.start, s.end) for s in sections] == [
+        ('Front Matter', 1, 2), ('Chapter One', 3, 4), ('Chapter Two', 5, 5)
+    ]
+    assert [n for s in sections for n in range(s.start, s.end + 1)] == list(range(1, 6))
+    document.close()
+
+
+def test_convert_cross_page_join_is_opt_in_and_does_not_cross_sections(tmp_path: Path) -> None:
+    from xml.etree import ElementTree as ET
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 100), '中文正文前行，中文正文前行，中文正文前行，', fontname='china-t')
+    page.insert_text((72, 720), '中文正文未完，中文正文未完，中文正文未完，', fontname='china-t')
+    document.new_page().insert_text((72, 90), '接續中文內容。', fontname='china-t')
+    pdf = tmp_path / 'continuation.pdf'
+    document.save(pdf)
+    document.close()
+    ns = {'x': 'http://www.w3.org/1999/xhtml'}
+    for join in [False, True]:
+        out = tmp_path / f'continuation-{join}.epub'
+        options = ['--join-page-continuations'] if join else []
+        assert hybrid.main(['convert', str(pdf), str(out), '--language', 'zh-Hant', *options]) == 0
+        with zipfile.ZipFile(out) as archive:
+            name = next(n for n in archive.namelist() if n.endswith('.xhtml') and '01_' in n)
+            root = ET.fromstring(archive.read(name))
+            paragraphs = root.findall('.//x:body/x:p', ns)
+            assert len(paragraphs) == (2 if join else 3)
+            text = ''.join(''.join(p.itertext()) for p in paragraphs)
+            assert text == '中文正文前行，中文正文前行，中文正文前行，中文正文未完，中文正文未完，中文正文未完，接續中文內容。'
+    out = tmp_path / 'separate.epub'
+    assert hybrid.main(['convert', str(pdf), str(out), '--join-page-continuations', '--section', 'First:1-1', '--section', 'Second:2-2']) == 0
+    with zipfile.ZipFile(out) as archive:
+        second = next(n for n in archive.namelist() if n.endswith('.xhtml') and '02_' in n)
+        root = ET.fromstring(archive.read(second))
+        assert [''.join(p.itertext()) for p in root.findall('.//x:body/x:p', ns)] == ['接續中文內容。']

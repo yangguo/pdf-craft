@@ -61,7 +61,6 @@ h1 {
 }
 section.pdf-page {
   margin: 0 0 1.8em;
-  page-break-after: always;
 }
 p {
   margin: 0 0 0.8em;
@@ -177,9 +176,17 @@ def parse_sections(raw_sections: list[str], page_count: int) -> list[Section]:
 
 def default_sections(doc: fitz.Document) -> list[Section]:
     toc = doc.get_toc(simple=True)
-    level_one = [(title, page) for level, title, page in toc if level == 1 and 1 <= page <= doc.page_count]
+    # Duplicate bookmark starts must not create empty ranges; bookmarks may
+    # also omit the cover, title page, and other front matter.
+    starts: dict[int, str] = {}
+    for level, title, page in toc:
+        if level == 1 and 1 <= page <= doc.page_count:
+            starts.setdefault(page, title)
+    level_one = [(title, page) for page, title in sorted(starts.items())]
     if level_one:
         sections = []
+        if level_one[0][1] > 1:
+            sections.append(Section("Front Matter", 1, level_one[0][1] - 1))
         for index, (title, start) in enumerate(level_one):
             next_start = level_one[index + 1][1] if index + 1 < len(level_one) else doc.page_count + 1
             sections.append(Section(normalize_text(title), start, next_start - 1))
@@ -272,6 +279,101 @@ def reflow_text_blocks(blocks: list[tuple]) -> list[str]:
     if current:
         paragraphs.append(current)
     return paragraphs
+
+
+XHTML_NS = "http://www.w3.org/1999/xhtml"
+
+
+def page_continues_paragraph(
+    previous: fitz.Page, current: fitz.Page, *, drop_headers: bool
+) -> bool:
+    """Conservatively recognize a CJK paragraph continuing over a page turn.
+
+    Require a full-width unfinished last line near the bottom, a same-size
+    unindented first line near the top, and matching page dimensions. This is
+    deliberately inconclusive for columns, poetry, and short final lines.
+    """
+    if abs(previous.rect.width - current.rect.width) > 1:
+        return False
+    before = _page_text_records(previous, 0, drop_headers)
+    after = _page_text_records(current, 0, drop_headers)
+    if not before or not after:
+        return False
+    last, last_size = before[-1]
+    first, first_size = after[0]
+    body_size = statistics.median(size for _, size in before)
+    if abs(last_size - body_size) > 0.5 or abs(first_size - body_size) > 0.5:
+        return False
+    base_x = min(block[0] for block, size in before if abs(size - body_size) <= 0.5)
+    right_x = max(block[2] for block, size in before if abs(size - body_size) <= 0.5)
+    # Block bounds include earlier lines; consult the last line itself.
+    source = previous.get_text("dict")["blocks"][last[5]]
+    last_line = source["lines"][-1]["bbox"]
+    if (
+        last_line[3] < previous.rect.height * 0.8
+        or first[1] > current.rect.height * 0.2
+        or abs(first[0] - base_x) > 3
+        or abs(last_line[2] - right_x) > 6
+        or right_x - base_x < previous.rect.width * 0.3
+    ):
+        return False
+    first_raw = first[4].splitlines()[0]
+    if len(first_raw) - len(first_raw.lstrip(" \t\u3000\u2002\u2003")) >= 2:
+        return False
+    left_text = normalize_text(last[4]).rstrip().rstrip('”’"」』）》】）]')
+    if not left_text or left_text[-1] in "。！？!?…；;.:：":
+        return False
+    text = re.sub(r"\s+", "", last[4] + first[4])
+    cjk = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
+    return bool(text) and cjk / len(text) >= 0.2
+
+
+def flow_page_sections(root: ElementTree.Element, *, continuation_pages: set[int]) -> None:
+    """Flatten generated page wrappers without losing inline markup or IDs.
+
+    Only the first paragraph of a marked page may join the immediately
+    preceding paragraph. Figures, headings, and other elements are barriers.
+    """
+    tag = lambda local: f"{{{XHTML_NS}}}{local}"
+    body = root.find(tag("body"))
+    if body is None:
+        return
+    original = list(body)
+    for child in original:
+        body.remove(child)
+    for child in original:
+        if child.tag != tag("section") or child.get("class") != "pdf-page":
+            body.append(child)
+            continue
+        page_id = child.get("id", "")
+        match = re.fullmatch(r"p(\d+)", page_id)
+        anchor = ElementTree.Element(tag("span"), {"class": "source-page-anchor"})
+        if page_id:
+            anchor.set("id", page_id)
+        contents = list(child)
+        previous = body[-1] if len(body) else None
+        join = (
+            match is not None and int(match.group(1)) in continuation_pages
+            and previous is not None and previous.tag == tag("p")
+            and bool(contents) and contents[0].tag == tag("p")
+        )
+        if join:
+            paragraph = contents.pop(0)
+            previous.append(anchor)
+            if paragraph.get("id"):
+                paragraph_anchor = ElementTree.SubElement(previous, tag("span"), {"id": paragraph.get("id")})
+            else:
+                paragraph_anchor = anchor
+            left = "".join(previous.itertext()).rstrip()
+            right = paragraph.text or ""
+            separator = " " if re.search(r"[A-Za-z0-9]$", left) and re.match(r"^[A-Za-z0-9]", right) else ""
+            paragraph_anchor.tail = separator + right
+            for inline in list(paragraph):
+                previous.append(inline)
+        else:
+            body.append(anchor)
+        for content in contents:
+            body.append(content)
 
 
 def is_header_or_footer(block: tuple, drop_headers: bool, page_height: float = 792.0) -> bool:
@@ -753,6 +855,10 @@ def build_epub(args: argparse.Namespace) -> int:
     book.set_title(title)
     book.set_language(args.language)
     book.add_author(author)
+    for index, translator in enumerate(args.translator, 1):
+        contributor_id = f"translator_{index}"
+        book.add_metadata("DC", "contributor", translator, {"id": contributor_id})
+        book.add_metadata(None, "meta", "trl", {"refines": f"#{contributor_id}", "property": "role", "scheme": "marc:relators"})
     if args.publisher:
         book.add_metadata("DC", "publisher", args.publisher)
     if args.published:
@@ -761,7 +867,12 @@ def build_epub(args: argparse.Namespace) -> int:
         book.add_metadata("DC", "description", args.description)
     book.set_cover("cover.jpg", render_cover_jpeg(doc[args.cover_page - 1]))
 
-    css = epub.EpubItem(uid="book_css", file_name="style/book.css", media_type="text/css", content=CSS.encode("utf-8"))
+    stylesheet = CSS
+    if args.layout == "pages":
+        stylesheet += "\nsection.pdf-page { page-break-after: always; }\n"
+    if args.language.lower().startswith(("zh", "ja", "ko")):
+        stylesheet += "\nbody { line-height: 1.8; } p { text-indent: 2em; }\n"
+    css = epub.EpubItem(uid="book_css", file_name="style/book.css", media_type="text/css", content=stylesheet.encode("utf-8"))
     book.add_item(css)
 
     visual_items: dict[int, list[VisualAsset]] = {}
@@ -822,6 +933,7 @@ def build_epub(args: argparse.Namespace) -> int:
             f"<h1>{escape(section.title)}</h1>",
         ]
         chapter_footnotes: list[str] = []
+        continuation_pages: set[int] = set()
         for page_no in range(section.start, section.end + 1):
             page_assets = visual_items.get(page_no, [])
             excluded_rects = [
@@ -837,6 +949,14 @@ def build_epub(args: argparse.Namespace) -> int:
                 excluded_rects=excluded_rects,
                 column_split=args.column_split,
             )
+            if (
+                args.layout == "flow" and args.join_page_continuations
+                and args.column_split is None and page_no > section.start
+                and "index" not in section.title.lower()
+                and not page_assets and not visual_items.get(page_no - 1)
+                and page_continues_paragraph(doc[page_no - 2], doc[page_no - 1], drop_headers=args.drop_headers)
+            ):
+                continuation_pages.add(page_no)
             chapter_footnotes.extend(footnotes)
             blocks = remove_duplicate_section_heading(
                 blocks,
@@ -870,11 +990,18 @@ def build_epub(args: argparse.Namespace) -> int:
             parts.append("</ol></section>")
         parts.append("</body></html>")
 
+        chapter_content = "\n".join(parts).encode("utf-8")
+        if args.layout == "flow":
+            root = ElementTree.fromstring(chapter_content)
+            flow_page_sections(root, continuation_pages=continuation_pages)
+            ElementTree.register_namespace("", XHTML_NS)
+            chapter_content = ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+
         chapter = epub.EpubHtml(
             title=section.title,
             file_name=safe_filename(index, section.title),
             lang=args.language,
-            content="\n".join(parts).encode("utf-8"),
+            content=chapter_content,
         )
         chapter.add_item(css)
         book.add_item(chapter)
@@ -1005,6 +1132,9 @@ def build_parser() -> argparse.ArgumentParser:
     convert_parser.add_argument("output")
     convert_parser.add_argument("--title")
     convert_parser.add_argument("--author")
+    convert_parser.add_argument("--translator", action="append", default=[], help="repeatable translator contributor")
+    convert_parser.add_argument("--layout", choices=("flow", "pages"), default="flow", help="continuous prose (default) or preserve PDF page breaks")
+    convert_parser.add_argument("--join-page-continuations", action="store_true", help="join CJK page-turn continuations when geometry supports it; review the result")
     convert_parser.add_argument("--language", default="en")
     convert_parser.add_argument("--identifier")
     convert_parser.add_argument("--isbn", help="ISBN used as the identifier when --identifier is omitted")
