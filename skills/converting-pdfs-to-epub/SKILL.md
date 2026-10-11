@@ -11,9 +11,10 @@ Convert PDFs into EPUBs that are readable in Calibre and usable on e-readers. Th
 
 ## Workflow
 
-1. Inspect the PDF before converting: page count, metadata, text layer, embedded images, drawing-heavy pages, list of figures/tables, and chapter starts.
+1. Inspect the PDF before converting: page count, metadata, text layer, embedded outline/bookmarks, embedded images, drawing-heavy pages, list of figures/tables, and representative chapter starts.
 2. Choose the path:
-   - Use a text-layer hybrid conversion when most pages already contain extractable text.
+   - Use readable native text as the source of truth when its order and encoding are sound; treat the text-layer ratio as a screening signal, not a fixed threshold.
+   - Use MinerU to cross-check structure or repair complex, missing, or corrupted ranges instead of replacing trustworthy prose.
    - Use `pdf2epub_paddle.py --api mineru` (faster) or `--api paddle` (default) when pages are scanned or text length is near zero across body pages.
    - Use page images only as a last resort; Calibre and e-readers handle text EPUBs better.
 3. Preserve local visuals selectively: cover, photos, diagrams, charts, and table pages. Do not link remote images from XHTML.
@@ -37,6 +38,14 @@ Call `pdf2epub_paddle.py` only when OCR is actually needed. Use `--api mineru` f
 
 For mixed PDFs, OCR only the scanned page ranges if the project OCR workflow supports it; otherwise use OCR for the source pass, then still run EPUB validation and visual-retention checks.
 
+## MinerU-Assisted Extraction
+
+When using MinerU MCP for a large PDF, honor the service's current page limit and split into ordered, inclusive ranges when necessary. Submit different ranges of the same source PDF as **separate MCP calls with separate output directories**. In observed workflows, batching same-basename ranges in one `file_sources` request duplicated or overwrote output while reporting success; separate calls avoid that collision.
+
+Treat each saved result as untrusted until checked. Confirm that ranges cover the source exactly once and in order; compare file sizes, hashes, opening and closing text, representative headings, and approximate character counts against native extraction. Identical hashes for different ranges, missing boundary text, or implausibly small output require an independent rerun rather than packaging the Markdown.
+
+Prefer the PDF's embedded outline for chapter boundaries when it matches printed contents and actual heading pages. Use MinerU headings only to fill gaps or challenge a suspect outline. If the converter's automatic outline handling is too coarse, pass explicit `--section` ranges for the useful chapter level.
+
 ## Helper Script
 
 Use `skills/converting-pdfs-to-epub/scripts/pdf_to_epub_hybrid.py` for text-layer PDFs.
@@ -47,6 +56,8 @@ python3 skills/converting-pdfs-to-epub/scripts/pdf_to_epub_hybrid.py inspect boo
 python3 skills/converting-pdfs-to-epub/scripts/pdf_to_epub_hybrid.py convert book.pdf book.epub \
   --title "Book Title" \
   --author "Author Name" \
+  --translator "Translator Name" \
+  --language zh-Hant --layout flow \
   --isbn "978-1-23456-789-0" \
   --publisher "Example Press" \
   --published "2026-07-18" \
@@ -65,6 +76,14 @@ If the repository has a better project-specific converter, prefer that. For Padd
 
 The hybrid converter automatically calibrates vector-drawing complexity against the document baseline so recurring crop marks and page furniture do not turn every page into a visual snapshot. On CJK-dominant pages it also joins wrapped line blocks into paragraphs using indentation and vertical spacing, while leaving non-CJK block boundaries unchanged. Explicit `--visual-pages` and `--section` values remain the authoritative override when automatic inspection is uncertain.
 
+## Reflow and Source-Specific Overrides
+
+The helper defaults to `--layout flow`: continuous prose with source-page anchors. Use `--layout pages` to retain PDF page breaks. `--join-page-continuations` enables conservative CJK joins based on native geometry, font size, and indentation; review changed boundaries. Joins preserve inline markup and stop at chapters and figures. Never merge all adjacent paragraphs simply because one lacks final punctuation.
+
+Use `--column-split X` only for a reviewed, consistent two-column layout (X is in PDF points). Full-page raster artwork is retained automatically; use `--skip-page-rasters` only after checking that those regions are scans rather than illustrations. Explicit visual-page selections take precedence. Automatic chapter boundaries retain front matter before the first bookmark and deduplicate identical starts.
+
+Keep book-specific titles, page mappings, spelling corrections, and repair ledgers outside the generic converter. Record exact repair preconditions and original-page evidence. See [the source-faithful validation guide](../../docs/hybrid-epub-validation.md) for workflow details and limits.
+
 ## Visual Retention
 
 Use visual snapshots for:
@@ -74,7 +93,7 @@ Use visual snapshots for:
 | Cover | Embed as `cover.jpg` and set EPUB cover metadata |
 | Photos/scans/diagrams | Local image item in the EPUB |
 | Charts/vector figures | Snapshot the PDF page or tight crop |
-| Complex tables | Keep table text searchable and add a page snapshot |
+| Complex tables | Local snapshot and searchable caption; use a dedicated extractor for semantic table cells |
 | Plain prose | Extract as XHTML text, not images |
 
 Find visual pages from the PDF’s list of figures/tables, `page.get_images()`, `page.get_drawings()`, and caption searches like `Figure 4.2` or `Table 6.1`. Multi-page tables need every continuation page.
@@ -114,6 +133,8 @@ Confirm:
 | Remote image timeout | Download/embed images locally or remove remote references |
 | OCR produces noisy layout | Use PDF text layer when available; reserve OCR for scanned pages |
 | OCR text has CJK garbling or missing spans | Use `repairing-ocr-epubs`: scan, map to PDF pages, run targeted MinerU reruns, then rebuild and verify |
+| Different MinerU ranges contain identical content | Rerun each range in a separate MCP call and output directory; compare hashes and boundary text before use |
+| EPUB chapters follow broad parts instead of articles | Cross-check the embedded outline with printed contents, then pass explicit `--section` ranges |
 
 ## Reporting
 

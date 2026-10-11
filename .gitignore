@@ -13,9 +13,11 @@
 /*.pdf
 
 /.venv
+/.firecrawl/
 /analysing
 /models-cache
 /tmp
+/output/
 /tmp_pages/
 /manual_toc/*.json
 /*.epub.bak
